@@ -222,15 +222,15 @@ what roles are available, and to hire or fire members.
 make routing decisions. At every `act()` call, the LLM sees:
 
 ```
-Team members:
+**Team members:**
 @Manager (role: Manager) - [you]
 @Developer456 (role: Developer)
 @QA789 (role: QA)
 
-Available team roles:
-**Manager**: Helpful manager coordinating team work (Skills: coordination, delegation)
-**Developer**: Full-stack developer (Skills: coding, architecture)
-**QA**: Quality assurance engineer (Skills: testing, automation)
+**Available team roles:**
+Manager: Helpful manager coordinating team work (Skills: coordination, delegation)
+Developer: Full-stack developer (Skills: coding, architecture)
+QA: Quality assurance engineer (Skills: testing, automation)
 ```
 
 Combined with the `{team}` and `{roles}` variables injected into the `StructuredOutput`
