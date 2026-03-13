@@ -4,31 +4,48 @@ This module defines Pydantic models that enable agents to return structured resp
 in three distinct patterns:
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
-structured_output = """This thread was triggered by ({sender}).
+structured_output = """This thread was triggered by a {message_type} from ({sender}).
+{reply_protocol}
 
-Execution model:
-You process ONE message at a time. After you respond, your turn ends.
-If other members send you messages later, you will be called again with full context history.
-You CANNOT wait, sleep, poll, or loop. Do NOT use tools as a stalling mechanism.
+You CANNOT wait, sleep, poll, or loop. Return an empty list instead.
+You process ONE message at a time. After you conclude, your turn ends.
 
-How to respond - choose ONE of these actions:
-1. You can complete your task: respond to {sender} and/or other members,
-   or return an empty list if no message is needed.
-2. You need input from team members: send request(s) to existing members by name ({team})
-   or to new members by role ({roles}).
-3. You are waiting for messages that have not arrived yet: return an EMPTY messages list.
-   You will be called again when the next message arrives. Your context is preserved.
-
-CRITICAL: Only contact members when there is a clear request. Each thread has a cost!
-Do NOT call tools just to stay active or wait. Return an empty list instead.
+Team members: {team}.
+Available roles: {roles}.
 """
+
+REPLY_PROTOCOLS: dict[str, str] = {
+    "request": "You MUST respond to {sender}. You may also delegate to others.",
+    "response": "This is a reply to your earlier request. Continue or end the exchange.",
+    "notification": "Informational only. Do NOT reply to {sender}. Return an empty list.",
+    "instruction": "Acknowledge to {sender} that you understood. You may also delegate to others.",
+    "acknowledgment": "Receipt confirmed. No further action needed. Return an empty list.",
+}
+
 
 
 class Request(BaseModel):
     """A message directed to a specific team member or role."""
 
+    message_type: Literal[
+        "request",
+        "response",
+        "notification",
+        "instruction",
+        "acknowledgment",
+    ] = Field(
+        ...,
+        description="Choose based on intent: "
+        "'request' = ask recipient to act, a reply to this message is expected; "
+        "'response' = reply to a previous request; "
+        "'notification' = notification the recipient, no reply to this message is expected; "
+        "'instruction' = give instruction to the recipient, an acknowledgment is expected; "
+        "'acknowledgment' = confirm receipt of an instruction.",
+    )
     message: str = Field(..., description="The message content to send")
     recipient: str = Field(
         ...,

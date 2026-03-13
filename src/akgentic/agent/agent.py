@@ -1,5 +1,5 @@
-"""BaseAgent: LLM-powered team agent with delegation and collaboration.
 
+"""BaseAgent: LLM-powered team agent with delegation and collaboration.
 BaseAgent integrates with akgentic-llm's ReactAgent for all LLM management,
 with team-specific message handling and structured output patterns.
 
@@ -28,7 +28,7 @@ from pydantic_ai import ModelRetry, RunContext
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
-from akgentic.agent.output_models import StructuredOutput, structured_output
+from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput, structured_output
 from akgentic.core import ActorAddress, Akgent, Orchestrator
 from akgentic.core.agent import WarningError
 from akgentic.llm import ReactAgent, ReactAgentConfig
@@ -127,6 +127,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """
         assert self._orchestrator is not None, "Orchestrator address must be provided in config"
         self.orchestrator_proxy_ask = self.proxy_ask(self._orchestrator, Orchestrator)
+
+        self._current_message: AgentMessage | None = None
 
         # ── State ───────────────────────────────────────────────────────────────
         self.state = AgentState(backstory=self.config.prompt.render()).observer(self)
@@ -244,6 +246,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             {
                 "__doc__": structured_output.format(
                     sender=sender,
+                    message_type=self._current_message.type,
+                    reply_protocol=REPLY_PROTOCOLS.get(
+                        self._current_message.type, ""
+                    ).format(sender=sender),
                     team=", ".join(team) or "no other members",
                     roles=", ".join(roles) or "no roles available",
                 )
@@ -271,37 +277,35 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         for request in output.messages:
             recipient = request.recipient
 
-            # Reply to the send
-            if recipient == self._current_message.sender.name:
-                member = self._current_message.sender
-                content = f"You received an answer from {self.config.name}:\n\n" + request.message
-                self.send(member, AgentMessage(content=content, recipient=member))
-                continue
-
-            ## Check member
+            member = None
             if recipient.startswith("@"):
-                if member := self.get_team_member(recipient):
-                    content = (
-                        f"You received a message from {self.config.name}:\n\n" + request.message
-                    )
-                    self.send(member, AgentMessage(content=content, recipient=member))
-                    result.append(member.name)
-                else:
+                if not (member := self.get_team_member(recipient)):
                     logger.error(f"Invalid recipient {recipient}: not found in team members.")
                     member_err.append(recipient)
 
-            ## Check role
+            elif recipient in roles:
+                member = self.hire_member(recipient)
+
             else:
-                if recipient in roles:
-                    member = self.hire_member(recipient)
-                    content = (
-                        f"You received an request from {self.config.name}\n\n" + request.message
-                    )
-                    self.send(member, AgentMessage(content=content, recipient=member))
-                    result.append(member.name)
-                else:
-                    logger.error(f"Invalid recipient {recipient}: not found in team roles")
-                    role_err.append(recipient)
+                logger.error(f"Invalid recipient {recipient}: not found in team roles")
+                role_err.append(recipient)
+
+            if member is not None:
+                article = "an" if request.message_type[0] in "aeiou" else "a"
+                content = (
+                    f"You received {article} {request.message_type}"
+                    f" from {self.config.name}:\n\n"
+                    + request.message
+                )
+                self.send(
+                    member,
+                    AgentMessage(
+                        content=content,
+                        type=request.message_type,
+                        recipient=member,
+                    ),
+                )
+                result.append(member.name)
 
         if member_err or role_err:
             content = f"Message sent successfuly to: {'; '.join(result)}.\n"
@@ -349,7 +353,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     def notify_human(self, message: str) -> None:
         # Sent request to the first Human agent
         human = next((agent for agent in self.get_team() if agent.role == "human"), None)
-        self.send(human, AgentMessage(content=message, recipient=human))
+        self.send(human, AgentMessage(content=message, recipient=human, type="notification"))
 
     # ============================================================================
     # TEAM AWARENESS
