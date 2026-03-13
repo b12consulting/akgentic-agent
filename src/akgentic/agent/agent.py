@@ -308,7 +308,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 result.append(member.name)
 
         if member_err or role_err:
-            content = f"Message sent successfuly to: {'; '.join(result)}.\n"
+            content = f"Message sent successfully to: {'; '.join(result)}.\n"
             content += "Errors sending message to:\n"
             content += (f"- {', '.join(role_err)}, role(s) not found.\n") if role_err else ""
             content += (f"- {', '.join(member_err)}, member(s) not found.") if member_err else ""
