@@ -24,14 +24,14 @@ from datetime import datetime, timezone
 from time import sleep
 from typing import TypeVar, cast
 
-from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai import BinaryContent, ModelRetry, RunContext
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput, structured_output
 from akgentic.core import ActorAddress, Akgent, Orchestrator
 from akgentic.core.agent import WarningError
-from akgentic.llm import ReactAgent, ReactAgentConfig
+from akgentic.llm import ReactAgent, ReactAgentConfig, UserPrompt
 from akgentic.llm import UsageLimitError as LLMUsageLimitError
 from akgentic.tool.core import ToolFactory
 from akgentic.tool.planning import GetPlanning, GetPlanningTask
@@ -42,6 +42,8 @@ from akgentic.tool.team import (
     HireTeamMember,
     TeamTool,
 )
+from akgentic.tool.workspace import ExpandMediaRefs
+from akgentic.tool.workspace.readers import MediaContent
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +169,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         self._get_planning_task_command = commands.get(GetPlanningTask)
         self._get_team_roster_command = commands.get(GetTeamRoster)
         self._get_role_profiles_command = commands.get(GetRoleProfiles)
+        self._expand_media_refs_command = commands.get(ExpandMediaRefs)
 
         self._react_agent = ReactAgent(
             config=react_agent_config,
@@ -227,6 +230,19 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             LLMUsageLimitError: When usage limits exceeded; sends help request
                 to Human and wraps the LLMUsageLimitError.
         """
+        # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
+        prompt: UserPrompt = user_content
+        if self._expand_media_refs_command is not None:
+            parts = self._expand_media_refs_command(user_content)
+            if any(isinstance(p, MediaContent) for p in parts):
+                prompt = [
+                    BinaryContent(data=p.data, media_type=p.media_type)
+                    if isinstance(p, MediaContent)
+                    else p
+                    for p in parts
+                ]
+        # ── End media expansion ─────────────────────────────────────────────────
+
         assert self._current_message is not None
         assert self._current_message.sender is not None
 
@@ -256,7 +272,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             },
         )
 
-        output = self._react_agent.run_sync(user_content, deps=self, output_type=local_output_type)
+        output = self._react_agent.run_sync(prompt, deps=self, output_type=local_output_type)
 
         return cast(T, output)
 
