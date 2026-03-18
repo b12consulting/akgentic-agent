@@ -6,19 +6,16 @@ or real LLM calls.
 """
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
-from pydantic_ai import BinaryContent
-
-from akgentic.agent.agent import BaseAgent
-from akgentic.agent.config import AgentConfig
-from akgentic.agent.messages import AgentMessage
 from akgentic.tool.core import ToolFactory
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace import ExpandMediaRefs
 from akgentic.tool.workspace.readers import MediaContent
+from pydantic_ai import BinaryContent
 
+from akgentic.agent.agent import BaseAgent
+from akgentic.agent.messages import AgentMessage
 
 # =============================================================================
 # HELPERS
@@ -191,8 +188,14 @@ class TestBaseAgentMediaExpansion:
     # AC-5: document token → hint string list, no BinaryContent
     # ------------------------------------------------------------------
 
-    def test_document_token_passes_str_list_unchanged(self) -> None:
-        """AC-5: Doc hint strings (no MediaContent) → str list passed to run_sync."""
+    def test_document_token_passes_original_str_unchanged(self) -> None:
+        """AC-5: Doc hint strings (no MediaContent) → original user_content str passed to run_sync.
+
+        When ExpandMediaRefs returns a list of plain strings (no MediaContent — e.g. a PDF hint),
+        the any(isinstance(p, MediaContent)) guard is False and prompt stays as the original str.
+        Per ADR-001 Decision 2: prompt only becomes a list when at least one MediaContent is
+        present.
+        """
         agent = _make_minimal_agent()
 
         hint_list = ["check ", "!!report.pdf[=> Use workspace_read tool]"]
@@ -211,7 +214,7 @@ class TestBaseAgentMediaExpansion:
 
         assert len(captured_prompts) == 1
         result_prompt = captured_prompts[0]
-        # Pure string list — no BinaryContent construction
+        # No MediaContent → prompt stays as original user_content str (not a list)
         assert isinstance(result_prompt, str)
         assert result_prompt == "check !!report.pdf"
 
