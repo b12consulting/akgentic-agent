@@ -188,13 +188,11 @@ class TestBaseAgentMediaExpansion:
     # AC-5: document token → hint string list, no BinaryContent
     # ------------------------------------------------------------------
 
-    def test_document_token_passes_original_str_unchanged(self) -> None:
-        """AC-5: Doc hint strings (no MediaContent) → original user_content str passed to run_sync.
+    def test_document_token_forwards_hint_to_llm(self) -> None:
+        """AC-5: Doc hint strings (no MediaContent) → expanded parts forwarded to run_sync.
 
-        When ExpandMediaRefs returns a list of plain strings (no MediaContent — e.g. a PDF hint),
-        the any(isinstance(p, MediaContent)) guard is False and prompt stays as the original str.
-        Per ADR-001 Decision 2: prompt only becomes a list when at least one MediaContent is
-        present.
+        When ExpandMediaRefs returns a list of plain strings (e.g. a PDF hint or error),
+        the expanded parts are forwarded to the LLM so it can act on hints/errors.
         """
         agent = _make_minimal_agent()
 
@@ -214,9 +212,9 @@ class TestBaseAgentMediaExpansion:
 
         assert len(captured_prompts) == 1
         result_prompt = captured_prompts[0]
-        # No MediaContent → prompt stays as original user_content str (not a list)
-        assert isinstance(result_prompt, str)
-        assert result_prompt == "check !!report.pdf"
+        # Expanded parts forwarded as list so LLM sees the hint
+        assert isinstance(result_prompt, list)
+        assert result_prompt == ["check ", "!!report.pdf[=> Use workspace_read tool]"]
 
     # ------------------------------------------------------------------
     # AC-6: _expand_media_refs_command is None → user_content passed as-is
@@ -284,11 +282,12 @@ class TestBaseAgentMediaExpansion:
         assert isinstance(result_prompt, list)
         assert any(isinstance(p, BinaryContent) for p in result_prompt)
 
-    def test_any_media_content_false_branch(self) -> None:
-        """Branch coverage: any(isinstance(p, MediaContent)) == False → str returned."""
+    def test_no_refs_passes_original_str(self) -> None:
+        """Branch coverage: no !! tokens → parts == [user_content] → str returned."""
         agent = _make_minimal_agent()
 
-        mock_cmd = MagicMock(return_value=["only strings", " here"])
+        # _expand_media_refs returns [original_str] when no !! tokens are present
+        mock_cmd = MagicMock(return_value=["only strings here"])
         agent._expand_media_refs_command = mock_cmd  # type: ignore[attr-defined]
 
         captured_prompts: list[Any] = []

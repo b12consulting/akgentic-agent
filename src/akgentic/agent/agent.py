@@ -234,7 +234,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         prompt: UserPrompt = user_content
         if self._expand_media_refs_command is not None:
             parts = self._expand_media_refs_command(user_content)
-            if any(isinstance(p, MediaContent) for p in parts):
+            if parts != [user_content]:
                 prompt = [
                     BinaryContent(data=p.data, media_type=p.media_type)
                     if isinstance(p, MediaContent)
