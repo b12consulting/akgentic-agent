@@ -25,7 +25,7 @@ to each other via structured LLM output.
 
 ## Overview
 
-Each agent is a Pykka actor. When it receives an `AgentMessage`, it runs a REACT loop
+Each agent is an Akgent actor. When it receives an `AgentMessage`, it runs a REACT loop
 (`ReactAgent.run_sync`) and returns a `StructuredOutput` — a list of `Request` objects
 that each name a recipient and a message type. The framework resolves the recipients and
 delivers the messages; the LLM navigates the conversation graph.
@@ -112,25 +112,49 @@ human_addr = orchestrator_proxy.createActor(
 human_proxy = actor_system.proxy_tell(human_addr, HumanProxy)
 
 # Instantiate Manager and send the first message
-manager_addr = orchestrator_proxy.createActor(BaseAgent, config=manager_card.get_config_copy())
+manager_addr = orchestrator_proxy.createActor(
+    BaseAgent, config=manager_card.get_config_copy()
+)
+
 time.sleep(0.3)
+
+# Send a message from the human to the manager
 human_proxy.send(manager_addr, AgentMessage(content="Plan the next sprint."))
 ```
 
 ## Communication Model
 
-The communication model has two layers of LLM guidance that work together:
+Every message in the system carries an **intent** — a declaration of what the sender
+expects from the recipient. Intent is the core abstraction that drives conversation flow
+between agents.
 
-1. **Message content** — Each delivered message self-describes its origin and type
-   (e.g., `"You received a request from @Manager: ..."`), so the LLM sees the context
-   directly in its conversation history alongside older messages.
-2. **Structured output schema** — On every `act()` call, a per-call `StructuredOutput`
-   subclass injects the sender, message type, reply protocol, team roster, and available
-   roles into the LLM's output schema docstring.
+### Intent: the driving concept
 
-This **double reinforcement** ensures the LLM knows who to reply to, what protocol to
-follow, and which recipients are valid — even when the conversation history contains
-multiple interleaved exchanges.
+When an agent sends a message, it declares its intent via a `message_type`:
+
+| Intent | Meaning | Expected reply |
+|---|---|---|
+| `request` | "Do this and **bring me the result**" | `response` |
+| `instruction` | "Do this (possibly for a third party)" | `acknowledgment` |
+| `response` | "Here is what you asked for" | Optional |
+| `notification` | "FYI — no action needed" | None |
+| `acknowledgment` | "Got it" | None |
+
+The key distinction is **who needs the result**: a `request` means "bring it back to
+me", an `instruction` means "go do this on my behalf".
+
+Intent flows through the system in two complementary ways:
+
+1. **When sending** — The LLM chooses an intent for each outbound `Request`. The
+   framework delivers it as an `AgentMessage` whose `type` field preserves that intent,
+   and whose `content` is enriched with the sender and intent
+   (e.g., `"You received a request from @Manager: ..."`).
+
+2. **When receiving** — The receiving agent's LLM sees the intent both in the message
+   content (conversation history) and in its structured output schema (a per-call
+   docstring that includes the sender, the intent, and a reply protocol). This **double
+   reinforcement** ensures the LLM knows how to respond — even when the conversation
+   history contains multiple interleaved exchanges.
 
 ### AgentMessage
 
@@ -142,10 +166,10 @@ class AgentMessage(Message):
     content: str
 ```
 
-The first message is typically sent by an external system (e.g., `HumanProxy`) as a
-`request` with plain content. The `type` field carries the sender's intent through the
-system — it is not interpreted by `process_message()` directly, but flows into `act()`
-where it drives the reply protocol.
+The `type` field carries the sender's intent through the system. The first message is
+typically sent by an external system (e.g., `HumanProxy`) as a `request` with plain
+content. From there, each agent's LLM decides the intent it attaches to every outbound
+message.
 
 ### StructuredOutput and Request
 
@@ -153,7 +177,13 @@ Each LLM call produces a `StructuredOutput` with a list of outbound `Request` ob
 
 ```python
 class Request(BaseModel):
-    message_type: Literal["request", "response", "notification", "instruction", "acknowledgment"]
+    message_type: Literal[
+        "request",        # ask recipient to perform a task and reply to you with the result
+        "instruction",    # direct recipient to perform a task, you may ask for acknowledgement
+        "response",       # respond to a previous request
+        "notification",   # send information to the recipient, no reply is expected
+        "acknowledgment", # confirm receipt of an instruction, no reply is expected
+    ]
     message: str
     recipient: str   # "@MemberName" (existing actor) or "RoleName" (triggers hiring)
 
@@ -161,11 +191,14 @@ class StructuredOutput(BaseModel):
     messages: list[Request] = []
 ```
 
-The LLM chooses both the recipient and the message type for every outbound message.
+The LLM chooses both the **recipient** and the **intent** for every outbound message.
+`Request.message_type` flows directly into the delivered `AgentMessage.type`, so every
+receiver sees the sender's intent as first-class data.
+
 An empty list means the agent has nothing more to send — but the LLM still runs. A
-`notification` or `acknowledgment` that says "do not reply" means the output list should
-be empty, **not** that the LLM call is skipped. The message is still processed and added
-to the agent's context for future interactions.
+`notification` or `acknowledgment` means the output list should be empty, **not** that
+the LLM call is skipped. The message is still processed and added to the agent's context
+for future interactions.
 
 ### Schema-Constrained Recipients
 
@@ -173,7 +206,7 @@ to the agent's context for future interactions.
 `StructuredOutput` that constrain the `recipient` field to an enum of valid values:
 
 ```python
-valid_recipients = ["@Human", "@Developer001"]  # existing @members
+valid_recipients = ["@Human", "@Developer001"]   # existing @members
                  + ["QA", "Reviewer"]            # available roles for hiring
 # → recipient field gets json_schema_extra={"enum": valid_recipients}
 ```
@@ -185,10 +218,30 @@ can only produce recipients that exist as team members or hireable roles.
 The subclass also injects a dynamic docstring with per-call context:
 
 - `{sender}` — who triggered this message
-- `{message_type}` — the incoming message's type
+- `{message_type}` — the incoming message's intent
 - `{reply_protocol}` — behavioral instruction from `REPLY_PROTOCOLS`
 - `{team}` — current team member names
 - `{roles}` — available roles for hiring
+
+For example, when `@Human` sends a `request` to `@Manager` with `@Developer456` on the
+team and `QA` as an available role, the LLM sees this docstring in the output schema:
+
+```
+This thread was triggered by a request from (@Human).
+Carry out the task and respond to @Human. You may also delegate to others.
+
+You CANNOT wait, sleep, poll, or loop. Return an empty list instead.
+You process ONE message at a time. After you conclude, your turn ends.
+
+Team members: @Developer456.
+Available roles: QA.
+```
+
+And the `recipient` field in the JSON schema is constrained to:
+
+```json
+{"enum": ["@Human", "@Developer456", "QA"]}
+```
 
 This is thread-safe: multiple agents run `act()` concurrently on separate Pykka threads,
 each with its own per-call subclass.
@@ -202,7 +255,7 @@ each with its own per-call subclass.
 | `@MemberName` | Direct send to the named actor in the current team |
 | `RoleName` | `hire_member(role)` → create actor → send |
 
-Before delivery, the message content is enriched with the sender and message type:
+Before delivery, the message content is enriched with the sender and intent:
 
 ```python
 content = f"You received a request from @Manager:\n\n{request.message}"
@@ -210,7 +263,8 @@ content = f"You received a request from @Manager:\n\n{request.message}"
 
 This enriched content is what the **receiving** agent's LLM sees in its conversation
 history. Combined with its own `StructuredOutput` docstring (which independently injects
-the sender and protocol), the receiving LLM has redundant signals about how to respond.
+the sender and reply protocol), the receiving LLM has redundant signals about how to
+respond.
 
 On `LLMUsageLimitError`, the agent escalates to the first team member with
 `role="human"` via `notify_human()`.
@@ -236,16 +290,17 @@ human_proxy.process_human_input("My answer", original_message)
 
 ## Message Protocol
 
-The 5-type protocol controls conversation flow. The LLM receives a behavioral instruction
-(`REPLY_PROTOCOLS`) in its structured output schema that guides what to return:
+The 5-type intent protocol controls conversation flow. When processing an incoming
+message, the LLM receives a behavioral instruction (`REPLY_PROTOCOLS`) in its structured
+output schema that guides what to return:
 
-| Type | Sender intent | Receiver instruction | Expected reply |
-|---|---|---|---|
-| `request` | Ask recipient to act | "You MUST respond to {sender}. You may also delegate." | `response` |
-| `response` | Reply to a request | "Continue or end the exchange." | Optional |
-| `notification` | Informational only | "Do NOT reply. Return an empty list." | None |
-| `instruction` | Give direction | "Acknowledge to {sender}. You may also delegate." | `acknowledgment` |
-| `acknowledgment` | Confirm receipt | "No further action needed. Return an empty list." | None |
+| Intent | Receiver instruction |
+|---|---|
+| `request` | "Carry out the task and respond to {sender}. You may also delegate." |
+| `instruction` | "Carry out the task and acknowledge to {sender} if requested." |
+| `response` | "Analyse the response and continue or end the exchange." |
+| `notification` | "Informational only. Do NOT reply to {sender}. Return an empty list." |
+| `acknowledgment` | "Receipt confirmed. No further action needed. Return an empty list." |
 
 The protocol is **soft guidance**, not framework enforcement. The LLM is guided to return
 an empty list for `notification` and `acknowledgment`, but the framework processes
@@ -255,9 +310,6 @@ enforcement would be brittle.
 **No reply does not mean no processing.** When the protocol says "return an empty list",
 the LLM still runs — it absorbs the message into its context, which may inform future
 decisions. The empty list simply means no outbound messages are sent.
-
-The message type set on `Request.message_type` flows directly into the delivered
-`AgentMessage.type`, so every receiver sees the intent of the sender.
 
 ## Team Composition
 
@@ -378,13 +430,12 @@ Agents without `WorkspaceTool` are unaffected — the expansion block is a no-op
 
 ```bash
 cd packages/akgentic-agent
-uv run python examples/04_simple_team.py
+uv run python examples/simple_team.py
 ```
 
-| # | Script | Topic |
-|---|---|---|
-| 00 | `00_example.py` | Minimal single-agent setup — one message, inspect telemetry |
-| 04 | `04_simple_team.py` | Three-role interactive team with search, workspace, planning, and `/commands` |
+| Script | Topic |
+|---|---|
+| `simple_team.py` | Three-role interactive team with search, workspace, planning, and `/commands` |
 
 See the [Examples README](examples/README.md) for full descriptions and running instructions.
 

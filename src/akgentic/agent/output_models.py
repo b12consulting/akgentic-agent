@@ -19,13 +19,12 @@ Available roles: {roles}.
 """
 
 REPLY_PROTOCOLS: dict[str, str] = {
-    "request": "You MUST respond to {sender}. You may also delegate to others.",
-    "response": "This is a reply to your earlier request. Continue or end the exchange.",
+    "request": "Carry out the task and respond to {sender}. You may also delegate to others.",
+    "instruction": "Carry out the task and acknowledge to {sender} if requested.",
+    "response": "Analyse the response and continue or end the exchange.",
     "notification": "Informational only. Do NOT reply to {sender}. Return an empty list.",
-    "instruction": "Acknowledge to {sender} that you understood. You may also delegate to others.",
     "acknowledgment": "Receipt confirmed. No further action needed. Return an empty list.",
 }
-
 
 
 class Request(BaseModel):
@@ -40,11 +39,11 @@ class Request(BaseModel):
     ] = Field(
         ...,
         description="Choose based on intent: "
-        "'request' = ask recipient to act, a reply to this message is expected; "
-        "'response' = reply to a previous request; "
-        "'notification' = notification the recipient, no reply to this message is expected; "
-        "'instruction' = give instruction to the recipient, an acknowledgment is expected; "
-        "'acknowledgment' = confirm receipt of an instruction.",
+        "'request' = ask recipient to perform a task and reply to you with the result; "
+        "'instruction' = direct recipient to perform a task, you may ask for acknowledgement; "
+        "'response' = respond to a previous request; "
+        "'notification' = send information to the recipient, no reply is expected; "
+        "'acknowledgment' = confirm receipt of an instruction, no reply is expected.",
     )
     message: str = Field(..., description="The message content to send")
     recipient: str = Field(
