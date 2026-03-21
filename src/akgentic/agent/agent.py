@@ -1,4 +1,3 @@
-
 """BaseAgent: LLM-powered team agent with delegation and collaboration.
 BaseAgent integrates with akgentic-llm's ReactAgent for all LLM management,
 with team-specific message handling and structured output patterns.
@@ -203,6 +202,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     f"from team member(s): {', '.join(senders)}."
                     "\nConsider wrapping up the current thread to process them."
                 )
+            return None
 
     # ============================================================================
     # CORE LLM INTERACTION
@@ -310,7 +310,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             (output_type,),
             {
                 "__annotations__": {
-                    "messages": list[local_request],
+                    "messages": list[local_request],  # type: ignore[valid-type]
                 },
                 "messages": Field(
                     default_factory=list,
@@ -319,16 +319,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 "__doc__": structured_output.format(
                     sender=sender,
                     message_type=self._current_message.type,
-                    reply_protocol=REPLY_PROTOCOLS.get(
-                        self._current_message.type, ""
-                    ).format(sender=sender),
+                    reply_protocol=REPLY_PROTOCOLS.get(self._current_message.type, "").format(
+                        sender=sender
+                    ),
                     team=", ".join(team) or "no other members",
                     roles=", ".join(roles) or "no roles available",
                 ),
             },
         )
 
-        return local_output_type  # type: ignore[return-value]
+        return local_output_type  # pyright: ignore[reportReturnType]
 
     def process_message(self, message_content: str, sender: ActorAddress) -> None:
 
@@ -346,8 +346,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 article = "an" if request.message_type[0] in "aeiou" else "a"
                 content = (
                     f"You received {article} {request.message_type}"
-                    f" from {self.config.name}:\n\n"
-                    + request.message
+                    f" from {self.config.name}:\n\n" + request.message
                 )
                 self.send(
                     member,
@@ -420,7 +419,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         if self._hire_member_command is None:
             raise RuntimeError("hire_member command not available — TeamTool not configured")
 
-        return self._hire_member_command(role)
+        return cast(ActorAddress, self._hire_member_command(role))
 
     # ============================================================================
     # CMD_ COMMANDS (for programmatic / slash-command use, e.g. agent_team.py)
@@ -466,7 +465,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             raise RuntimeError("fire_member command not available — TeamTool not configured")
 
         try:
-            return self._fire_member_command(name)
+            return cast(str, self._fire_member_command(name))
         except ModelRetry as e:
             return str(e)
 
@@ -482,7 +481,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         if self._get_planning_command is None:
             raise RuntimeError("get_planning command not available — PlanningTool not configured")
 
-        return self._get_planning_command()
+        return cast(str, self._get_planning_command())
 
     def cmd_get_team_roster(self) -> str:
         """Get the current team roster as a formatted string (command version).
@@ -496,7 +495,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         if self._get_team_roster_command is None:
             raise RuntimeError("get_team_roster command not available — TeamTool not configured")
 
-        return self._get_team_roster_command()
+        return cast(str, self._get_team_roster_command())
 
     def cmd_get_role_profiles(self) -> str:
         """Get available team roles and their descriptions (command version).
@@ -510,9 +509,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         if self._get_role_profiles_command is None:
             raise RuntimeError("get_role_profiles command not available — TeamTool not configured")
 
-        return self._get_role_profiles_command()
+        return cast(str, self._get_role_profiles_command())
 
-    def cmd_get_planning_task(self, task_id: int):
+    def cmd_get_planning_task(self, task_id: int) -> Any:
         """Get a single planning task by ID (command version).
 
         Args:

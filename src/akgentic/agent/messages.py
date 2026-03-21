@@ -16,6 +16,10 @@ class AgentMessage(Message):
     """
 
     type: Literal[
-        "request", "response", "notification", "instruction", "acknowledgment",
+        "request",
+        "response",
+        "notification",
+        "instruction",
+        "acknowledgment",
     ] = "request"
     content: str
