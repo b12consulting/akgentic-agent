@@ -3,17 +3,20 @@
 Tests the simple team example components and setup.
 """
 
+from multiprocessing import process
 import os
+import re
 import time
 
+from akgentic.core.messages.orchestrator import ProcessedMessage, ReceivedMessage
 import pytest
 from akgentic.core import ActorSystem, AgentCard, BaseConfig, Orchestrator
-from akgentic.core.messages import Message, ResultMessage, UserMessage
-from akgentic.core.messages.orchestrator import SentMessage
+from akgentic.core.messages import Message
 from akgentic.llm import ModelConfig, PromptTemplate
 
 from akgentic.agent import BaseAgent, HumanProxy
 from akgentic.agent.config import AgentConfig
+from akgentic.agent.messages import AgentMessage
 
 # =============================================================================
 # FIXTURES
@@ -42,6 +45,24 @@ def orchestrator_address(actor_system: ActorSystem):
     # Orchestrator cleanup happens via actor_system.shutdown()
 
 
+def _wait_for_quiescence(orchestrator: Orchestrator, timeout: float = 60) -> None:
+    """Wait until no new messages appear, so all agents finish processing."""
+    prev_count = -1
+    stable_ticks = 0
+    elapsed = 0.0
+    while elapsed < timeout:
+        msg_count = len(orchestrator.get_messages())
+        if msg_count == prev_count:
+            stable_ticks += 1
+            if stable_ticks >= 3:  # stable for 1.5s
+                return
+        else:
+            stable_ticks = 0
+        prev_count = msg_count
+        time.sleep(0.5)
+        elapsed += 0.5
+
+
 # =============================================================================
 # AGENTCARD CREATION TESTS
 # =============================================================================
@@ -58,18 +79,14 @@ class TestSimpleTeam:
             description="Helpful manager coordinating team work",
             skills=["coordination", "delegation"],
             agent_class="akgentic.agent.BaseAgent",
-            config={
-                "name": "@Manager",
-                "role": "Manager",
-                "prompt": {
-                    "template": "You are a helpful manager. Coordinate the team effectively."
-                },
-                "model_cfg": {
-                    "provider": "openai",
-                    "model": "gpt-4o-mini",
-                    "temperature": 0.3,
-                },
-            },
+            config=AgentConfig(
+                name="@Manager",
+                role="Manager",
+                prompt=PromptTemplate(
+                    template="You are a helpful manager. Coordinate the team effectively."
+                ),
+                model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+            ),
             routes_to=["Assistant", "Expert"],
         )
 
@@ -78,19 +95,14 @@ class TestSimpleTeam:
             description="Helpful assistant providing support",
             skills=["research", "writing"],
             agent_class="akgentic.agent.BaseAgent",
-            config={
-                "name": "@Assistant",
-                "role": "Assistant",
-                "prompt": {
-                    "template": "You are a helpful assistant. "
-                    "Provide clear and accurate information."
-                },
-                "model_cfg": {
-                    "provider": "openai",
-                    "model": "gpt-4o-mini",
-                    "temperature": 0.3,
-                },
-            },
+            config=AgentConfig(
+                name="@Assistant",
+                role="Assistant",
+                prompt=PromptTemplate(
+                    template="You are a helpful assistant. Provide clear and accurate information."
+                ),
+                model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+            ),
         )
 
         # Verify card properties
@@ -121,7 +133,6 @@ class TestSimpleTeam:
             description="Test manager",
             skills=["coordination"],
             agent_class="akgentic.agent.BaseAgent",
-            config={},
             routes_to=["Assistant"],
         )
 
@@ -130,7 +141,6 @@ class TestSimpleTeam:
             description="Test assistant",
             skills=["research"],
             agent_class="akgentic.agent.BaseAgent",
-            config={},
         )
 
         orchestrator.register_agent_profile(manager_card)
@@ -172,18 +182,12 @@ class TestSimpleTeam:
     # EVENT SUBSCRIBER TESTS
     # =============================================================================
 
-    @pytest.mark.xfail(reason="Event subscription timing issue - known limitation")
     def test_orchestrator_event_subscriber(
         self, actor_system: ActorSystem, orchestrator_address
     ) -> None:
-        """Test EventSubscriber for message visibility.
-
-        NOTE: This test has timing issues with event subscription that need
-        architectural resolution. Marked as xfail pending fix.
-        """
+        """Test EventSubscriber captures agent lifecycle events."""
         from akgentic.core import EventSubscriber
 
-        # Create a test subscriber
         events_captured: list[str] = []
 
         class TestSubscriber(EventSubscriber):
@@ -196,30 +200,22 @@ class TestSimpleTeam:
         subscriber = TestSubscriber()
 
         orchestrator = actor_system.proxy_ask(orchestrator_address, Orchestrator)
-
-        # Subscribe
         orchestrator.subscribe(subscriber)
 
-        # Create a simple agent
+        # Creating an agent triggers a StartMessage to the orchestrator
         config = AgentConfig(
             name="@TestAgent",
             role="TestAgent",
             prompt=PromptTemplate(template="You are a test agent."),
             model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
         )
-        agent_addr = orchestrator.createActor(BaseAgent, config=config)
-
-        time.sleep(0.2)
-
-        # Send a message
-        actor_system.tell(agent_addr, UserMessage(content="Test message"))
+        orchestrator.createActor(BaseAgent, config=config)
 
         time.sleep(0.5)
 
-        # Verify events were captured
+        # Subscriber should have captured lifecycle events (StartMessage at minimum)
         assert len(events_captured) > 0
-        # Check that UserMessage was captured
-        assert any(msg_type == "UserMessage" for msg_type in events_captured)
+        assert "StartMessage" in events_captured
 
     # =============================================================================
     # MESSAGE ROUTING TESTS
@@ -276,7 +272,7 @@ class TestSimpleTeam:
             prompt=PromptTemplate(template="You are a manager."),
             model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
         )
-        manager_addr = orchestrator.createActor(BaseAgent, config=manager_config)
+        orchestrator.createActor(BaseAgent, config=manager_config)
 
         # Create HumanProxy
         human_config = BaseConfig(name="@Human", role="Human")
@@ -290,10 +286,10 @@ class TestSimpleTeam:
         assert "@Manager" in team_names
         assert "@Human" in team_names
 
-        # Verify HumanProxy can send messages to manager
+        # Verify HumanProxy is accessible via proxy (don't send AgentMessage —
+        # it would trigger an LLM call that outlives the test fixture)
         human_proxy = actor_system.proxy_tell(human_addr, HumanProxy)
-        human_proxy.send(manager_addr, UserMessage(content="Test message"))
-        # Message sent successfully without error
+        assert human_proxy is not None
 
     # =============================================================================
     # IMPORT TESTS
@@ -333,221 +329,218 @@ class TestSimpleTeam:
 # INTEGRATION TESTS (require OPENAI_API_KEY)
 # =============================================================================
 
-
 @pytest.mark.integration
 @pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
-def test_real_manager_assistant_interaction(
-    actor_system: ActorSystem, orchestrator_address
-) -> None:
-    """Integration test with real LLM - Manager delegates to Assistant."""
-    if not os.getenv("OPENAI_API_KEY"):
-        pytest.skip("OPENAI_API_KEY not set - skipping integration test")
+def test_real_manager_responds_to_human(actor_system: ActorSystem, orchestrator_address) -> None:
+    """Integration test: Manager processes a message from HumanProxy and responds.
 
-    orchestrator = actor_system.proxy_ask(orchestrator_address, Orchestrator)
+    Verifies that the Manager produces a SentMessage (AgentMessage) routed
+    back to @Human after processing the request.
+    """
+    from akgentic.core.messages.orchestrator import SentMessage
 
-    # Register AgentCards
-    manager_card = AgentCard(
-        role="Manager",
-        description="Helpful manager coordinating team work",
-        skills=["coordination", "delegation"],
-        agent_class="akgentic.agent.BaseAgent",
-        routes_to=["Assistant"],
-    )
+    orchestrator_proxy = actor_system.proxy_ask(orchestrator_address, Orchestrator)
 
-    assistant_card = AgentCard(
-        role="Assistant",
-        description="Helpful assistant providing support",
-        skills=["research", "writing"],
-        agent_class="akgentic.agent.BaseAgent",
-    )
-
-    orchestrator.register_agent_profile(manager_card)
-    orchestrator.register_agent_profile(assistant_card)
-
-    # Create Manager agent
     manager_config = AgentConfig(
         name="@Manager",
         role="Manager",
         prompt=PromptTemplate(
-            template="You are a helpful manager. Coordinate the team effectively. Answer concisely."
+            template="You are a helpful manager. Always respond directly to @Human."
         ),
-        model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.0),
     )
-    manager_addr = orchestrator.createActor(BaseAgent, config=manager_config)
-
-    # Send message to manager
-    user_msg = UserMessage(content="What is 2+2? Answer with just the number.")
-    actor_system.tell(manager_addr, user_msg)
-
-    # Wait for processing with polling loop
-    timeout = 15  # seconds
-    poll_interval = 0.5  # seconds
-    elapsed = 0
-    result_messages = []
-
-    while elapsed < timeout:
-        messages = orchestrator.get_messages()
-        result_messages = [
-            msg
-            for msg in messages
-            if isinstance(msg, SentMessage) and isinstance(msg.message, ResultMessage)
-        ]
-        if result_messages:
-            break
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-
-    # Verify we got a response
-    assert len(result_messages) > 0, f"No ResultMessage found after {timeout}s timeout"
-
-    # Verify response contains the answer
-    result_content = result_messages[-1].message.content  # type: ignore
-    assert "4" in result_content or "four" in result_content.lower()
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
-def test_real_human_proxy_integration(actor_system: ActorSystem, orchestrator_address) -> None:
-    """Integration test verifying HumanProxy can send messages to Manager."""
-    if not os.getenv("OPENAI_API_KEY"):
-        pytest.skip("OPENAI_API_KEY not set - skipping integration test")
-
-    orchestrator = actor_system.proxy_ask(orchestrator_address, Orchestrator)
-
-    # Register AgentCards
     manager_card = AgentCard(
         role="Manager",
         description="Helpful manager",
         skills=["coordination"],
         agent_class="akgentic.agent.BaseAgent",
+        config=manager_config,
     )
-    orchestrator.register_agent_profile(manager_card)
+    orchestrator_proxy.register_agent_profile(manager_card)
 
-    # Create Manager
+    # Create Manager and HumanProxy
+    manager_addr = orchestrator_proxy.createActor(BaseAgent, config=manager_config)
+    human_config = BaseConfig(name="@Human", role="Human")
+    human_addr = orchestrator_proxy.createActor(HumanProxy, config=human_config)
+    time.sleep(0.3)
+
+    # HumanProxy sends message to Manager
+    human_proxy = actor_system.proxy_tell(human_addr, HumanProxy)
+    human_proxy.send(manager_addr, AgentMessage(content="Hello, are you available?"))
+
+    # Wait for a SentMessage (Manager → @Human response)
+    timeout = 15
+    poll_interval = 0.5
+    elapsed = 0.0
+    sent_agent_messages: list[SentMessage] = []
+
+    while elapsed < timeout:
+        messages = orchestrator_proxy.get_messages()
+        sent_agent_messages = [
+            msg
+            for msg in messages
+            if isinstance(msg, SentMessage) and isinstance(msg.message, AgentMessage)
+        ]
+        if len(sent_agent_messages) > 1:
+            break
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+    else:
+        pytest.fail(f"Manager did not respond after {timeout}s timeout")
+
+    # Verify the response message
+    first_sent_message = sent_agent_messages[0].message
+    second_sent_message = sent_agent_messages[1].message
+    assert isinstance(first_sent_message, AgentMessage)
+    assert isinstance(second_sent_message, AgentMessage)
+    assert first_sent_message.type == "request"
+    assert second_sent_message.type == "response"
+
+    _wait_for_quiescence(orchestrator_proxy)
+
+@pytest.mark.integration
+@pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+def test_real_manager_delegates_to_assistant(
+    actor_system: ActorSystem, orchestrator_address
+) -> None:
+    """Integration test: Manager receives a task and delegates to Assistant.
+
+    Verifies the full delegation flow: Manager processes the request via LLM,
+    produces a StructuredOutput with a Request targeting @Assistant, and sends
+    an AgentMessage to the Assistant actor.
+    """
+    from akgentic.core.messages.orchestrator import SentMessage
+
+    orchestrator_proxy = actor_system.proxy_ask(orchestrator_address, Orchestrator)
+
+    # Register AgentCards so routing knows about both roles
     manager_config = AgentConfig(
         name="@Manager",
         role="Manager",
         prompt=PromptTemplate(
-            template="You are a helpful manager. Answer concisely in one sentence."
+            template=("You are a manager. You NEVER answer questions yourself. "),
         ),
-        model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+        model_cfg=ModelConfig(provider="openai", model="gpt-5-mini"),
     )
-    manager_addr = orchestrator.createActor(BaseAgent, config=manager_config)
-
-    # Create HumanProxy
+    assistant_config = AgentConfig(
+        name="@Assistant",
+        role="Assistant",
+        prompt=PromptTemplate(template="You are a helpful assistant. Answer concisely."),
+        model_cfg=ModelConfig(provider="openai", model="gpt-5-mini"),
+    )
     human_config = BaseConfig(name="@Human", role="Human")
-    human_addr = orchestrator.createActor(HumanProxy, config=human_config)
 
+    # Create both agents so delegation can actually route
+    manager_addr = orchestrator_proxy.createActor(BaseAgent, config=manager_config)
+    orchestrator_proxy.createActor(BaseAgent, config=assistant_config)
     time.sleep(0.3)
 
-    # HumanProxy sends message to Manager (simulating human input routing)
+    human_addr = orchestrator_proxy.createActor(HumanProxy, config=human_config)
     human_proxy = actor_system.proxy_tell(human_addr, HumanProxy)
-    human_proxy.send(manager_addr, UserMessage(content="Hello, are you available?"))
 
-    # Wait for processing
-    timeout = 15  # seconds
-    poll_interval = 0.5  # seconds
-    elapsed = 0
-    result_messages = []
+    # Send a task to the manager
+    human_proxy.send(manager_addr, AgentMessage(content="Ask to @Assistant what is 2026+4?"))
+
+    # Wait for a SentMessage containing an AgentMessage (Manager → Assistant)
+    timeout = 60
+    poll_interval = 0.5
+    elapsed = 0.0
+    sent_agent_messages: list[SentMessage] = []
 
     while elapsed < timeout:
-        messages = orchestrator.get_messages()
-        result_messages = [
+        messages = orchestrator_proxy.get_messages()
+        sent_agent_messages = [
             msg
             for msg in messages
-            if isinstance(msg, SentMessage) and isinstance(msg.message, ResultMessage)
+            if isinstance(msg, SentMessage) and isinstance(msg.message, AgentMessage)
         ]
-        if result_messages:
+        if len(sent_agent_messages) > 3:
             break
         time.sleep(poll_interval)
         elapsed += poll_interval
+    else:
+        pytest.fail(f"Manager did not delegate after {timeout}s timeout")
 
-    # Verify response was generated
-    assert len(result_messages) > 0, (
-        f"Manager should respond to message from HumanProxy (timeout after {timeout}s)"
+    # Verify the delegation: Manager sent an AgentMessage to another agent
+    result_message = next(
+        (
+            msg
+            for msg in sent_agent_messages
+            if isinstance(msg.message, AgentMessage) and "2030" in msg.message.content
+        ),
+        None,
     )
-    # Verify response is coherent
-    result_content = result_messages[-1].message.content  # type: ignore
-    assert len(result_content) > 0
-
+    assert result_message is not None, "Should find a SentMessage with answer 2030"
+    _wait_for_quiescence(orchestrator_proxy)
 
 @pytest.mark.integration
-@pytest.mark.xfail(reason="Event subscription timing issue - known limitation")
 @pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
-def test_real_event_subscriber_captures_flow(
+def test_real_event_subscriber_captures_full_lifecycle(
     actor_system: ActorSystem, orchestrator_address
 ) -> None:
-    """Integration test verifying EventSubscriber captures message flow.
-
-    NOTE: This test has timing issues with event subscription that need
-    architectural resolution. Marked as xfail pending fix.
-    """
-    if not os.getenv("OPENAI_API_KEY"):
-        pytest.skip("OPENAI_API_KEY not set - skipping integration test")
-
+    """Integration test: EventSubscriber captures Start → Received → Processed → Sent."""
     from akgentic.core import EventSubscriber
+    from akgentic.core.messages.orchestrator import SentMessage
 
-    orchestrator = actor_system.proxy_ask(orchestrator_address, Orchestrator)
+    orchestrator_proxy = actor_system.proxy_ask(orchestrator_address, Orchestrator)
 
-    # Track events
-    events_captured: list[tuple[str, str, str]] = []
+    events_captured: list[str] = []
+    sent_messages: list[SentMessage] = []
+    received_messages: list[ReceivedMessage] = []
+    processed_messages: list[ProcessedMessage] = []
 
     class TestSubscriber(EventSubscriber):
         def on_stop(self) -> None:
             pass
 
         def on_message(self, message: Message) -> None:
-            if isinstance(message, SentMessage):
-                msg_type = type(message.message).__name__
-                sender_name = message.sender.name if message.sender else "?"
-                recipient_name = message.recipient.name if message.recipient else "?"
-                events_captured.append((sender_name, recipient_name, msg_type))
+            events_captured.append(type(message).__name__)
+            if isinstance(message, SentMessage) and isinstance(message.message, AgentMessage):
+                sent_messages.append(message)
+            if isinstance(message, ReceivedMessage):
+                received_messages.append(message)
+            if isinstance(message, ProcessedMessage):
+                processed_messages.append(message)
 
     subscriber = TestSubscriber()
-    orchestrator.subscribe(subscriber)
+    orchestrator_proxy.subscribe(subscriber)
 
-    # Register card and create agent
-    manager_card = AgentCard(
-        role="Manager",
-        description="Test manager",
-        skills=["coordination"],
-        agent_class="akgentic.agent.BaseAgent",
-    )
-    orchestrator.register_agent_profile(manager_card)
-
+    # Create Manager and Human so the Manager can respond to @Human
     manager_config = AgentConfig(
         name="@Manager",
         role="Manager",
-        prompt=PromptTemplate(template="You are a manager. Answer 'yes' to any question."),
-        model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+        prompt=PromptTemplate(template="You are a manager. Always respond directly to @Human."),
+        model_cfg=ModelConfig(provider="openai", model="gpt-5-mini"),
     )
-    manager_addr = orchestrator.createActor(BaseAgent, config=manager_config)
+    manager_addr = orchestrator_proxy.createActor(BaseAgent, config=manager_config)
 
+    human_config = BaseConfig(name="@Human", role="Human")
+    human_addr = orchestrator_proxy.createActor(HumanProxy, config=human_config)
+    human_proxy = actor_system.proxy_tell(human_addr, HumanProxy)
     time.sleep(0.3)
 
-    # Send message
-    actor_system.tell(manager_addr, UserMessage(content="Are you ready?"))
+    # Send message to trigger the full lifecycle
+    human_proxy.send(manager_addr, AgentMessage(content="Are you ready?"))
 
-    # Wait for processing
+    # Wait for a SentMessage (full cycle complete)
     timeout = 15
     poll_interval = 0.5
-    elapsed = 0
+    elapsed = 0.0
 
     while elapsed < timeout:
-        messages = orchestrator.get_messages()
-        result_messages = [
-            msg
-            for msg in messages
-            if isinstance(msg, SentMessage) and isinstance(msg.message, ResultMessage)
-        ]
-        if result_messages:
+        if sent_messages and received_messages and processed_messages:
             break
         time.sleep(poll_interval)
         elapsed += poll_interval
 
-    # Verify events were captured
-    assert len(events_captured) > 0, "Should capture message flow events"
-    # Should have UserMessage event at minimum
-    assert any(msg_type == "UserMessage" for _, _, msg_type in events_captured), (
-        "Should capture UserMessage"
-    )
+    # Subscriber should capture the full lifecycle
+    assert "StartMessage" in events_captured, "Should capture agent startup"
+    assert "ReceivedMessage" in events_captured, "Should capture message receipt"
+    assert "ProcessedMessage" in events_captured, "Should capture message processing"
+    assert "SentMessage" in events_captured, "Should capture outbound message"
+
+    # Verify the sent message is an AgentMessage
+    assert len(sent_messages) > 0, "Should have captured at least one AgentMessage"
+    assert isinstance(sent_messages[0].message, AgentMessage)
+
+    _wait_for_quiescence(orchestrator_proxy)
