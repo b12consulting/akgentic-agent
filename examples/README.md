@@ -7,180 +7,145 @@ Examples demonstrating the akgentic-agent module capabilities.
 From the **project root**:
 
 ```bash
-uv run python packages/akgentic-agent/examples/00_example.py
+uv run python packages/akgentic-agent/examples/simple_team.py
 ```
 
 From the **akgentic-agent directory**:
 
 ```bash
 cd packages/akgentic-agent
-uv run python examples/00_example.py
+uv run python examples/simple_team.py
 ```
 
 ## Available Examples
 
-### [00_example.py](00_example.py) - Simple BaseAgent Setup ✅
+### [simple_team.py](simple_team.py) — Interactive Agent Team
 
 **What it demonstrates:**
 
-- Creating an ActorSystem
-- Creating an Orchestrator to manage the team
-- Creating a BaseAgent with LLM configuration
-- Sending a UserMessage to the agent
-- Basic agent configuration with model, runtime, and usage limits
+- Defining a three-role team (Manager, Assistant, Expert) via `AgentCard`
+- Registering role profiles with the `Orchestrator` for dynamic hiring
+- Pre-hiring agents and exploring dynamic on-demand hiring via `TeamTool`
+- Interactive chat with `@mention` routing and `/commands`
+- Real-time message and tool-call visibility via `EventSubscriber`
+- `HumanProxy` as the human-in-the-loop entry point
+
+**Team structure:**
+
+```
+@Human (HumanProxy)
+    └──→ @Manager (BaseAgent, routes_to=[Assistant, Expert])
+              ├── @Assistant (BaseAgent)
+              └── @Expert (BaseAgent)
+```
 
 **Key concepts:**
 
-- `AgentConfig` — Agent configuration with prompt, model, runtime settings
-- `BaseAgent` — LLM-powered agent using ReactAgent from akgentic-llm
-- `Orchestrator` — Team management and message telemetry
-- `UserMessage` — User input message type
-- `ResultMessage` — Agent response message type
+- `AgentCard` — Declarative role definition with skills, prompt, and `routes_to`
+- `AgentCard.get_config_copy()` — Extract a fresh `AgentConfig` from a card
+- `register_agent_profiles()` — Register role blueprints with the Orchestrator
+- `EventSubscriber.on_message()` — Event-driven visibility into agent interactions
+- `ActorAddress.send()` — Route human input into the actor system
+- `proxy_ask(addr, T).cmd_*()` — Programmatic commands: roster, planning, hire/fire
+- `ToolCallEvent` — Observe LLM tool calls as they happen
 
-**Requirements:**
+**Tools included:**
 
-- OpenAI API key in environment (`OPENAI_API_KEY`)
+| Tool | Purpose | Requires |
+|---|---|---|
+| `SearchTool` | Web search, fetch, and crawl via Tavily | `TAVILY_API_KEY` |
+| `PlanningTool` | Shared task tracking across the team | — |
+| `WorkspaceTool` | File I/O anchored to a named workspace | — |
 
-### [04_simple_team.py](04_simple_team.py) - V1 Migration Example (Interactive Team Chat) ✅
+**Interactive commands:**
 
-**What it demonstrates:**
+| Command | Description |
+|---|---|
+| `@AgentName message` | Route message to a specific agent |
+| `/team` | Show current team roster |
+| `/roles` | Show available roles for hiring |
+| `/planning` | Show current team planning |
+| `/task <id>` | Show a specific planning task |
+| `/hire <role>` | Hire a new team member by role |
+| `/fire <name>` | Fire a team member by name |
+| `/help` | Show command help |
+| `/exit` | Quit |
 
-- Creating a team with Manager, Assistant, and Expert roles using AgentCard
-- Interactive chat loop with @ mention routing (e.g., `@Expert help me`)
-- HumanProxy for human-to-manager communication
-- EventSubscriber for real-time message flow visibility
-- Dynamic team composition (Manager can hire Assistant/Expert on demand)
-
-**Team Structure:**
-
-- **Manager**: Coordinates team, can hire Assistant and Expert roles
-- **Assistant**: Provides support and research
-- **Expert**: Provides specialized knowledge
-- **HumanProxy**: Routes human input to Manager
-
-**Interactive Features:**
-
-- Type messages directly to communicate via Manager
-- Use `@AgentName message` to route to specific agents
-- Type `exit` to quit the chat loop
-- Real-time message flow printed via event subscriber
-
-**Key concepts:**
-
-- `AgentCard` — Defines agent roles with skills, prompts, and routing rules
-- `AgentCard.config` — Embedded AgentConfig for each role
-- `routes_to` — Defines which roles an agent can hire
-- `register_agent_profiles()` — Registers multiple AgentCards with orchestrator
-- `EventSubscriber.on_message()` — Event-driven message monitoring
-- `HumanProxy.send()` — Sends UserMessages from human to agents
-- `orchestrator.get_team()` — Retrieves current team roster
-
-**Requirements:**
-
-- OpenAI API key in environment (`OPENAI_API_KEY`)
-
-**Run:**
+**Requirements:** `OPENAI_API_KEY`, `TAVILY_API_KEY` (for web search)
 
 ```bash
-uv run packages/akgentic-agent/examples/04_simple_team.py
+uv run python packages/akgentic-agent/examples/simple_team.py
 ```
 
-**Example interaction:**
+**Example session:**
 
 ```
-Team members:
-  - @Orchestrator (Orchestrator)
-  - @Human (Human)
-  - @Manager (Manager)
-  - @Assistant (Assistant)
-  - @Expert (Expert)
+Team Roster:
+  @Orchestrator (Orchestrator)
+  @Human (Human)
+  @Manager (Manager)
+  @Assistant (Assistant)
+  @Expert (Expert)
 
-Type your message (use @Name to route to specific agent, 'exit' to quit):
+Type your message (use @AgentName to route to a specific agent, /help for commands, /exit to quit):
 ----------------------------------------------------------------------------------------------------
-> Hello, I need help with Python
-[Manager] -> ResultMessage (@Human):
-Hello! I'd be happy to help you with Python. What specific aspect of Python do you need assistance with?
+> Hello, I need help planning a Python refactoring project
 ----------------------------------------------------------------------------------------------------
-> @Expert What are Python's best practices for error handling?
-[Expert] -> ResultMessage (@Human):
-Python's best practices for error handling include using try-except blocks, handling specific exceptions...
+[Manager] -> AgentMessage (@Human):
+I'd be happy to help you plan your Python refactoring project...
 ----------------------------------------------------------------------------------------------------
-> exit
+> @Expert What are the best practices for large-scale Python refactoring?
+----------------------------------------------------------------------------------------------------
+[Expert] -> AgentMessage (@Human):
+For large-scale Python refactoring, the key best practices are...
+----------------------------------------------------------------------------------------------------
+> /planning
+No planning tasks yet.
+> /exit
 Exiting chat loop.
 ```
 
-## Planned Examples
-
-1. **01_team_basics.py** - Basic team creation and configuration
-2. **02_continuation_messaging.py** - Multi-hop request chains with automatic answer routing
-3. **03_dynamic_composition.py** - Hire/fire agents at runtime
-4. **05_human_proxy.py** - Additional continuation-aware human-in-the-loop patterns
+---
 
 ## Prerequisites
 
 All examples require:
 
 - Python 3.12+
-- `akgentic` (akgentic-core)
-- `akgentic-llm`
-- Valid LLM API credentials (OpenAI, Anthropic, etc.)
-
-Install with:
+- `akgentic` workspace packages installed
+- A valid LLM API key
 
 ```bash
-uv sync
+# From workspace root
+uv sync --all-packages --all-extras
 ```
 
 ## Environment Variables
 
-Set your LLM provider API key:
-
 ```bash
 export OPENAI_API_KEY="your-key-here"
+export TAVILY_API_KEY="your-key-here"   # for SearchTool
 # or
 export ANTHROPIC_API_KEY="your-key-here"
 ```
 
-## Common Patterns
-
-### Creating an Agent
-
-```python
-from akgentic.agent import BaseAgent
-from akgentic.agent.config import AgentConfig
-from akgentic.llm.config import ModelConfig, RuntimeConfig, UsageLimits
-from akgentic.llm.prompts import PromptTemplate
-
-config = AgentConfig(
-    name="MyAgent",
-    role="Assistant",
-    prompt=PromptTemplate(template="You are a helpful assistant"),
-    model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
-    runtime_cfg=RuntimeConfig(temperature=0.7),
-    usage_limits=UsageLimits(total_tokens_limit=10000),
-)
-
-agent_addr = system.createActor(BaseAgent, config=config)
-```
-
-### Sending Messages
-
-```python
-from akgentic.core.messages import UserMessage
-
-message = UserMessage(content="What is 2 + 2?")
-system.ask(agent_addr, message, timeout=30)
-```
-
 ## Troubleshooting
 
-**"ModuleNotFoundError: No module named 'akgentic.agent'"**
+**`ModuleNotFoundError: No module named 'akgentic.agent'`**
 
-- Run from project root with `uv run python packages/akgentic-agent/examples/00_example.py`
-- Or ensure you're in the akgentic-agent directory: `cd packages/akgentic-agent && uv run python examples/00_example.py`
+Run from the workspace root so `uv` picks up the workspace configuration:
 
-**"API key not found"**
+```bash
+uv run python packages/akgentic-agent/examples/simple_team.py
+```
 
-- Set your environment variable: `export OPENAI_API_KEY="your-key"`
+**`API key not found`**
 
-Examples will be implemented during later stories of the akgentic-agent development cycle.
+```bash
+export OPENAI_API_KEY="your-key"
+export TAVILY_API_KEY="your-key"
+```
+
+**Agents not responding**
+
+Increase the `time.sleep()` delay after actor creation if running on a slow machine.

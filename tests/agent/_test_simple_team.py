@@ -1,13 +1,13 @@
-"""Tests for 04_simple_team_v1_adapted.py example.
+"""Tests for simple_team.py example.
 
-Tests the v1 migration example components and setup.
+Tests the simple team example components and setup.
 """
 
 import os
 import time
 
 import pytest
-from akgentic.core import ActorAddress, ActorSystem, AgentCard, BaseConfig, Orchestrator
+from akgentic.core import ActorSystem, AgentCard, BaseConfig, Orchestrator
 from akgentic.core.messages import Message, ResultMessage, UserMessage
 from akgentic.core.messages.orchestrator import SentMessage
 from akgentic.llm import ModelConfig, PromptTemplate
@@ -47,8 +47,8 @@ def orchestrator_address(actor_system: ActorSystem):
 # =============================================================================
 
 
-class TestSimpleTeamV1Adapted:
-    """Test the v1 adapted simple team example components."""
+class TestSimpleTeam:
+    """Test the simple team example components."""
 
     def test_agent_card_creation(self) -> None:
         """Test creating AgentCards for team roles."""
@@ -82,7 +82,8 @@ class TestSimpleTeamV1Adapted:
                 "name": "@Assistant",
                 "role": "Assistant",
                 "prompt": {
-                    "template": "You are a helpful assistant. Provide clear and accurate information."
+                    "template": "You are a helpful assistant. "
+                    "Provide clear and accurate information."
                 },
                 "model_cfg": {
                     "provider": "openai",
@@ -182,15 +183,15 @@ class TestSimpleTeamV1Adapted:
         """
         from akgentic.core import EventSubscriber
 
-        from akgentic.agent import HelpAnswerMessage, HelpRequestMessage
-
         # Create a test subscriber
-        events_captured: list[tuple[str, str, str]] = []
+        events_captured: list[str] = []
 
         class TestSubscriber(EventSubscriber):
-            def sentMessage(self, message: Message) -> None:
-                msg_type = type(message).__name__
-                events_captured.append((sender.name, recipient.name, msg_type))
+            def on_stop(self) -> None:
+                pass
+
+            def on_message(self, message: Message) -> None:
+                events_captured.append(type(message).__name__)
 
         subscriber = TestSubscriber()
 
@@ -218,7 +219,7 @@ class TestSimpleTeamV1Adapted:
         # Verify events were captured
         assert len(events_captured) > 0
         # Check that UserMessage was captured
-        assert any(msg_type == "UserMessage" for _, _, msg_type in events_captured)
+        assert any(msg_type == "UserMessage" for msg_type in events_captured)
 
     # =============================================================================
     # MESSAGE ROUTING TESTS
@@ -228,8 +229,6 @@ class TestSimpleTeamV1Adapted:
         """Test @ mention routing to specific agents."""
         orchestrator = actor_system.proxy_ask(orchestrator_address, Orchestrator)
 
-        orchestrator = actor_system.proxy_ask(orchestrator_address, Orchestrator)
-
         # Create two agents
         agent1_config = AgentConfig(
             name="@Agent1",
@@ -237,7 +236,7 @@ class TestSimpleTeamV1Adapted:
             prompt=PromptTemplate(template="You are agent 1."),
             model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
         )
-        agent1_addr = orchestrator.createActor(BaseAgent, config=agent1_config)
+        orchestrator.createActor(BaseAgent, config=agent1_config)
 
         agent2_config = AgentConfig(
             name="@Agent2",
@@ -245,7 +244,7 @@ class TestSimpleTeamV1Adapted:
             prompt=PromptTemplate(template="You are agent 2."),
             model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
         )
-        agent2_addr = orchestrator.createActor(BaseAgent, config=agent2_config)
+        orchestrator.createActor(BaseAgent, config=agent2_config)
 
         time.sleep(0.2)
 
@@ -304,14 +303,13 @@ class TestSimpleTeamV1Adapted:
         """Test that all imports in the example are available."""
         # Test core imports
         # Test llm imports
-        from akgentic.llm import ModelConfig, PromptTemplate
-
         # Test messages imports
         from akgentic.core import (
             ActorSystem,
             AgentCard,
             Orchestrator,
         )
+        from akgentic.llm import ModelConfig, PromptTemplate
 
         # Test team imports
         from akgentic.agent import (
@@ -353,7 +351,6 @@ def test_real_manager_assistant_interaction(
         description="Helpful manager coordinating team work",
         skills=["coordination", "delegation"],
         agent_class="akgentic.agent.BaseAgent",
-        config={},
         routes_to=["Assistant"],
     )
 
@@ -362,7 +359,6 @@ def test_real_manager_assistant_interaction(
         description="Helpful assistant providing support",
         skills=["research", "writing"],
         agent_class="akgentic.agent.BaseAgent",
-        config={},
     )
 
     orchestrator.register_agent_profile(manager_card)
@@ -424,7 +420,6 @@ def test_real_human_proxy_integration(actor_system: ActorSystem, orchestrator_ad
         description="Helpful manager",
         skills=["coordination"],
         agent_class="akgentic.agent.BaseAgent",
-        config={},
     )
     orchestrator.register_agent_profile(manager_card)
 
@@ -498,11 +493,15 @@ def test_real_event_subscriber_captures_flow(
     events_captured: list[tuple[str, str, str]] = []
 
     class TestSubscriber(EventSubscriber):
-        def sentMessage(
-            self, sender: ActorAddress, recipient: ActorAddress, message: Message
-        ) -> None:
-            msg_type = type(message).__name__
-            events_captured.append((sender.name, recipient.name, msg_type))
+        def on_stop(self) -> None:
+            pass
+
+        def on_message(self, message: Message) -> None:
+            if isinstance(message, SentMessage):
+                msg_type = type(message.message).__name__
+                sender_name = message.sender.name if message.sender else "?"
+                recipient_name = message.recipient.name if message.recipient else "?"
+                events_captured.append((sender_name, recipient_name, msg_type))
 
     subscriber = TestSubscriber()
     orchestrator.subscribe(subscriber)
@@ -513,7 +512,6 @@ def test_real_event_subscriber_captures_flow(
         description="Test manager",
         skills=["coordination"],
         agent_class="akgentic.agent.BaseAgent",
-        config={},
     )
     orchestrator.register_agent_profile(manager_card)
 
