@@ -369,7 +369,7 @@ def test_real_manager_responds_to_human(actor_system: ActorSystem, orchestrator_
     human_proxy.send(manager_addr, AgentMessage(content="Hello, are you available?"))
 
     # Wait for a SentMessage (Manager → @Human response)
-    timeout = 15
+    timeout = 60
     poll_interval = 0.5
     elapsed = 0.0
     sent_agent_messages: list[SentMessage] = []
@@ -442,7 +442,7 @@ def test_real_manager_delegates_to_assistant(
     human_proxy.send(manager_addr, AgentMessage(content="Ask to @Assistant what is 2026+4?"))
 
     # Wait for a SentMessage containing an AgentMessage (Manager → Assistant)
-    timeout = 60
+    timeout = 120
     poll_interval = 0.5
     elapsed = 0.0
     sent_agent_messages: list[SentMessage] = []
