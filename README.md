@@ -1,7 +1,7 @@
 # akgentic-agent
 
 [![CI](https://github.com/b12consulting/akgentic-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/b12consulting/akgentic-agent/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gpiroux/1de1509c7df7ff22c47eb5252bc696c3/raw/coverage.json)](https://github.com/b12consulting/akgentic-agent/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gpiroux/69ad301e9b6491972aa7324eb8953f8a/raw/coverage.json)](https://github.com/b12consulting/akgentic-agent/actions/workflows/ci.yml)
 
 LLM-driven collaborative agents for the
 [Akgentic](https://github.com/b12consulting/akgentic-quick-start) multi-agent framework.
