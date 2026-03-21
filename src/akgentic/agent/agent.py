@@ -1,4 +1,3 @@
-
 """BaseAgent: LLM-powered team agent with delegation and collaboration.
 BaseAgent integrates with akgentic-llm's ReactAgent for all LLM management,
 with team-specific message handling and structured output patterns.
@@ -22,13 +21,19 @@ import logging
 import random
 from datetime import datetime, timezone
 from time import sleep
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
+from pydantic import Field
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
-from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput, structured_output
+from akgentic.agent.output_models import (
+    REPLY_PROTOCOLS,
+    Request,
+    StructuredOutput,
+    structured_output,
+)
 from akgentic.core import ActorAddress, Akgent, Orchestrator
 from akgentic.core.agent import WarningError
 from akgentic.llm import ReactAgent, ReactAgentConfig, UserPrompt
@@ -47,12 +52,6 @@ from akgentic.tool.workspace.readers import MediaContent
 
 logger = logging.getLogger(__name__)
 
-
-class RecusionError(Exception):
-    pass
-
-
-MAX_RECURSION_DEPTH = 3
 
 T = TypeVar("T")
 
@@ -203,6 +202,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     f"from team member(s): {', '.join(senders)}."
                     "\nConsider wrapping up the current thread to process them."
                 )
+            return None
 
     # ============================================================================
     # CORE LLM INTERACTION
@@ -243,6 +243,37 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 ]
         # ── End media expansion ─────────────────────────────────────────────────
 
+        local_output_type = self._build_structured_output_type(output_type)
+
+        output = self._react_agent.run_sync(prompt, deps=self, output_type=local_output_type)
+
+        return cast(T, output)
+
+    def _build_structured_output_type(self, output_type: type[T]) -> type[T]:
+        """Build a per-call StructuredOutput subclass with schema-constrained recipients.
+
+        Creates dynamic Pydantic subclasses of Request and the given output_type that:
+
+        1. **Constrain the recipient field** — The Request subclass restricts ``recipient``
+           to an enum of valid values (``@member`` names + available role names) via
+           ``json_schema_extra``. This enum is included in the JSON schema sent to the LLM,
+           preventing invalid routing at generation time rather than catching it after.
+
+        2. **Inject per-call context into the docstring** — The output_type subclass gets a
+           dynamic ``__doc__`` that tells the LLM who sent the current message, what type it
+           is, the reply protocol to follow, and the available team/roles. pydantic-ai passes
+           this docstring as part of the structured output schema description.
+
+        A new subclass is created on every call to ensure thread-safety: multiple agents run
+        ``act()`` concurrently on separate Pykka threads, each with its own subclass.
+
+        Args:
+            output_type: The base StructuredOutput class to subclass.
+
+        Returns:
+            A per-call subclass of output_type with constrained recipients and injected
+            context in the docstring.
+        """
         assert self._current_message is not None
         assert self._current_message.sender is not None
 
@@ -250,68 +281,72 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         team = [
             agent.name
             for agent in self.get_team()
-            if agent.name != sender and not agent.name.startswith("#")
+            if agent.name != self.config.name and not agent.name.startswith("#")
         ]
         roles = self.get_available_roles()
 
-        # Create a per-call subclass to avoid mutating the shared class __doc__
-        # (thread-safety: multiple agents run act() concurrently on separate pykka threads)
+        # Valid recipients: @members for direct sends, role names for hire-on-demand
+        valid_recipients = team + roles
+
+        # Per-call Request subclass with recipient constrained to valid values
+        recipient_schema: dict[str, Any] = {"enum": valid_recipients}
+        local_request = type(
+            "Request",
+            (Request,),
+            {
+                "__annotations__": {
+                    "recipient": str,
+                },
+                "recipient": Field(
+                    ...,
+                    description="The recipient by name or role",
+                    json_schema_extra=recipient_schema,
+                ),
+            },
+        )
+
         local_output_type = type(
             output_type.__name__,
             (output_type,),
             {
+                "__annotations__": {
+                    "messages": list[local_request],  # type: ignore[valid-type]
+                },
+                "messages": Field(
+                    default_factory=list,
+                    description="Requests to send to team members; empty if no delegation needed",
+                ),
                 "__doc__": structured_output.format(
                     sender=sender,
                     message_type=self._current_message.type,
-                    reply_protocol=REPLY_PROTOCOLS.get(
-                        self._current_message.type, ""
-                    ).format(sender=sender),
+                    reply_protocol=REPLY_PROTOCOLS.get(self._current_message.type, "").format(
+                        sender=sender
+                    ),
                     team=", ".join(team) or "no other members",
                     roles=", ".join(roles) or "no roles available",
-                )
+                ),
             },
         )
 
-        output = self._react_agent.run_sync(prompt, deps=self, output_type=local_output_type)
+        return local_output_type  # pyright: ignore[reportReturnType]
 
-        return cast(T, output)
-
-    def process_message(self, message_content: str, sender: ActorAddress, count: int = 0):
-        assert self._current_message is not None
-        assert self._current_message.sender is not None
-
-        if count > MAX_RECURSION_DEPTH:
-            raise RecusionError()
+    def process_message(self, message_content: str, sender: ActorAddress) -> None:
 
         output = self.act(message_content, StructuredOutput)
-
-        roles = self.get_available_roles()
-        result = []
-        member_err = []
-        role_err = []
 
         for request in output.messages:
             recipient = request.recipient
 
-            member = None
             if recipient.startswith("@"):
-                if not (member := self.get_team_member(recipient)):
-                    logger.error(f"Invalid recipient {recipient}: not found in team members.")
-                    member_err.append(recipient)
-
-            elif recipient in roles:
-                member = self.hire_member(recipient)
-
+                member = self.get_team_member(recipient)
             else:
-                logger.error(f"Invalid recipient {recipient}: not found in team roles")
-                role_err.append(recipient)
+                member = self.hire_member(recipient)
 
             if member is not None:
                 article = "an" if request.message_type[0] in "aeiou" else "a"
                 content = (
                     f"You received {article} {request.message_type}"
-                    f" from {self.config.name}:\n\n"
-                    + request.message
+                    f" from {self.config.name}:\n\n" + request.message
                 )
                 self.send(
                     member,
@@ -321,14 +356,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                         recipient=member,
                     ),
                 )
-                result.append(member.name)
-
-        if member_err or role_err:
-            content = f"Message sent successfully to: {'; '.join(result)}.\n"
-            content += "Errors sending message to:\n"
-            content += (f"- {', '.join(role_err)}, role(s) not found.\n") if role_err else ""
-            content += (f"- {', '.join(member_err)}, member(s) not found.") if member_err else ""
-            self.process_message(content, sender, count + 1)
 
     def receiveMsg_AgentMessage(self, message: AgentMessage, sender: ActorAddress) -> None:  # noqa: N802
         """Handle incoming AgentMessage.
@@ -357,14 +384,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 + "Please review the agent's activity and give your instruction."
             )
             raise WarningError(f"LLM usage limit exceeded: {e}")
-
-        except RecusionError as e:
-            self.notify_human(
-                f"The agent {self.config.name} fails the process the message 3 times: \n"
-                + f"{message.content}\n\n"
-                + "Please review the agent's activity and give your instruction."
-            )
-            raise WarningError(f"Recursion error: {e}")
 
     def notify_human(self, message: str) -> None:
         # Sent request to the first Human agent
@@ -400,7 +419,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         if self._hire_member_command is None:
             raise RuntimeError("hire_member command not available — TeamTool not configured")
 
-        return self._hire_member_command(role)
+        return cast(ActorAddress, self._hire_member_command(role))
 
     # ============================================================================
     # CMD_ COMMANDS (for programmatic / slash-command use, e.g. agent_team.py)
@@ -446,7 +465,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             raise RuntimeError("fire_member command not available — TeamTool not configured")
 
         try:
-            return self._fire_member_command(name)
+            return cast(str, self._fire_member_command(name))
         except ModelRetry as e:
             return str(e)
 
@@ -462,7 +481,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         if self._get_planning_command is None:
             raise RuntimeError("get_planning command not available — PlanningTool not configured")
 
-        return self._get_planning_command()
+        return cast(str, self._get_planning_command())
 
     def cmd_get_team_roster(self) -> str:
         """Get the current team roster as a formatted string (command version).
@@ -476,7 +495,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         if self._get_team_roster_command is None:
             raise RuntimeError("get_team_roster command not available — TeamTool not configured")
 
-        return self._get_team_roster_command()
+        return cast(str, self._get_team_roster_command())
 
     def cmd_get_role_profiles(self) -> str:
         """Get available team roles and their descriptions (command version).
@@ -490,9 +509,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         if self._get_role_profiles_command is None:
             raise RuntimeError("get_role_profiles command not available — TeamTool not configured")
 
-        return self._get_role_profiles_command()
+        return cast(str, self._get_role_profiles_command())
 
-    def cmd_get_planning_task(self, task_id: int):
+    def cmd_get_planning_task(self, task_id: int) -> Any:
         """Get a single planning task by ID (command version).
 
         Args:

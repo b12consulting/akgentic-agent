@@ -14,11 +14,12 @@ import logging
 
 from akgentic.agent.messages import AgentMessage
 from akgentic.core import ActorAddress, UserProxy
+from akgentic.core.messages.message import Message
 
 logger = logging.getLogger(__name__)
 
 
-class HumanProxy(UserProxy):  # type: ignore[misc]
+class HumanProxy(UserProxy):
     """UserProxy with team message handling and continuation support.
 
     HumanProxy extends UserProxy with:
@@ -68,7 +69,7 @@ class HumanProxy(UserProxy):  # type: ignore[misc]
         # - Store request context for continuation tracking
         # For now, just log it - human responds via process_human_input()
 
-    def process_human_input(self, content: str, message: AgentMessage) -> None:
+    def process_human_input(self, content: str, message: Message) -> None:
         """Process human input and route back through continuation chain.
 
         Takes human's response to a AgentMessage and creates a new AgentMessage
@@ -97,7 +98,7 @@ class HumanProxy(UserProxy):  # type: ignore[misc]
         formatted_content = f"You received an answer from {self.config.name}:\n\n" + content
         answer = AgentMessage(content=formatted_content).init(
             sender=self.myAddress,
-            team_id=message.team_id if hasattr(message, "team_id") else None,
+            team_id=message.team_id,
             current_message=message,
         )
 

@@ -42,7 +42,7 @@ messages:
 - ✅ The LLM reasons about routing; conversation context is visible to it
 - ✅ Hire-by-role: LLM addresses a _role_ and the framework hires automatically
 - ✅ Transparent to the LLM — it sees the conversation history, not a hidden call stack
-- ✅ Recursion protection catches bad routing decisions automatically
+- ✅ Schema-constrained recipients prevent invalid routing at generation time
 
 ### Real-World Scenarios
 
@@ -97,11 +97,15 @@ class Request(BaseModel):
 
 The `recipient` field drives all routing logic in `process_message()`:
 
-| Recipient format          | Meaning                      | Framework action                        |
-| ------------------------- | ---------------------------- | --------------------------------------- |
-| `@MemberName`             | Existing team member by name | Direct send                             |
-| `RoleName`                | Role not yet hired           | Auto-hire then send                     |
-| `@User` (original sender) | Reply to caller              | Direct send to `current_message.sender` |
+| Recipient format | Meaning                      | Framework action    |
+| ---------------- | ---------------------------- | ------------------- |
+| `@MemberName`    | Existing team member by name | Direct send         |
+| `RoleName`       | Role not yet hired           | Auto-hire then send |
+
+Recipients are **schema-constrained** at generation time: `_build_structured_output_type()`
+creates a per-call `Request` subclass where the `recipient` field is restricted to an enum
+of valid `@member` names and available role names. Invalid recipients are prevented by the
+JSON schema sent to the LLM, not caught after the fact.
 
 ### Context is the "Call Stack"
 
@@ -155,7 +159,6 @@ index pointer, no framework-managed stack.
               │
      For each Request:
      ┌─────────────────────────────────────────────────────┐
-     │ recipient == sender.name?  → reply to caller         │
      │ recipient starts with "@"? → direct send to member   │
      │ recipient is a role name?  → auto-hire + send        │
      └─────────────────────────────────────────────────────┘
@@ -374,13 +377,13 @@ sequenceDiagram
     activate Developer
     Developer->>Developer: act() → StructuredOutput
     Note over Developer: [{recipient: "@Manager", message: "3 days"}]
-    Developer->>Manager: AgentMessage("You received an answer from Developer: 3 days")
+    Developer->>Manager: AgentMessage("You received a response from @Developer456: 3 days")
     deactivate Developer
 
     activate Manager
     Manager->>Manager: act() → StructuredOutput
     Note over Manager: [{recipient: "@User", message: "Estimate: 3 days"}]
-    Manager->>User: AgentMessage("You received an answer from Manager: Estimate: 3 days")
+    Manager->>User: AgentMessage("You received a response from @Manager: Estimate: 3 days")
     deactivate Manager
 ```
 
@@ -415,28 +418,17 @@ sequenceDiagram
 flowchart TD
     S[process_message called] --> A[act user_content StructuredOutput]
     A --> B[For each Request in output.messages]
-    B --> C{recipient == sender.name?}
-    C -->|yes| D[send reply to original sender]
-    C -->|no| E{starts with '@'?}
+    B --> E{starts with '@'?}
     E -->|yes| F[get_team_member recipient]
-    F --> G{found?}
-    G -->|yes| H[send AgentMessage to member]
-    G -->|no| I[log error → member_err list]
-    E -->|no| J[treat as role name]
-    J --> K{role in get_available_roles?}
-    K -->|yes| L[hire_member role → auto-hire]
+    F --> H[send AgentMessage to member]
+    E -->|no| L[hire_member role → auto-hire]
     L --> H
-    K -->|no| M[log error → role_err list]
-    I --> N{any errors?}
-    M --> N
-    H --> N
-    D --> N
-    N -->|yes| O[build error message → process_message recursion count+1]
-    N -->|no| P[done]
-    O --> Q{count > MAX_RECURSION_DEPTH?}
-    Q -->|yes| R[raise RecursionError → notify_human]
-    Q -->|no| S
+    H --> P[done]
 ```
+
+> **Note:** Recipients are schema-constrained at generation time via
+> `_build_structured_output_type()`, so invalid recipients cannot be produced by
+> the LLM. The routing logic is a simple two-branch dispatch.
 
 ### 5. Mailbox Notification
 
@@ -462,78 +454,75 @@ sequenceDiagram
 ### 1. Message Delivery (process_message)
 
 ```python
-def process_message(self, message_content: str, sender: ActorAddress, count: int = 0):
-    if count > MAX_RECURSION_DEPTH:
-        raise RecursionError()
-
+def process_message(self, message_content: str, sender: ActorAddress) -> None:
     output = self.act(message_content, StructuredOutput)
-
-    roles = self.get_available_roles()
-    result, member_err, role_err = [], [], []
 
     for request in output.messages:
         recipient = request.recipient
 
-        # Case 1: Reply to original sender
-        if recipient == self._current_message.sender.name:
-            member = self._current_message.sender
-            content = f"You received an answer from {self.config.name}:\n\n" + request.message
-            self.send(member, AgentMessage(content=content, recipient=member))
-
-        # Case 2: Direct send to existing member (@name)
-        elif recipient.startswith("@"):
-            if member := self.get_team_member(recipient):
-                content = f"You received a message from {self.config.name}:\n\n" + request.message
-                self.send(member, AgentMessage(content=content, recipient=member))
-                result.append(member.name)
-            else:
-                member_err.append(recipient)
-
-        # Case 3: Hire-by-role (plain role name)
+        member = None
+        if recipient.startswith("@"):
+            member = self.get_team_member(recipient)
         else:
-            if recipient in roles:
-                member = self.hire_member(recipient)
-                content = f"You received a request from {self.config.name}\n\n" + request.message
-                self.send(member, AgentMessage(content=content, recipient=member))
-                result.append(member.name)
-            else:
-                role_err.append(recipient)
+            member = self.hire_member(recipient)
 
-    # Retry on routing errors
-    if member_err or role_err:
-        error_summary = build_error_summary(result, role_err, member_err)
-        self.process_message(error_summary, sender, count + 1)
+        if member is not None:
+            article = "an" if request.message_type[0] in "aeiou" else "a"
+            content = (
+                f"You received {article} {request.message_type}"
+                f" from {self.config.name}:\n\n"
+                + request.message
+            )
+            self.send(
+                member,
+                AgentMessage(
+                    content=content,
+                    type=request.message_type,
+                    recipient=member,
+                ),
+            )
 ```
 
-### 2. Structured Output and LLM Routing Instructions
+Since recipients are schema-constrained by `_build_structured_output_type()`, the routing
+logic is a simple two-branch dispatch with no error recovery needed.
 
-Each call to `act()` creates a per-call subclass of `StructuredOutput` with dynamic
-docstring that injects team context into the LLM's output schema:
+### 2. Schema-Constrained Structured Output (_build_structured_output_type)
+
+Each call to `act()` delegates to `_build_structured_output_type()` which creates
+per-call Pydantic subclasses with two purposes:
+
+1. **Constrain recipients** — A `Request` subclass restricts `recipient` to an enum
+   of valid `@member` names + available role names via `json_schema_extra`. This enum
+   appears in the JSON schema sent to the LLM, preventing invalid routing at generation
+   time.
+
+2. **Inject per-call context** — A `StructuredOutput` subclass gets a dynamic docstring
+   with the sender, message type, reply protocol, team roster, and available roles.
 
 ```python
-local_output_type = type(
-    output_type.__name__,
-    (output_type,),
-    {
-        "__doc__": structured_output.format(
-            sender=sender,
-            team=", ".join(team) or "no other members",
-            roles=", ".join(roles) or "no roles available",
-        )
-    },
-)
+# Per-call Request subclass with constrained recipients
+valid_recipients = [f"@{name}" for name in team] + list(roles)
+local_request = type("Request", (Request,), {
+    "__annotations__": {"recipient": str},
+    "recipient": Field(..., json_schema_extra={"enum": valid_recipients}),
+})
+
+# Per-call StructuredOutput subclass with context docstring
+local_output_type = type(output_type.__name__, (output_type,), {
+    "__annotations__": {"messages": list[local_request]},
+    "messages": Field(default_factory=list),
+    "__doc__": structured_output.format(
+        sender=sender,
+        message_type=self._current_message.type,
+        reply_protocol=REPLY_PROTOCOLS.get(self._current_message.type, ""),
+        team=", ".join(team) or "no other members",
+        roles=", ".join(roles) or "no roles available",
+    ),
+})
 ```
 
-The `structured_output` template explains to the LLM its three options:
-
-```
-1. Complete your task: respond to {sender} and/or other members,
-   or return an empty list if no message is needed.
-2. Need input from team members: send request(s) to existing members
-   by name ({team}) or to new members by role ({roles}).
-3. Waiting for messages not yet arrived: return an EMPTY messages list.
-   You will be called again when the next message arrives.
-```
+This is thread-safe: each agent's `act()` call creates its own subclass on a separate
+Pykka thread.
 
 ### 3. Hire-by-Role (hire_member)
 
@@ -551,11 +540,10 @@ Internally, `TeamTool` asks the `Orchestrator` to create a new actor of the
 requested role and register it in the team roster. The address is returned and
 the message is immediately delivered to the newly hired actor.
 
-### 4. Usage Limit and Recursion Protection
+### 4. Usage Limit Protection
 
-Two guard rails protect against runaway agents:
-
-**Usage limits** (via `ReactAgent`):
+`receiveMsg_AgentMessage` catches `LLMUsageLimitError` and escalates to the first
+team member with `role="human"` via `notify_human()`:
 
 ```python
 except LLMUsageLimitError as e:
@@ -565,17 +553,7 @@ except LLMUsageLimitError as e:
     raise WarningError(f"LLM usage limit exceeded: {e}")
 ```
 
-**Recursion protection** (via `process_message`):
-
-```python
-except RecursionError as e:
-    self.notify_human(
-        f"The agent {self.config.name} fails to process the message 3 times."
-    )
-    raise WarningError(f"Recursion error: {e}")
-```
-
-Both escalate to the first `human` role in the team via `notify_human()`.
+Routing errors are no longer possible at runtime thanks to schema-constrained recipients.
 
 ---
 
@@ -666,9 +644,9 @@ StructuredOutput(messages=[
 ])
 
 # process_message() resolves each:
-# "@Human"             → sender.name match → reply
+# "@Human"             → starts with "@" → get_team_member → direct send
 # "@Developer456"      → starts with "@" → get_team_member → direct send
-# "SecurityEngineer"   → no "@" → role match → hire_member → send to new actor
+# "SecurityEngineer"   → no "@" → hire_member → send to new actor
 ```
 
 ### Example 3: Waiting for a Collaborator
@@ -800,9 +778,9 @@ StructuredOutput(messages=[
 
 3. **Don't create feedback loops**
 
-   If agent A always messages agent B who always messages agent A, recursion
-   protection (`MAX_RECURSION_DEPTH=3`) will fire and escalate to the human.
-   Design prompts with clear termination conditions.
+   If agent A always messages agent B who always messages agent A, the agents
+   will consume usage limits rapidly. Design prompts with clear termination
+   conditions. Usage limit protection will eventually escalate to the human.
 
 4. **Don't skip the `PlanningTool` for multi-step work**
 
@@ -870,9 +848,12 @@ class Request(BaseModel):
     """A directed message produced by the LLM.
 
     Attributes:
+        message_type: Intent of the message (request, response, notification, etc.).
         message: The message content to send.
         recipient: Target expressed as "@MemberName" or "RoleName".
+            Schema-constrained to valid values at generation time.
     """
+    message_type: Literal["request", "response", "notification", "instruction", "acknowledgment"]
     message: str
     recipient: str
 ```
@@ -923,11 +904,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     Key methods:
 
     act(user_content, output_type) -> T
-        Execute one LLM REACT loop. Returns output_type result.
+        Execute one LLM REACT loop. Builds schema-constrained output type
+        via _build_structured_output_type(), then delegates to ReactAgent.
 
-    process_message(message_content, sender, count=0) -> None
+    process_message(message_content, sender) -> None
         Core routing engine. Calls act(), resolves recipients,
-        delivers AgentMessage instances, retries on routing errors.
+        delivers AgentMessage instances with enriched content.
 
     receiveMsg_AgentMessage(message, sender) -> None
         Pykka message handler. Entry point for all incoming messages.
@@ -959,11 +941,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
 ```python
 class HumanProxy(UserProxy):
-    """Human-in-the-loop agent receiving AgentMessage.
+    """Human-in-the-loop agent serving as telemetry sink and input bridge.
 
     receiveMsg_AgentMessage(message, sender) -> None
-        Receives and logs AgentMessage from agents.
-        Intended for UI integration / human review queues.
+        Telemetry sink: pushes incoming messages into the event system.
+        Consumer is pluggable (console, WebSocket, WhatsApp, email, etc.).
 
     process_human_input(content, message) -> None
         Routes human response back as AgentMessage to the requesting agent.
@@ -999,7 +981,7 @@ python -m pytest tests/ --cov=akgentic.agent
 When extending the collaboration system:
 
 1. **Maintain `AgentMessage` as the sole inter-agent message type** — do not introduce new types without strong justification
-2. **Test recursion scenarios** — ensure `MAX_RECURSION_DEPTH` is honoured
+2. **Keep schema constraints in sync** — `_build_structured_output_type()` must reflect the current team roster and available roles
 3. **Document prompt patterns** — add examples to this document when new routing patterns are validated
 4. **Performance test fan-out** — benchmark with large `StructuredOutput` lists to detect delivery bottlenecks
 
