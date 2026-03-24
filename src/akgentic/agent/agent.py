@@ -36,6 +36,7 @@ from akgentic.agent.output_models import (
 )
 from akgentic.core import ActorAddress, Akgent, Orchestrator
 from akgentic.core.agent import WarningError
+from akgentic.core.messages import Message
 from akgentic.llm import ReactAgent, ReactAgentConfig, UserPrompt
 from akgentic.llm import UsageLimitError as LLMUsageLimitError
 from akgentic.tool.core import ToolFactory
@@ -204,7 +205,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 )
             return None
 
-    def init_llm_context(self, context: list[Any]) -> None:
+    def init_llm_context(self, context: list[Message]) -> None:
         """Restore LLM conversation context from persisted events.
 
         Pure pass-through: forwards events to ReactAgent which owns
@@ -214,7 +215,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Args:
             context: List of EventMessage objects from the restorer.
         """
-        self._react_agent.restore_context(context)  # type: ignore[attr-defined]
+        self._react_agent.restore_context(context)
 
     # ============================================================================
     # CORE LLM INTERACTION
