@@ -204,7 +204,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 )
             return None
 
-    def init_llm_context(self, events: list[Any]) -> None:
+    def init_llm_context(self, context: list[Any]) -> None:
         """Restore LLM conversation context from persisted events.
 
         Pure pass-through: forwards events to ReactAgent which owns
@@ -212,9 +212,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Part of the 4-layer restoration chain defined in ADR-009 (Layer 3).
 
         Args:
-            events: List of EventMessage objects from the restorer.
+            context: List of EventMessage objects from the restorer.
         """
-        self._react_agent.restore_context(events)  # type: ignore[attr-defined]
+        self._react_agent.restore_context(context)
 
     # ============================================================================
     # CORE LLM INTERACTION
