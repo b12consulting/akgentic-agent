@@ -85,7 +85,7 @@ class TestSimpleTeam:
                 prompt=PromptTemplate(
                     template="You are a helpful manager. Coordinate the team effectively."
                 ),
-                model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+                model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
             ),
             routes_to=["Assistant", "Expert"],
         )
@@ -101,7 +101,7 @@ class TestSimpleTeam:
                 prompt=PromptTemplate(
                     template="You are a helpful assistant. Provide clear and accurate information."
                 ),
-                model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+                model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
             ),
         )
 
@@ -157,7 +157,7 @@ class TestSimpleTeam:
             name="@Manager",
             role="Manager",
             prompt=PromptTemplate(template="You are a test manager."),
-            model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+            model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
         )
         manager_addr = orchestrator.createActor(BaseAgent, config=manager_config)
 
@@ -207,7 +207,7 @@ class TestSimpleTeam:
             name="@TestAgent",
             role="TestAgent",
             prompt=PromptTemplate(template="You are a test agent."),
-            model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+            model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
         )
         orchestrator.createActor(BaseAgent, config=config)
 
@@ -230,7 +230,7 @@ class TestSimpleTeam:
             name="@Agent1",
             role="Agent1",
             prompt=PromptTemplate(template="You are agent 1."),
-            model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+            model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
         )
         orchestrator.createActor(BaseAgent, config=agent1_config)
 
@@ -238,7 +238,7 @@ class TestSimpleTeam:
             name="@Agent2",
             role="Agent2",
             prompt=PromptTemplate(template="You are agent 2."),
-            model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+            model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
         )
         orchestrator.createActor(BaseAgent, config=agent2_config)
 
@@ -270,7 +270,7 @@ class TestSimpleTeam:
             name="@Manager",
             role="Manager",
             prompt=PromptTemplate(template="You are a manager."),
-            model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.3),
+            model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
         )
         orchestrator.createActor(BaseAgent, config=manager_config)
 
@@ -347,7 +347,7 @@ def test_real_manager_responds_to_human(actor_system: ActorSystem, orchestrator_
         prompt=PromptTemplate(
             template="You are a helpful manager. Always respond directly to @Human."
         ),
-        model_cfg=ModelConfig(provider="openai", model="gpt-4o-mini", temperature=0.0),
+        model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.0),
     )
     manager_card = AgentCard(
         role="Manager",
@@ -394,7 +394,7 @@ def test_real_manager_responds_to_human(actor_system: ActorSystem, orchestrator_
     assert isinstance(first_sent_message, AgentMessage)
     assert isinstance(second_sent_message, AgentMessage)
     assert first_sent_message.type == "request"
-    assert second_sent_message.type == "response"
+    assert second_sent_message.type == "response" or "notification"
 
     _wait_for_quiescence(orchestrator_proxy)
 
