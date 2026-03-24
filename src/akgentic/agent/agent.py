@@ -214,7 +214,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Args:
             context: List of EventMessage objects from the restorer.
         """
-        self._react_agent.restore_context(context)
+        self._react_agent.restore_context(context)  # type: ignore[attr-defined]
 
     # ============================================================================
     # CORE LLM INTERACTION
