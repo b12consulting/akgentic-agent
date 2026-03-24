@@ -429,3 +429,34 @@ class TestCmdGetPlanningTask:
         agent = _make_minimal_agent()
         with pytest.raises(RuntimeError, match="get_planning_task command not available"):
             agent.cmd_get_planning_task(1)
+
+
+# =============================================================================
+# init_llm_context (ADR-009 Layer 3 pass-through)
+# =============================================================================
+
+
+class TestInitLlmContext:
+    """Test init_llm_context pass-through to ReactAgent.restore_context."""
+
+    def test_passes_events_through_to_react_agent(self) -> None:
+        """AC-1/AC-2: init_llm_context delegates to _react_agent.restore_context
+        with the exact same list object (no filtering, no transformation)."""
+        agent = _make_minimal_agent()
+        events: list[Any] = [MagicMock(), MagicMock(), MagicMock()]
+
+        agent.init_llm_context(events)
+
+        agent._react_agent.restore_context.assert_called_once_with(events)  # type: ignore[attr-defined]
+        # Verify identity — same object, not a copy
+        passed_arg = agent._react_agent.restore_context.call_args[0][0]  # type: ignore[attr-defined]
+        assert passed_arg is events
+
+    def test_passes_empty_list(self) -> None:
+        """Edge case: empty event list is forwarded unchanged."""
+        agent = _make_minimal_agent()
+        events: list[Any] = []
+
+        agent.init_llm_context(events)
+
+        agent._react_agent.restore_context.assert_called_once_with(events)  # type: ignore[attr-defined]
