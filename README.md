@@ -409,6 +409,7 @@ Access via `actor_system.proxy_ask(agent_addr, BaseAgent)`:
 | `cmd_get_team_roster()` | `str` | Current team member list |
 | `cmd_get_role_profiles()` | `str` | Available roles and descriptions |
 | `cmd_get_planning_task(id)` | `Task \| str` | Single planning task by ID |
+| `get_usage_summary(by_run)` | `AgentUsageSummary` | Aggregated LLM usage and cost; queries orchestrator for `LlmUsageEvent`s via `aggregate_usage()` from `akgentic.llm`. Pass `by_run=True` for per-run breakdown. Callable via Pykka proxy. |
 
 ### Media Expansion
 
@@ -435,7 +436,7 @@ uv run python examples/simple_team.py
 
 | Script | Topic |
 |---|---|
-| `simple_team.py` | Three-role interactive team with search, workspace, planning, and `/commands` |
+| `simple_team.py` | Three-role interactive team with search, workspace, planning, `/commands`, and `/usage` for per-agent cost reporting via `EventSubscriber` |
 
 See the [Examples README](examples/README.md) for full descriptions and running instructions.
 
