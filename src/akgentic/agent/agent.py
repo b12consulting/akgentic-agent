@@ -37,7 +37,14 @@ from akgentic.agent.output_models import (
 from akgentic.core import ActorAddress, Akgent, Orchestrator
 from akgentic.core.agent import WarningError
 from akgentic.core.messages import Message
-from akgentic.llm import ReactAgent, ReactAgentConfig, UserPrompt
+from akgentic.llm import (
+    AgentUsageSummary,
+    LlmUsageEvent,
+    ReactAgent,
+    ReactAgentConfig,
+    UserPrompt,
+    aggregate_usage,
+)
 from akgentic.llm import UsageLimitError as LLMUsageLimitError
 from akgentic.tool.core import ToolFactory
 from akgentic.tool.planning import GetPlanning, GetPlanningTask
@@ -216,6 +223,32 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             context: List of EventMessage objects from the restorer.
         """
         self._react_agent.restore_context(context)
+
+    # ============================================================================
+    # USAGE TRACKING
+    # ============================================================================
+
+    def get_usage_summary(self, by_run: bool = False) -> AgentUsageSummary:
+        """Query LLM usage events and return an aggregated cost summary.
+
+        Queries the orchestrator for all LlmUsageEvent events emitted by this
+        agent, extracts the event payloads, and delegates to aggregate_usage()
+        for hierarchical cost aggregation.
+
+        Callable via Pykka proxy:
+            proxy_ask(agent_addr, BaseAgent).get_usage_summary().get()
+
+        Args:
+            by_run: When True, include per-run breakdown in the summary.
+
+        Returns:
+            AgentUsageSummary with totals, by-model, and optionally by-run detail.
+        """
+        events = self.orchestrator_proxy_ask.get_events(
+            agent_id=str(self.agent_id),
+            event_class=LlmUsageEvent,
+        ).get()
+        return aggregate_usage([e.event for e in events], by_run=by_run)
 
     # ============================================================================
     # CORE LLM INTERACTION
