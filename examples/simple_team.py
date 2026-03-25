@@ -19,13 +19,19 @@ Run: uv run python packages/akgentic-agent/examples/simple_team.py
 
 import logging
 import time
+from collections import defaultdict
 
 from akgentic.core import ActorSystem, AgentCard, BaseConfig, EventSubscriber, Orchestrator
 from akgentic.core.messages import Message
 from akgentic.core.messages.orchestrator import EventMessage, SentMessage
-from akgentic.llm import ModelConfig, PromptTemplate
+from akgentic.llm import (
+    LlmUsageEvent,
+    ModelConfig,
+    PromptTemplate,
+    ToolCallEvent,
+    aggregate_usage,
+)
 from akgentic.llm.config import RuntimeConfig, UsageLimits
-from akgentic.tool import ToolCallEvent
 from akgentic.tool.planning import PlanningTool, UpdatePlanning
 from akgentic.tool.search import SearchTool, WebCrawl, WebFetch, WebSearch
 from akgentic.tool.workspace import WorkspaceTool
@@ -139,7 +145,15 @@ agent_cards = [manager_card, assistant_card, expert_card]
 
 
 class MessagePrinter(EventSubscriber):
-    """Prints AgentMessages and tool-call events from the orchestrator."""
+    """Prints AgentMessages and tool-call events from the orchestrator.
+
+    Collects LlmUsageEvent per agent for on-demand cost reporting via /usage.
+    """
+
+    EXCLUDED_ROLES = {"Orchestrator", "Human", "human"}
+
+    def __init__(self) -> None:
+        self._usage_events: dict[str, list[LlmUsageEvent]] = defaultdict(list)
 
     def on_stop(self) -> None:
         pass
@@ -150,26 +164,80 @@ class MessagePrinter(EventSubscriber):
 
         if isinstance(message, SentMessage):
             self.handle_sent_message(message, sender)
-        elif isinstance(message, EventMessage) and isinstance(message.event, ToolCallEvent):
-            self.handle_tool_call_event(message, sender)
+        elif isinstance(message, EventMessage):
+            if isinstance(message.event, ToolCallEvent):
+                self.handle_tool_call_event(message, sender)
+            elif isinstance(message.event, LlmUsageEvent):
+                if message.sender.role not in self.EXCLUDED_ROLES:
+                    self._usage_events[sender].append(message.event)
 
     def handle_tool_call_event(self, message: EventMessage, sender: str) -> None:
         assert isinstance(message.event, ToolCallEvent)
         event = message.event
         print("-" * 100)
-        print(f"[{sender}] -> {event.tool_name} - {event.args} - {event.kwargs}\n")
+        print(f"[{sender}] -> {event.tool_name} - {event.arguments}\n")
 
     def handle_sent_message(self, message: SentMessage, sender: str) -> None:
         msg = message.message
         recipient = message.recipient.name
 
-        # Print any message that has a content attribute
         if hasattr(msg, "content"):
             message_name = msg.__class__.__name__
             content = getattr(msg, "content", "")
             type = getattr(msg, "type", "")
             print("-" * 100)
             print(f"[{sender}] -> {message_name}({type}) [{recipient}]: \n{content}\n")
+
+    @staticmethod
+    def _fmt_tokens(n: int) -> str:
+        """Format token count with European thousands separator (dot)."""
+        return f"{n:,}".replace(",", ".")
+
+    @staticmethod
+    def _fmt_cost(c: float) -> str:
+        """Format cost in European style (comma decimal). Show — when zero."""
+        if c == 0.0:
+            return "       —"
+        formatted = f"{c:,.4f}".replace(",", " ").replace(".", ",").replace(" ", ".")
+        return f"${formatted}"
+
+    def get_usage_report(self) -> str:
+        """Build a usage report across all tracked agents using aggregate_usage()."""
+        lines = [
+            "\n  LLM Usage Report",
+            "  " + "=" * 80,
+            f"  {'Agent':<20} {'in':>10}  {'out':>10}  {'reqs':>4}  {'cost':>10}",
+            "  " + "-" * 80,
+        ]
+
+        total_input = 0
+        total_output = 0
+        total_cost = 0.0
+        total_requests = 0
+
+        for name in sorted(self._usage_events):
+            summary = aggregate_usage(self._usage_events[name])
+            total_input += summary.total_input_tokens
+            total_output += summary.total_output_tokens
+            total_cost += summary.total_cost_usd
+            total_requests += summary.total_requests
+            lines.append(
+                f"  {name:<20} "
+                f"{self._fmt_tokens(summary.total_input_tokens):>10}  "
+                f"{self._fmt_tokens(summary.total_output_tokens):>10}  "
+                f"{summary.total_requests:>4}  "
+                f"{self._fmt_cost(summary.total_cost_usd):>10}"
+            )
+
+        lines.append("  " + "-" * 80)
+        lines.append(
+            f"  {'TOTAL':<20} "
+            f"{self._fmt_tokens(total_input):>10}  "
+            f"{self._fmt_tokens(total_output):>10}  "
+            f"{total_requests:>4}  "
+            f"{self._fmt_cost(total_cost):>10}"
+        )
+        return "\n".join(lines)
 
 
 # =============================================================================
@@ -191,7 +259,8 @@ def main() -> None:
     orchestrator_proxy = actor_system.proxy_ask(orchestrator_addr, Orchestrator)
 
     # 3. Subscribe to orchestrator events for real-time message visibility
-    orchestrator_proxy.subscribe(MessagePrinter())
+    printer = MessagePrinter()
+    orchestrator_proxy.subscribe(printer)
 
     # 4. Register AgentCards — defines the roles available for dynamic hiring
     orchestrator_proxy.register_agent_profiles(agent_cards)
@@ -229,6 +298,7 @@ def main() -> None:
         print("  /task <id>      Show a specific planning task by ID")
         print("  /hire <role>    Hire a new team member by role")
         print("  /fire <name>    Fire a team member by name")
+        print("  /usage          Show LLM usage and cost per agent")
         print("  /help           Show this help message")
         print()
 
@@ -271,6 +341,8 @@ def main() -> None:
                     print(f"Hire failed: {result}")
             elif command == "fire" and arg:
                 print(manager_proxy.cmd_fire_member(arg))
+            elif command == "usage":
+                print(printer.get_usage_report())
             else:
                 print_help()
             print()
