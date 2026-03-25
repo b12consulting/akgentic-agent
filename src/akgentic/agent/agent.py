@@ -247,7 +247,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         events = self.orchestrator_proxy_ask.get_events(
             agent_id=str(self.agent_id),
             event_class=LlmUsageEvent,
-        ).get()
+        ).get()  # type: ignore[attr-defined]
         return aggregate_usage([e.event for e in events], by_run=by_run)
 
     # ============================================================================
