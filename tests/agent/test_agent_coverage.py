@@ -233,10 +233,11 @@ class TestReceiveAgentMessage:
         message = AgentMessage(content="do this", type="request")
         message.sender = _make_mock_sender("@Bob")
 
-        agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Bob"))
+        sender = _make_mock_sender("@Bob")
+        agent.receiveMsg_AgentMessage(message, sender)
 
         expected = "You received a request from @Bob:\n\ndo this"
-        agent.process_message.assert_called_once_with(expected, agent.process_message.call_args[0][1])
+        agent.process_message.assert_called_once_with(expected, sender)
 
     @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_an_for_acknowledgment(self, mock_sleep: MagicMock) -> None:
