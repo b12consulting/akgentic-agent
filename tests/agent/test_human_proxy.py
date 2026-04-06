@@ -113,4 +113,6 @@ class TestHumanProxyProcessInput:
             m for m in sent_messages if "Yes, proceed" in m.message.content
         ]
         assert len(answer_msgs) > 0
-        assert "@Human" in answer_msgs[0].message.content
+        # Content is now raw (no prefix baked in) and type is "response"
+        assert answer_msgs[0].message.content == "Yes, proceed"
+        assert answer_msgs[0].message.type == "response"

@@ -389,15 +389,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 member = self.hire_member(recipient)
 
             if member is not None:
-                article = "an" if request.message_type[0] in "aeiou" else "a"
-                content = (
-                    f"You received {article} {request.message_type}"
-                    f" from {self.config.name}:\n\n" + request.message
-                )
                 self.send(
                     member,
                     AgentMessage(
-                        content=content,
+                        content=request.message,
                         type=request.message_type,
                         recipient=member,
                     ),
@@ -422,7 +417,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         try:
             sleep(random.uniform(0.25, 0.5))  # Simulate processing delay
-            self.process_message(message.content, sender)
+            sender_name = message.sender.name if message.sender else "unknown"
+            article = "an" if message.type[0] in "aeiou" else "a"
+            prefixed_content = (
+                f"You received {article} {message.type} from {sender_name}:\n\n{message.content}"
+            )
+            self.process_message(prefixed_content, sender)
 
         except LLMUsageLimitError as e:
             self.notify_human(
