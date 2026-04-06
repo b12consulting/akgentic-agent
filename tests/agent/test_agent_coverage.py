@@ -73,7 +73,7 @@ class TestProcessMessage:
     """Test process_message routing logic."""
 
     def test_routes_to_existing_member_via_at_prefix(self) -> None:
-        """recipient starting with '@' → get_team_member."""
+        """recipient starting with '@' → get_team_member; content is raw (no prefix)."""
         agent = _make_minimal_agent()
 
         member_addr = _make_mock_sender("@Assistant")
@@ -98,9 +98,10 @@ class TestProcessMessage:
         sent_msg = agent.send.call_args[0][1]
         assert isinstance(sent_msg, AgentMessage)
         assert sent_msg.type == "request"
+        assert sent_msg.content == "do this"
 
     def test_routes_to_hire_member_without_at_prefix(self) -> None:
-        """recipient without '@' → hire_member."""
+        """recipient without '@' → hire_member; content is raw (no prefix)."""
         agent = _make_minimal_agent()
 
         hired_addr = _make_mock_sender("@Developer")
@@ -124,6 +125,7 @@ class TestProcessMessage:
         agent.send.assert_called_once()
         sent_msg = agent.send.call_args[0][1]
         assert sent_msg.type == "instruction"
+        assert sent_msg.content == "build this"
 
     def test_no_send_when_member_not_found(self) -> None:
         """When get_team_member returns None, no message is sent."""
@@ -153,8 +155,8 @@ class TestProcessMessage:
         agent.process_message("test", _make_mock_sender())
         agent.send.assert_not_called()
 
-    def test_article_an_for_vowel_message_type(self) -> None:
-        """message_type starting with vowel → 'an' article."""
+    def test_sends_raw_content_without_prefix(self) -> None:
+        """process_message sends AgentMessage with raw content (no prefix baked in)."""
         agent = _make_minimal_agent()
         member_addr = _make_mock_sender("@Assistant")
         agent.get_team_member = MagicMock(return_value=member_addr)  # type: ignore[method-assign]
@@ -172,7 +174,8 @@ class TestProcessMessage:
 
         agent.process_message("test", _make_mock_sender())
         sent_msg = agent.send.call_args[0][1]
-        assert "an acknowledgment" in sent_msg.content
+        assert sent_msg.content == "ack"
+        assert "You received" not in sent_msg.content
 
 
 # =============================================================================
@@ -184,17 +187,21 @@ class TestReceiveAgentMessage:
     """Test receiveMsg_AgentMessage handler."""
 
     @patch("akgentic.agent.agent.sleep")
-    def test_calls_process_message(self, mock_sleep: MagicMock) -> None:
-        """Normal path: calls process_message with content."""
+    def test_calls_process_message_with_reconstructed_prefix(self, mock_sleep: MagicMock) -> None:
+        """Normal path: calls process_message with reconstructed prefix from metadata."""
         agent = _make_minimal_agent()
         agent.process_message = MagicMock()  # type: ignore[method-assign]
 
-        message = AgentMessage(content="hello world")
-        sender = _make_mock_sender("@Human")
+        msg_sender = _make_mock_sender("@Alice")
+        message = AgentMessage(content="hello world", type="request")
+        message.sender = msg_sender
+
+        sender = _make_mock_sender("@Alice")
 
         agent.receiveMsg_AgentMessage(message, sender)
 
-        agent.process_message.assert_called_once_with("hello world", sender)
+        expected = "You received a request from @Alice:\n\nhello world"
+        agent.process_message.assert_called_once_with(expected, sender)
 
     @patch("akgentic.agent.agent.sleep")
     def test_usage_limit_error_notifies_human(self, mock_sleep: MagicMock) -> None:
@@ -216,6 +223,68 @@ class TestReceiveAgentMessage:
 
         agent.notify_human.assert_called_once()
         assert "exceeded" in agent.notify_human.call_args[0][0]
+
+    @patch("akgentic.agent.agent.sleep")
+    def test_reconstructs_prefix_with_a_for_consonant_type(self, mock_sleep: MagicMock) -> None:
+        """type='request' (consonant) → prefix uses 'a request'."""
+        agent = _make_minimal_agent()
+        agent.process_message = MagicMock()  # type: ignore[method-assign]
+
+        message = AgentMessage(content="do this", type="request")
+        message.sender = _make_mock_sender("@Bob")
+
+        sender = _make_mock_sender("@Bob")
+        agent.receiveMsg_AgentMessage(message, sender)
+
+        expected = "You received a request from @Bob:\n\ndo this"
+        agent.process_message.assert_called_once_with(expected, sender)
+
+    @patch("akgentic.agent.agent.sleep")
+    def test_reconstructs_prefix_with_an_for_acknowledgment(self, mock_sleep: MagicMock) -> None:
+        """type='acknowledgment' (vowel) → prefix uses 'an acknowledgment'."""
+        agent = _make_minimal_agent()
+        agent.process_message = MagicMock()  # type: ignore[method-assign]
+
+        message = AgentMessage(content="ack", type="acknowledgment")
+        message.sender = _make_mock_sender("@Carol")
+
+        agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Carol"))
+
+        called_content = agent.process_message.call_args[0][0]
+        assert called_content.startswith("You received an acknowledgment from @Carol:")
+        assert called_content.endswith("ack")
+
+    @patch("akgentic.agent.agent.sleep")
+    def test_reconstructs_prefix_with_an_for_instruction(self, mock_sleep: MagicMock) -> None:
+        """type='instruction' (vowel) → prefix uses 'an instruction'."""
+        agent = _make_minimal_agent()
+        agent.process_message = MagicMock()  # type: ignore[method-assign]
+
+        message = AgentMessage(content="step 1", type="instruction")
+        message.sender = _make_mock_sender("@Manager")
+
+        agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Manager"))
+
+        called_content = agent.process_message.call_args[0][0]
+        assert called_content.startswith("You received an instruction from @Manager:")
+        assert called_content.endswith("step 1")
+
+    @patch("akgentic.agent.agent.sleep")
+    def test_reconstructs_prefix_with_unknown_when_sender_is_none(
+        self, mock_sleep: MagicMock
+    ) -> None:
+        """message.sender is None → fallback to 'unknown'."""
+        agent = _make_minimal_agent()
+        agent.process_message = MagicMock()  # type: ignore[method-assign]
+
+        message = AgentMessage(content="hello", type="request")
+        message.sender = None
+
+        agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Somewhere"))
+
+        called_content = agent.process_message.call_args[0][0]
+        assert "from unknown:" in called_content
+        assert called_content.endswith("hello")
 
 
 # =============================================================================

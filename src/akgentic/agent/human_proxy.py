@@ -95,8 +95,7 @@ class HumanProxy(UserProxy):
 
         logger.info(f"Processing human input for request {message.id} from {destinataire}")
 
-        formatted_content = f"You received an answer from {self.config.name}:\n\n" + content
-        answer = AgentMessage(content=formatted_content).init(
+        answer = AgentMessage(content=content, type="response").init(
             sender=self.myAddress,
             team_id=message.team_id,
             current_message=message,
