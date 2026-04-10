@@ -88,20 +88,23 @@ class HumanProxy(UserProxy):
             >>> # AgentMessage routes back to Agent
         """
 
+        ## Simulate the on_receive() handler
+        self._current_message = message
+
         # The sender of the AgentMessage is who we route the answer back to
         # This is the agent who directly asked for human input
         destinataire = message.sender
         assert destinataire is not None, "AgentMessage must have a sender"
 
-        logger.info(f"Processing human input for request {message.id} from {destinataire}")
-
-        answer = AgentMessage(content=content, type="response").init(
-            sender=self.myAddress,
-            team_id=message.team_id,
-            current_message=message,
-        )
-
         # Send the answer back to the requesting agent
         # The continuation chain ensures it routes correctly even in multi-hop scenarios
-        self.send(destinataire, answer)
-        logger.info(f"Sent AgentMessage to {destinataire}")
+        self.send(
+            destinataire,
+            AgentMessage(
+                content=content,
+                type="response",
+                recipient=destinataire,
+            )
+        )
+
+        self._current_message = None
