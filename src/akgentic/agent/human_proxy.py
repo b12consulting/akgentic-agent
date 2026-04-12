@@ -72,36 +72,48 @@ class HumanProxy(UserProxy):
     def process_human_input(self, content: str, message: Message) -> None:
         """Process human input and route back through continuation chain.
 
-        Takes human's response to a AgentMessage and creates a new AgentMessage
-        that routes back to the requesting agent via the continuation chain. Supports
-        multi-hop routing where answers automatically flow back through multiple agents.
+        Takes human's response to an AgentMessage and creates a new AgentMessage
+        that routes back to the requesting agent via the continuation chain. The
+        recipient (destinataire) is derived from ``message.sender`` -- i.e. the
+        agent that originally sent the incoming message is the one that receives
+        the human's answer. Supports multi-hop routing where answers automatically
+        flow back through multiple agents.
+
+        This method simulates the ``on_receive()`` lifecycle by setting
+        ``_current_message`` before calling ``send()`` (so that ``parent_id``
+        tracking works correctly) and clearing it afterwards.
 
         Args:
             content: The human's response text.
-            message: The original AgentMessage being answered.
+            message: The original AgentMessage being answered. Its ``sender``
+                field determines the recipient of the outgoing response.
 
         Example:
             >>> # Agent A asks human for input
             >>> help_req = AgentMessage(content="Should we proceed?", ...)
             >>> # Human responds
             >>> human_proxy.process_human_input("Yes, proceed", help_req)
-            >>> # AgentMessage routes back to Agent
+            >>> # AgentMessage routes back to Agent A (message.sender)
         """
 
-        # The sender of the AgentMessage is who we route the answer back to
-        # This is the agent who directly asked for human input
-        destinataire = message.sender
-        assert destinataire is not None, "AgentMessage must have a sender"
+        # Simulate the on_receive() lifecycle so that send() can read
+        # _current_message for parent_id tracking.
+        self._current_message = message
+        try:
+            # The sender of the AgentMessage is who we route the answer back to
+            # This is the agent who directly asked for human input
+            destinataire = message.sender
+            assert destinataire is not None, "AgentMessage must have a sender"
 
-        logger.info(f"Processing human input for request {message.id} from {destinataire}")
-
-        answer = AgentMessage(content=content, type="response").init(
-            sender=self.myAddress,
-            team_id=message.team_id,
-            current_message=message,
-        )
-
-        # Send the answer back to the requesting agent
-        # The continuation chain ensures it routes correctly even in multi-hop scenarios
-        self.send(destinataire, answer)
-        logger.info(f"Sent AgentMessage to {destinataire}")
+            # Send the answer back to the requesting agent
+            # The continuation chain ensures it routes correctly even in multi-hop scenarios
+            self.send(
+                destinataire,
+                AgentMessage(
+                    content=content,
+                    type="response",
+                    recipient=destinataire,
+                ),
+            )
+        finally:
+            self._current_message = None

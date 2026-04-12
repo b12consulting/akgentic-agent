@@ -116,3 +116,7 @@ class TestHumanProxyProcessInput:
         # Content is now raw (no prefix baked in) and type is "response"
         assert answer_msgs[0].message.content == "Yes, proceed"
         assert answer_msgs[0].message.type == "response"
+        # AC-2: recipient must be set to the original sender (destinataire).
+        # Compare by agent_id since send().init() wraps addresses as ActorAddressProxy.
+        assert answer_msgs[0].message.recipient is not None
+        assert answer_msgs[0].message.recipient.agent_id == other_addr.agent_id
