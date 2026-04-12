@@ -96,23 +96,24 @@ class HumanProxy(UserProxy):
             >>> # AgentMessage routes back to Agent A (message.sender)
         """
 
-        ## Simulate the on_receive() handler
+        # Simulate the on_receive() lifecycle so that send() can read
+        # _current_message for parent_id tracking.
         self._current_message = message
+        try:
+            # The sender of the AgentMessage is who we route the answer back to
+            # This is the agent who directly asked for human input
+            destinataire = message.sender
+            assert destinataire is not None, "AgentMessage must have a sender"
 
-        # The sender of the AgentMessage is who we route the answer back to
-        # This is the agent who directly asked for human input
-        destinataire = message.sender
-        assert destinataire is not None, "AgentMessage must have a sender"
-
-        # Send the answer back to the requesting agent
-        # The continuation chain ensures it routes correctly even in multi-hop scenarios
-        self.send(
-            destinataire,
-            AgentMessage(
-                content=content,
-                type="response",
-                recipient=destinataire,
+            # Send the answer back to the requesting agent
+            # The continuation chain ensures it routes correctly even in multi-hop scenarios
+            self.send(
+                destinataire,
+                AgentMessage(
+                    content=content,
+                    type="response",
+                    recipient=destinataire,
+                ),
             )
-        )
-
-        self._current_message = None
+        finally:
+            self._current_message = None
