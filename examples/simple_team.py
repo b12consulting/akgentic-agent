@@ -161,6 +161,9 @@ class MessagePrinter(EventSubscriber):
     def on_stop(self) -> None:
         pass
 
+    def set_restoring(self, restoring: bool) -> None:
+        pass
+
     def on_message(self, message: Message) -> None:
         assert message.sender is not None
         sender = message.sender.name
