@@ -32,16 +32,14 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/akgentic"]
 
-# akgentic-* dependencies are resolved from GitHub at the release branch below.
-# The `branch` field IS the release-channel marker — on `master` it is "master",
-# on `version-1.x` it is "version-1.x". The akgentic-quick-start workspace root
-# overrides these back to `workspace = true` for local editable development.
-# Every akgentic-* dependency must be listed here explicitly — uv no longer
-# infers them from the workspace.
+# akgentic-* dependencies use `workspace = true` so this package resolves them
+# as editable workspace members inside the akgentic-quick-start workspace.
+# Standalone CI rewrites these entries to GitHub git sources at RELEASE_BRANCH
+# before `uv sync` — see the "Rewrite akgentic-* sources" step in ci.yml.
 [tool.uv.sources]
-akgentic-core = { git = "https://github.com/b12consulting/akgentic-core.git", branch = "master" }
-akgentic-llm = { git = "https://github.com/b12consulting/akgentic-llm.git", branch = "master" }
-akgentic-tool = { git = "https://github.com/b12consulting/akgentic-tool.git", branch = "master" }
+akgentic-core = { workspace = true }
+akgentic-llm = { workspace = true }
+akgentic-tool = { workspace = true }
 
 # Previously inherited from the akgentic-quick-start workspace root; the
 # standalone-package CI no longer checks out the workspace.
