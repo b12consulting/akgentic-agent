@@ -43,8 +43,20 @@ akgentic-core = { git = "https://github.com/b12consulting/akgentic-core.git", br
 akgentic-llm = { git = "https://github.com/b12consulting/akgentic-llm.git", branch = "master" }
 akgentic-tool = { git = "https://github.com/b12consulting/akgentic-tool.git", branch = "master" }
 
-# Tool configurations inherit from root workspace pyproject.toml
-# Only override when package-specific behavior is needed
+# Previously inherited from the akgentic-quick-start workspace root; the
+# standalone-package CI no longer checks out the workspace.
+# - asyncio_mode='auto' so async tests run (default is 'strict').
+# - integration tests make real LLM calls (gated by OPENAI_API_KEY) and
+#   poll for actor quiescence up to 60s; deselect them by default so CI
+#   does not hang. Run them explicitly with `-m integration`.
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: tests requiring a real LLM (OPENAI_API_KEY) — not run in default CI",
+]
 
 [tool.mypy]
 python_version = "3.12"
