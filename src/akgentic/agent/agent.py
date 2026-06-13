@@ -26,6 +26,7 @@ from typing import Any, TypeVar, cast
 
 from pydantic import Field
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
@@ -450,6 +451,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         caught inside ``dispatch`` and returned as a result string — they are
         handled here exactly like a success and never fall back to the LLM.
 
+        On any dispatched (non-``CommandNotRecognized``) outcome, exactly one
+        synthetic, human-attributed operator-action entry is appended to the
+        ReactAgent context via :meth:`_inject_operator_action`, so the agent
+        reasons about the human's action (and its result) on its next turn
+        without mistaking it for its own tool call. The fallback branch performs
+        no injection — the command never ran.
+
         Args:
             message: The incoming AgentMessage whose raw content starts with ``/``.
             sender: The ActorAddress to send the command result back to.
@@ -467,7 +475,24 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             sender,
             AgentMessage(content=result, type="notification", recipient=sender),
         )
+        self._inject_operator_action(message.content, result)
         return True
+
+    def _inject_operator_action(self, command_text: str, result: str) -> None:
+        """Append one human-attributed operator-action entry to the LLM context.
+
+        Builds a user-role ``ModelRequest`` framing the slash command as the
+        human operator's action (never the agent's own tool call) and appends it
+        through the ReactAgent context manager — the same sink that emits
+        ``LlmMessageEvent``. The entry is therefore visible on the next
+        ``run_sync`` ``message_history`` AND surfaced to context observers.
+
+        Args:
+            command_text: The original ``/``-prefixed text the human sent.
+            result: The string ``dispatch`` returned for that command.
+        """
+        entry = f'[Operator action] The human ran "{command_text}". Result: {result}'
+        self._react_agent.context.add_message(ModelRequest(parts=[UserPromptPart(content=entry)]))
 
     def notify_human(self, message: str) -> None:
         # Sent request to the first Human agent

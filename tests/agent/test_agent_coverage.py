@@ -572,6 +572,176 @@ class TestDispatchCommandHelper:
 
 
 # =============================================================================
+# Operator-action LLM-context injection (Story 8.3)
+# =============================================================================
+
+
+class TestOperatorActionInjection:
+    """AC 1-7: post-dispatch human-attributed operator-action context entry."""
+
+    @staticmethod
+    def _real_react_agent(agent: BaseAgent) -> tuple[list[Any], list[Any]]:
+        """Swap in a real ContextManager + observer; return (events, messages).
+
+        ``events`` collects every event emitted by the context manager (so we can
+        assert exactly one ``LlmMessageEvent``); ``messages`` is the live message
+        list inside the ContextManager.
+        """
+        from akgentic.llm.context import ContextManager
+
+        events: list[Any] = []
+
+        class _Observer:
+            def notify_event(self, event: object) -> None:
+                events.append(event)
+
+        ctx = ContextManager()
+        ctx.subscribe(_Observer())
+
+        react = MagicMock()
+        react.context = ctx
+        agent._react_agent = react  # type: ignore[attr-defined]
+        return events, ctx.messages  # initial snapshot (empty)
+
+    def test_success_injects_one_human_attributed_entry_with_result(self) -> None:
+        """AC-1/2/3: success → one entry, human-attributed, includes command + result."""
+        from akgentic.llm.context import ContextManager
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        agent = _make_minimal_agent()
+        events, _ = self._real_react_agent(agent)
+        ctx: ContextManager = agent._react_agent.context  # type: ignore[attr-defined]
+        agent._command_registry.dispatch.return_value = "hired @Developer42"  # type: ignore[attr-defined]
+
+        message = AgentMessage(content="/hire Developer", type="request")
+        message.sender = _make_mock_sender("@Human")
+        sender = _make_mock_sender("@Human")
+
+        handled = agent._dispatch_command(message, sender)
+
+        assert handled is True
+        msgs = ctx.messages
+        assert len(msgs) == 1
+        entry = msgs[0]
+        assert isinstance(entry, ModelRequest)
+        assert len(entry.parts) == 1
+        part = entry.parts[0]
+        assert isinstance(part, UserPromptPart)
+        content = part.content
+        assert isinstance(content, str)
+        # AC-2: operator marker + original command text reproduced verbatim
+        assert content.startswith("[Operator action]")
+        assert "/hire Developer" in content
+        # AC-3: dispatch result (member name) included
+        assert "hired @Developer42" in content
+        # the result string + send still happen
+        agent.send.assert_called_once()
+
+    def test_entry_is_human_subject_never_agent_first_person(self) -> None:
+        """AC-2: 'The human ran' phrasing; no agent first-person framing."""
+        agent = _make_minimal_agent()
+        _, _ = self._real_react_agent(agent)
+        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        agent._command_registry.dispatch.return_value = "hired @Dev9"  # type: ignore[attr-defined]
+
+        message = AgentMessage(content="/hire Developer", type="request")
+        message.sender = _make_mock_sender("@Human")
+
+        agent._dispatch_command(message, _make_mock_sender("@Human"))
+
+        content = ctx.messages[0].parts[0].content
+        assert "The human ran" in content
+        assert "I ran" not in content
+        assert "I hired" not in content
+
+    def test_injection_emits_single_llm_message_event_user_role(self) -> None:
+        """AC-4: add_message sink emits exactly one LlmMessageEvent (user-role)."""
+        from akgentic.llm import LlmMessageEvent
+        from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+        agent = _make_minimal_agent()
+        events, _ = self._real_react_agent(agent)
+        agent._command_registry.dispatch.return_value = "hired @Dev1"  # type: ignore[attr-defined]
+
+        message = AgentMessage(content="/hire Developer", type="request")
+        message.sender = _make_mock_sender("@Human")
+
+        agent._dispatch_command(message, _make_mock_sender("@Human"))
+
+        llm_events = [e for e in events if isinstance(e, LlmMessageEvent)]
+        assert len(llm_events) == 1
+        emitted = llm_events[0].message
+        assert isinstance(emitted, ModelRequest)
+        assert isinstance(emitted.parts[0], UserPromptPart)
+
+    def test_command_not_recognized_injects_nothing(self) -> None:
+        """AC-5: CommandNotRecognized → no entry appended, returns False."""
+        agent = _make_minimal_agent()
+        events, _ = self._real_react_agent(agent)
+        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        agent._command_registry.dispatch.side_effect = CommandNotRecognized("frob")  # type: ignore[attr-defined]
+
+        message = AgentMessage(content="/frobnicate", type="request")
+        message.sender = _make_mock_sender("@Human")
+
+        handled = agent._dispatch_command(message, _make_mock_sender("@Human"))
+
+        assert handled is False
+        assert ctx.messages == []
+        agent.send.assert_not_called()
+
+    def test_post_identification_failure_injects_one_entry_with_error_result(self) -> None:
+        """AC-6: bad-args dispatch returns a usage string → one entry with that result."""
+        agent = _make_minimal_agent()
+        _, _ = self._real_react_agent(agent)
+        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        agent._command_registry.dispatch.return_value = "usage: /hire <role>"  # type: ignore[attr-defined]
+
+        message = AgentMessage(content="/hire", type="request")
+        message.sender = _make_mock_sender("@Human")
+        sender = _make_mock_sender("@Human")
+
+        handled = agent._dispatch_command(message, sender)
+
+        assert handled is True
+        msgs = ctx.messages
+        assert len(msgs) == 1
+        content = msgs[0].parts[0].content
+        assert content.startswith("[Operator action]")
+        assert "/hire" in content
+        assert "usage: /hire <role>" in content
+        agent.send.assert_called_once()  # exactly one send to sender
+
+    def test_at_most_one_entry_and_one_send_per_dispatch(self) -> None:
+        """AC-7: one dispatched message → at most one entry and one send."""
+        agent = _make_minimal_agent()
+        _, _ = self._real_react_agent(agent)
+        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        agent._command_registry.dispatch.return_value = "ok"  # type: ignore[attr-defined]
+
+        message = AgentMessage(content="/roster", type="request")
+        message.sender = _make_mock_sender("@Human")
+
+        agent._dispatch_command(message, _make_mock_sender("@Human"))
+
+        assert len(ctx.messages) == 1
+        agent.send.assert_called_once()
+
+    def test_inject_helper_builds_canonical_entry(self) -> None:
+        """_inject_operator_action builds the canonical human-attributed entry."""
+        agent = _make_minimal_agent()
+        _, _ = self._real_react_agent(agent)
+        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+
+        agent._inject_operator_action("/hire Developer", "hired @Developer42")
+
+        content = ctx.messages[0].parts[0].content
+        assert content == (
+            '[Operator action] The human ran "/hire Developer". Result: hired @Developer42'
+        )
+
+
+# =============================================================================
 # init_llm_context (ADR-009 Layer 3 pass-through)
 # =============================================================================
 
