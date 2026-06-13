@@ -294,7 +294,7 @@ def main() -> None:
     print()
     # Roster via the command channel (ADR-028): the manager's CommandRegistry dispatches
     # the "/"-prefixed message and replies on the event stream (rendered by the printer).
-    human_addr.send(manager_addr, AgentMessage(content="/team_roster_prompt"))
+    human_addr.send(manager_addr, AgentMessage(content="/team_members"))
 
     # 9. Interactive chat loop
     def print_help() -> None:
@@ -320,9 +320,9 @@ def main() -> None:
     # (ADR-028). /help and /usage are handled locally by this CLI; every other "/" command
     # is sent to the manager as a normal message for its CommandRegistry to dispatch.
     command_aliases = {
-        "team": "team_roster_prompt",
-        "roles": "role_profiles_prompt",
-        "planning": "planning_prompt",
+        "team": "team_members",
+        "roles": "team_roles",
+        "planning": "planning_summary",
         "task": "get_planning_task",
         "hire": "hire_member",
         "fire": "fire_member",
