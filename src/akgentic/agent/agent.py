@@ -200,16 +200,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         for system_prompt in tool_factory.get_system_prompts():
             self._react_agent.system_prompt(system_prompt)
 
-        @self._react_agent.system_prompt
-        def mailbox_notifications(ctx: RunContext[BaseAgent]) -> str | None:
-            if inbox := ctx.deps.get_mailbox():
-                senders = {msg.sender.name for msg in inbox if msg.sender}
-                return (
-                    f"NOTICE: {len(inbox)} new message(s) arrived in your mailbox "
-                    f"from team member(s): {', '.join(senders)}."
-                    "\nConsider wrapping up the current thread to process them."
-                )
-            return None
+        if inbox := self.get_mailbox():
+            @self._react_agent.system_prompt
+            def mailbox_notifications(ctx: RunContext[BaseAgent]) -> str | None:
+                    senders = {msg.sender.name for msg in inbox if msg.sender}
+                    return (
+                        f"NOTICE: {len(inbox)} new message(s) arrived in your mailbox "
+                        f"from team member(s): {', '.join(senders)}."
+                        "\nConsider wrapping up the current thread to process them."
+                    )
 
     def init_llm_context(self, context: list[Message]) -> None:
         """Restore LLM conversation context from persisted events.
@@ -491,7 +490,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             command_text: The original ``/``-prefixed text the human sent.
             result: The string ``dispatch`` returned for that command.
         """
-        entry = f'[Operator action] The human ran "{command_text}". Result: {result}'
+        entry = f'[Operator action] The human ran "{command_text}". \nResult:\n{result}'
         self._react_agent.context.add_message(ModelRequest(parts=[UserPromptPart(content=entry)]))
 
     def notify_human(self, message: str) -> None:
