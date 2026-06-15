@@ -737,7 +737,7 @@ class TestOperatorActionInjection:
 
         content = ctx.messages[0].parts[0].content
         assert content == (
-            '[Operator action] The human ran "/hire Developer". Result: hired @Developer42'
+            '[Operator action] The human ran "/hire Developer". \nResult:\nhired @Developer42'
         )
 
 

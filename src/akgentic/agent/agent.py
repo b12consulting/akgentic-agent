@@ -186,6 +186,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             observer=self,
         )
 
+        # Surface the backstory at creation as a display-only event (no white
+        # panel for a never-run agent) WITHOUT pre-seeding the pydantic-ai run
+        # buffer. Leaving _messages empty keeps dynamic @system_prompt injection
+        # (date, roster, role profiles, mailbox) live on the first run; the first
+        # full rendering supersedes this stub latest-wins (ADR-006 §3).
+        self._react_agent.context.record_initial_system_prompt(self.state.backstory)
+
         # ── Additional dynamic system prompts ─────────────────────────────────
         # ReactAgent already registers: current_datetime_prompt + config.system_prompts
         @self._react_agent.system_prompt
