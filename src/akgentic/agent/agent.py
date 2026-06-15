@@ -26,7 +26,6 @@ from typing import Any, TypeVar, cast
 
 from pydantic import Field
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
-from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
@@ -478,20 +477,22 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         return True
 
     def _inject_operator_action(self, command_text: str, result: str) -> None:
-        """Append one human-attributed operator-action entry to the LLM context.
+        """Record one human-attributed operator-action entry for the agent.
 
-        Builds a user-role ``ModelRequest`` framing the slash command as the
-        human operator's action (never the agent's own tool call) and appends it
-        through the ReactAgent context manager — the same sink that emits
-        ``LlmMessageEvent``. The entry is therefore visible on the next
-        ``run_sync`` ``message_history`` AND surfaced to context observers.
+        Builds a user-role entry framing the slash command as the human
+        operator's action (never the agent's own tool call) and hands it to the
+        LLM ``ContextManager``. The context owns the buffer-vs-append decision:
+        before the agent's first model run it buffers the entry (folded into the
+        next run's prompt by ``ReactAgent.run``); afterwards it appends the entry
+        directly. The agent stays ignorant of pydantic-ai's first-run injection
+        rule — that coupling lives entirely in ``akgentic-llm`` (ADR-007 §3).
 
         Args:
             command_text: The original ``/``-prefixed text the human sent.
             result: The string ``dispatch`` returned for that command.
         """
         entry = f'[Operator action] The human ran "{command_text}". \nResult:\n{result}'
-        self._react_agent.context.add_message(ModelRequest(parts=[UserPromptPart(content=entry)]))
+        self._react_agent.context.record_operator_action(entry)
 
     def notify_human(self, message: str) -> None:
         # Sent request to the first Human agent
