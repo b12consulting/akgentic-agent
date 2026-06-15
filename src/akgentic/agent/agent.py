@@ -26,7 +26,6 @@ from typing import Any, TypeVar, cast
 
 from pydantic import Field
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
-from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
@@ -144,14 +143,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         # Private attributes (not serialized)
         self._max_help_requests: int = self.config.max_help_requests
-        # Operator actions (slash commands) that arrive BEFORE the agent's first
-        # model run are buffered here instead of being appended to the context.
-        # pydantic-ai only injects the registered system prompts on a run whose
-        # message_history is empty (_agent_graph.py: `if not messages`); a
-        # system-less operator-action ModelRequest in the buffer would make the
-        # first run's history non-empty and suppress the system prompt entirely.
-        # act() flushes these into the first run's user prompt.
-        self._pending_operator_actions: list[str] = []
 
         # ── Add TeamTool automatically (without mutating config) ──────────────
         # TeamTool is hardcoded in akgentic-agent package
@@ -282,15 +273,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             LLMUsageLimitError: When usage limits exceeded; sends help request
                 to Human and wraps the LLMUsageLimitError.
         """
-        # Flush operator actions buffered before the first run (see
-        # _inject_operator_action): prepend them to this run's prompt so the
-        # agent sees the human's prior actions, while message_history stays empty
-        # so pydantic-ai injects the full dynamic system prompt on this run.
-        if self._pending_operator_actions:
-            preamble = "\n\n".join(self._pending_operator_actions)
-            self._pending_operator_actions = []
-            user_content = f"{preamble}\n\n{user_content}"
-
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
         prompt: UserPrompt = user_content
         if self._command_registry.has("_expand_media_refs"):
@@ -498,46 +480,19 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """Record one human-attributed operator-action entry for the agent.
 
         Builds a user-role entry framing the slash command as the human
-        operator's action (never the agent's own tool call). Where it goes
-        depends on whether the agent has already run:
-
-        - **After the first run** (the context holds a system-bearing
-          ``ModelRequest``): appended directly through the ReactAgent context
-          manager — the same sink that emits ``LlmMessageEvent`` — so it is
-          visible on the next ``run_sync`` ``message_history`` and to observers.
-        - **Before the first run**: buffered in ``_pending_operator_actions``
-          instead. Appending a system-less ``ModelRequest`` now would make the
-          first run's ``message_history`` non-empty and cause pydantic-ai to
-          skip system-prompt injection entirely (``_agent_graph.py``:
-          ``if not messages``), so the agent would run context-blind. ``act()``
-          folds the buffer into the first run's user prompt instead.
+        operator's action (never the agent's own tool call) and hands it to the
+        LLM ``ContextManager``. The context owns the buffer-vs-append decision:
+        before the agent's first model run it buffers the entry (folded into the
+        next run's prompt by ``ReactAgent.run``); afterwards it appends the entry
+        directly. The agent stays ignorant of pydantic-ai's first-run injection
+        rule — that coupling lives entirely in ``akgentic-llm`` (ADR-007 §3).
 
         Args:
             command_text: The original ``/``-prefixed text the human sent.
             result: The string ``dispatch`` returned for that command.
         """
         entry = f'[Operator action] The human ran "{command_text}". \nResult:\n{result}'
-        if self._context_has_system_prompt():
-            self._react_agent.context.add_message(
-                ModelRequest(parts=[UserPromptPart(content=entry)])
-            )
-        else:
-            self._pending_operator_actions.append(entry)
-
-    def _context_has_system_prompt(self) -> bool:
-        """True once a real run has materialized the system prompt into context.
-
-        pydantic-ai injects the registered system prompts only on a run whose
-        ``message_history`` is empty, so a ``ModelRequest`` carrying a
-        ``system-prompt`` part appears only after the first real run (or after a
-        restore of a previously-run agent). Used to decide whether an operator
-        action may be appended directly or must be buffered.
-        """
-        return any(
-            isinstance(m, ModelRequest)
-            and any(p.part_kind == "system-prompt" for p in m.parts)
-            for m in self._react_agent.context.messages
-        )
+        self._react_agent.context.record_operator_action(entry)
 
     def notify_human(self, message: str) -> None:
         # Sent request to the first Human agent

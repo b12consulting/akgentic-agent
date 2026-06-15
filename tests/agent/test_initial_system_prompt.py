@@ -12,10 +12,11 @@ These tests assert the observable behavior:
 - FR1/FR6: after ``on_start`` (before any run) NO ``LlmSystemPromptEvent`` (nor
   any ``LlmMessageEvent``) is emitted — there is no backend creation event, and
   nothing has been appended to the run buffer.
-- FR1/FR2a/FR3: with an empty run buffer, an operator action that arrives before
-  the first run is buffered (``_pending_operator_actions``) rather than appended
-  to the context — confirming the run buffer is empty, so pydantic-ai's dynamic
-  ``@system_prompt`` injection is not suppressed on the first run.
+
+The operator-action buffering that protects this empty run buffer now lives in
+``akgentic-llm`` (the agent merely delegates via
+``context.record_operator_action``), so its buffer-vs-append behavior is
+unit-tested there rather than here.
 
 No assertion references any "ADR-NNN" string (Golden Rule #8).
 """
