@@ -68,6 +68,11 @@ def _make_minimal_agent(
 
     agent._command_registry = _make_registry(callables)  # type: ignore[attr-defined]
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
+    # __init__ is bypassed (object.__new__), so set the runtime attrs the
+    # operator-action buffering path depends on. Default to an empty, iterable
+    # context so _context_has_system_prompt() returns False (→ buffer).
+    agent._pending_operator_actions = []  # type: ignore[attr-defined]
+    agent._react_agent.context.messages = []  # type: ignore[attr-defined]
     agent._current_message = _make_mock_message()  # type: ignore[attr-defined]
 
     mock_config = MagicMock(spec=AgentConfig)
@@ -603,45 +608,57 @@ class TestOperatorActionInjection:
         agent._react_agent = react  # type: ignore[attr-defined]
         return events, ctx.messages  # initial snapshot (empty)
 
-    def test_success_injects_one_human_attributed_entry_with_result(self) -> None:
-        """AC-1/2/3: success → one entry, human-attributed, includes command + result."""
-        from akgentic.llm.context import ContextManager
-        from pydantic_ai.messages import ModelRequest, UserPromptPart
+    def _seed_system_request(self, agent: BaseAgent) -> None:
+        """Simulate a completed first run: append a system-bearing ModelRequest
+        so subsequent operator actions append directly instead of buffering."""
+        from pydantic_ai.messages import ModelRequest, SystemPromptPart, UserPromptPart
+
+        agent._react_agent.context.add_message(  # type: ignore[attr-defined]
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content="You are X.", dynamic_ref="agent_backstory"),
+                    UserPromptPart(content="prior"),
+                ]
+            )
+        )
+
+    def test_pre_run_operator_action_is_buffered_not_appended(self) -> None:
+        """AC-1/2/3: before the first run, the action is BUFFERED (not appended).
+
+        Appending a system-less ModelRequest before the first run would make
+        message_history non-empty and suppress pydantic-ai system-prompt
+        injection. The entry is buffered for act() to fold into the first run's
+        prompt, so no LlmMessageEvent is emitted yet.
+        """
+        from akgentic.llm import LlmMessageEvent
 
         agent = _make_minimal_agent()
         events, _ = self._real_react_agent(agent)
-        ctx: ContextManager = agent._react_agent.context  # type: ignore[attr-defined]
+        ctx = agent._react_agent.context  # type: ignore[attr-defined]
         agent._command_registry.dispatch.return_value = "hired @Developer42"  # type: ignore[attr-defined]
 
         message = AgentMessage(content="/hire Developer", type="request")
         message.sender = _make_mock_sender("@Human")
-        sender = _make_mock_sender("@Human")
 
-        handled = agent._dispatch_command(message, sender)
+        handled = agent._dispatch_command(message, _make_mock_sender("@Human"))
 
         assert handled is True
-        msgs = ctx.messages
-        assert len(msgs) == 1
-        entry = msgs[0]
-        assert isinstance(entry, ModelRequest)
-        assert len(entry.parts) == 1
-        part = entry.parts[0]
-        assert isinstance(part, UserPromptPart)
-        content = part.content
-        assert isinstance(content, str)
-        # AC-2: operator marker + original command text reproduced verbatim
-        assert content.startswith("[Operator action]")
-        assert "/hire Developer" in content
-        # AC-3: dispatch result (member name) included
-        assert "hired @Developer42" in content
-        # the result string + send still happen
+        # Buffered, not appended; nothing in context; no LlmMessageEvent yet.
+        assert ctx.messages == []
+        assert [e for e in events if isinstance(e, LlmMessageEvent)] == []
+        buffered = agent._pending_operator_actions  # type: ignore[attr-defined]
+        assert len(buffered) == 1
+        # AC-2/3: operator marker + command text + result reproduced verbatim.
+        assert buffered[0].startswith("[Operator action]")
+        assert "/hire Developer" in buffered[0]
+        assert "hired @Developer42" in buffered[0]
+        # The result is still sent back to the human.
         agent.send.assert_called_once()
 
-    def test_entry_is_human_subject_never_agent_first_person(self) -> None:
+    def test_buffered_entry_is_human_subject_never_agent_first_person(self) -> None:
         """AC-2: 'The human ran' phrasing; no agent first-person framing."""
         agent = _make_minimal_agent()
-        _, _ = self._real_react_agent(agent)
-        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        self._real_react_agent(agent)
         agent._command_registry.dispatch.return_value = "hired @Dev9"  # type: ignore[attr-defined]
 
         message = AgentMessage(content="/hire Developer", type="request")
@@ -649,18 +666,22 @@ class TestOperatorActionInjection:
 
         agent._dispatch_command(message, _make_mock_sender("@Human"))
 
-        content = ctx.messages[0].parts[0].content
+        content = agent._pending_operator_actions[0]  # type: ignore[attr-defined]
         assert "The human ran" in content
         assert "I ran" not in content
         assert "I hired" not in content
 
-    def test_injection_emits_single_llm_message_event_user_role(self) -> None:
-        """AC-4: add_message sink emits exactly one LlmMessageEvent (user-role)."""
+    def test_post_run_operator_action_appended_and_emits_event(self) -> None:
+        """AC-4: after the first run (system-bearing context), the action is
+        appended directly and emits exactly one user-role LlmMessageEvent."""
         from akgentic.llm import LlmMessageEvent
         from pydantic_ai.messages import ModelRequest, UserPromptPart
 
         agent = _make_minimal_agent()
         events, _ = self._real_react_agent(agent)
+        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        self._seed_system_request(agent)
+        events.clear()  # drop the seed's event; count only the operator action
         agent._command_registry.dispatch.return_value = "hired @Dev1"  # type: ignore[attr-defined]
 
         message = AgentMessage(content="/hire Developer", type="request")
@@ -668,16 +689,22 @@ class TestOperatorActionInjection:
 
         agent._dispatch_command(message, _make_mock_sender("@Human"))
 
+        # Nothing buffered; appended as the latest message.
+        assert agent._pending_operator_actions == []  # type: ignore[attr-defined]
+        appended = ctx.messages[-1]
+        assert isinstance(appended, ModelRequest)
+        assert isinstance(appended.parts[0], UserPromptPart)
+        content = appended.parts[0].content
+        assert content.startswith("[Operator action]")
+        assert "/hire Developer" in content
+        assert "hired @Dev1" in content
         llm_events = [e for e in events if isinstance(e, LlmMessageEvent)]
         assert len(llm_events) == 1
-        emitted = llm_events[0].message
-        assert isinstance(emitted, ModelRequest)
-        assert isinstance(emitted.parts[0], UserPromptPart)
 
     def test_command_not_recognized_injects_nothing(self) -> None:
-        """AC-5: CommandNotRecognized → no entry appended, returns False."""
+        """AC-5: CommandNotRecognized → nothing appended or buffered, returns False."""
         agent = _make_minimal_agent()
-        events, _ = self._real_react_agent(agent)
+        self._real_react_agent(agent)
         ctx = agent._react_agent.context  # type: ignore[attr-defined]
         agent._command_registry.dispatch.side_effect = CommandNotRecognized("frob")  # type: ignore[attr-defined]
 
@@ -688,35 +715,32 @@ class TestOperatorActionInjection:
 
         assert handled is False
         assert ctx.messages == []
+        assert agent._pending_operator_actions == []  # type: ignore[attr-defined]
         agent.send.assert_not_called()
 
-    def test_post_identification_failure_injects_one_entry_with_error_result(self) -> None:
-        """AC-6: bad-args dispatch returns a usage string → one entry with that result."""
+    def test_post_identification_failure_buffers_one_entry_with_error_result(self) -> None:
+        """AC-6: bad-args dispatch returns a usage string → one buffered entry."""
         agent = _make_minimal_agent()
-        _, _ = self._real_react_agent(agent)
-        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        self._real_react_agent(agent)
         agent._command_registry.dispatch.return_value = "usage: /hire <role>"  # type: ignore[attr-defined]
 
         message = AgentMessage(content="/hire", type="request")
         message.sender = _make_mock_sender("@Human")
-        sender = _make_mock_sender("@Human")
 
-        handled = agent._dispatch_command(message, sender)
+        handled = agent._dispatch_command(message, _make_mock_sender("@Human"))
 
         assert handled is True
-        msgs = ctx.messages
-        assert len(msgs) == 1
-        content = msgs[0].parts[0].content
-        assert content.startswith("[Operator action]")
-        assert "/hire" in content
-        assert "usage: /hire <role>" in content
+        buffered = agent._pending_operator_actions  # type: ignore[attr-defined]
+        assert len(buffered) == 1
+        assert buffered[0].startswith("[Operator action]")
+        assert "/hire" in buffered[0]
+        assert "usage: /hire <role>" in buffered[0]
         agent.send.assert_called_once()  # exactly one send to sender
 
     def test_at_most_one_entry_and_one_send_per_dispatch(self) -> None:
-        """AC-7: one dispatched message → at most one entry and one send."""
+        """AC-7: one dispatched message → at most one buffered entry and one send."""
         agent = _make_minimal_agent()
-        _, _ = self._real_react_agent(agent)
-        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        self._real_react_agent(agent)
         agent._command_registry.dispatch.return_value = "ok"  # type: ignore[attr-defined]
 
         message = AgentMessage(content="/roster", type="request")
@@ -724,21 +748,38 @@ class TestOperatorActionInjection:
 
         agent._dispatch_command(message, _make_mock_sender("@Human"))
 
-        assert len(ctx.messages) == 1
+        assert len(agent._pending_operator_actions) == 1  # type: ignore[attr-defined]
         agent.send.assert_called_once()
 
     def test_inject_helper_builds_canonical_entry(self) -> None:
-        """_inject_operator_action builds the canonical human-attributed entry."""
+        """_inject_operator_action builds the canonical human-attributed entry
+        (buffered before the first run)."""
         agent = _make_minimal_agent()
-        _, _ = self._real_react_agent(agent)
-        ctx = agent._react_agent.context  # type: ignore[attr-defined]
+        self._real_react_agent(agent)
 
         agent._inject_operator_action("/hire Developer", "hired @Developer42")
 
-        content = ctx.messages[0].parts[0].content
-        assert content == (
+        assert agent._pending_operator_actions[0] == (  # type: ignore[attr-defined]
             '[Operator action] The human ran "/hire Developer". \nResult:\nhired @Developer42'
         )
+
+    def test_buffered_actions_flushed_into_first_run_prompt(self) -> None:
+        """act() prepends buffered operator actions to the first run's prompt and
+        clears the buffer, so message_history stays empty for system-prompt injection."""
+        agent = _make_minimal_agent()
+        agent._pending_operator_actions = [  # type: ignore[attr-defined]
+            '[Operator action] The human ran "/get_planning_task 1".'
+            " \nResult:\nNo task with that ID."
+        ]
+        agent._command_registry.has = MagicMock(return_value=False)  # type: ignore[attr-defined]
+        agent._react_agent.run_sync.return_value = StructuredOutput(messages=[])  # type: ignore[attr-defined]
+
+        agent.act("You received a request from @Human:\n\nHello", StructuredOutput)
+
+        prompt = agent._react_agent.run_sync.call_args[0][0]  # type: ignore[attr-defined]
+        assert prompt.startswith('[Operator action] The human ran "/get_planning_task 1".')
+        assert "You received a request from @Human:\n\nHello" in prompt
+        assert agent._pending_operator_actions == []  # type: ignore[attr-defined]
 
 
 # =============================================================================

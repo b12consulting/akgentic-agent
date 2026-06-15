@@ -69,6 +69,8 @@ def _make_minimal_agent(name: str = "@TestAgent", media_cmd: Any = None) -> Base
     # Minimal attributes expected by act()
     agent._command_registry = _make_registry(media_cmd)  # type: ignore[attr-defined]
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
+    # act() flushes operator actions buffered before the first run (empty here).
+    agent._pending_operator_actions = []  # type: ignore[attr-defined]
     agent._current_message = _make_mock_message()  # type: ignore[attr-defined]
 
     # config.name is used by _build_structured_output_type to exclude self
