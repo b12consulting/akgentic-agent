@@ -21,8 +21,9 @@ import asyncio
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from akgentic.agent.agent import BaseAgent
 from akgentic.core import Akgent
+
+from akgentic.agent.agent import BaseAgent
 
 # =============================================================================
 # HELPERS
