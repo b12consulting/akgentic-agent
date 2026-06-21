@@ -203,6 +203,26 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                         "\nConsider wrapping up the current thread to process them."
                     )
 
+    def on_stop(self) -> None:
+        """Release LLM resources before the actor's event loop is closed.
+
+        The ReactAgent's httpx.AsyncClient (held via the pydantic-ai Model) is
+        bound to the actor's persistent event loop (run_sync reuses it), so it
+        MUST be closed on that SAME loop here — BEFORE super().on_stop() closes
+        the loop. Otherwise the connection pool survives team stop and the
+        worker's RAM grows per stopped team.
+        """
+
+        loop = self._event_loop
+        if loop is not None and not loop.is_closed():
+            try:
+                logger.warning("[%s] ReactAgent.aclose()", self.config.name)
+                loop.run_until_complete(self._react_agent.aclose())
+            except Exception as e:  # noqa: BLE001 - teardown must not raise
+                logger.warning("[%s] ReactAgent.aclose() failed on stop", self.config.name)
+                logger.exception(f"Exception during ReactAgent.aclose() - {e}")
+        super().on_stop()
+
     def _build_react_agent(
         self, config: ReactAgentConfig, tools: list[Any], toolsets: list[Any]
     ) -> ReactAgent:
