@@ -204,23 +204,17 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     )
 
     def on_stop(self) -> None:
-        """Release LLM resources before the actor's event loop is closed.
+        """Release LLM resources on stop, then run the base teardown.
 
-        The ReactAgent's httpx.AsyncClient (held via the pydantic-ai Model) is
-        bound to the actor's persistent event loop (run_sync reuses it), so it
-        MUST be closed on that SAME loop here — BEFORE super().on_stop() closes
-        the loop. Otherwise the connection pool survives team stop and the
-        worker's RAM grows per stopped team.
+        Delegates teardown to the ReactAgent's synchronous, idempotent
+        ``close()`` — the agent owns and closes its own loop now, so BaseAgent
+        no longer drives ``aclose()`` on an actor loop. ``super().on_stop()``
+        always runs last so the core StopMessage telemetry fires.
         """
-
-        loop = self._event_loop
-        if loop is not None and not loop.is_closed():
-            try:
-                logger.warning("[%s] ReactAgent.aclose()", self.config.name)
-                loop.run_until_complete(self._react_agent.aclose())
-            except Exception as e:  # noqa: BLE001 - teardown must not raise
-                logger.warning("[%s] ReactAgent.aclose() failed on stop", self.config.name)
-                logger.exception(f"Exception during ReactAgent.aclose() - {e}")
+        try:
+            self._react_agent.close()
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            logger.exception("[%s] ReactAgent.close() failed on stop", self.config.name)
         super().on_stop()
 
     def _build_react_agent(
@@ -250,7 +244,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     deps_type=BaseAgent,
                     tools=tools,
                     toolsets=toolsets,
-                    event_loop=self._event_loop,
                     observer=self,
                 ),
             )
@@ -259,7 +252,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             deps_type=BaseAgent,
             tools=tools,
             toolsets=toolsets,
-            event_loop=self._event_loop,
             observer=self,
         )
 
