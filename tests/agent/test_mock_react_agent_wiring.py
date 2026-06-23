@@ -22,9 +22,11 @@ ENV_VAR = "AKGENTIC_MOCK_SCENARIO"
 
 
 def _make_agent() -> BaseAgent:
-    """Bare BaseAgent (no Pykka actor system) with the attrs the helper reads."""
+    """Bare BaseAgent (no Pykka actor system) for ``_build_react_agent`` tests.
+
+    No ``_event_loop`` is wired — ``_build_react_agent`` no longer reads it.
+    """
     agent: BaseAgent = object.__new__(BaseAgent)
-    agent._event_loop = None  # type: ignore[assignment]
     return agent
 
 
@@ -95,3 +97,41 @@ def test_blank_env_falls_back_to_real(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert isinstance(result, _FakeReactAgent)
     assert built == ["real"]
+
+
+def test_real_path_omits_event_loop_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC #5 (real path): ReactAgent is built with NO ``event_loop`` keyword."""
+    monkeypatch.delenv(ENV_VAR, raising=False)
+
+    captured: dict[str, object] = {}
+
+    class _FakeReactAgent:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(agent_module, "ReactAgent", _FakeReactAgent)
+
+    agent = _make_agent()
+    agent._build_react_agent(ReactAgentConfig(), [], [])
+
+    assert "event_loop" not in captured
+
+
+def test_mock_path_omits_event_loop_kwarg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC #5 (mock path): MockReactAgent is built with NO ``event_loop`` keyword."""
+    monkeypatch.setenv(ENV_VAR, "/tmp/sandpile-research.yaml")
+
+    captured: dict[str, object] = {}
+
+    class _FakeMockReactAgent:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    fake_loadtest = types.ModuleType("akgentic.llm.loadtest")
+    fake_loadtest.MockReactAgent = _FakeMockReactAgent  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "akgentic.llm.loadtest", fake_loadtest)
+
+    agent = _make_agent()
+    agent._build_react_agent(ReactAgentConfig(), [], [])
+
+    assert "event_loop" not in captured
