@@ -5,18 +5,18 @@ on_hire, on_fire, hire_member, cmd_* commands.
 All tests use _make_minimal_agent pattern — no live actors or LLM calls.
 """
 
+import uuid
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from akgentic.core import ActorAddress
 from pydantic_ai import ModelRetry
 
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import Request, StructuredOutput
-from akgentic.core import ActorAddress
-
 
 # =============================================================================
 # HELPERS (same pattern as test_agent.py)
@@ -42,6 +42,9 @@ def _make_minimal_agent(name: str = "@TestAgent") -> BaseAgent:
     """Construct a BaseAgent without Pykka actor system."""
     agent: BaseAgent = object.__new__(BaseAgent)
 
+    # object.__new__ skips Akgent.__init__, so every attribute it would set has
+    # to be faked here. team_id is read by receiveMsg_AgentMessage's log line.
+    agent.team_id = uuid.uuid4()  # type: ignore[attr-defined]
     agent._expand_media_refs_command = None  # type: ignore[attr-defined]
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
     agent._current_message = _make_mock_message()  # type: ignore[attr-defined]
