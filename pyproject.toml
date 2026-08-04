@@ -8,12 +8,26 @@ authors = [
     { name = "gpiroux", email = "geoffroy.piroux@weareyuma.com" }
 ]
 keywords = ["agents", "ai", "team", "collaboration", "pydantic-ai"]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 
+# akgentic-* bounds: floor = version on this maintenance line, ceiling = next
+# minor. The ceiling is what stops a 1.3.x install from resolving to a 2.x-line
+# subpackage release already on PyPI.
 dependencies = [
     "pydantic>=2.0.0",
-    "akgentic-core",
-    "akgentic-llm",
-    "akgentic-tool",
+    "pydantic-ai>=1.107.0,<2",
+    "akgentic-core>=1.3.3,<1.4",
+    "akgentic-llm>=1.2.0,<1.3",
+    "akgentic-tool>=1.2.2,<1.3",
 ]
 
 [project.optional-dependencies]
@@ -32,9 +46,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/akgentic"]
 
-[tool.uv.sources]
-akgentic-core = { workspace = true }
-akgentic-llm = { workspace = true }
+# Note: akgentic-* dependencies have NO [tool.uv.sources] entry here.
+# - Inside the akgentic-quick-start workspace, the workspace root's
+#   [tool.uv.sources] resolves them as editable workspace members.
+# - In standalone CI, they resolve from PyPI under the bounds declared above.
+# A `akgentic-core = { workspace = true }` entry here is fatal standalone:
+# uv rejects a workspace source whose member does not exist.
 
 # Tool configurations inherit from root workspace pyproject.toml
 # Only override when package-specific behavior is needed
