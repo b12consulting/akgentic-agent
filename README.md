@@ -415,11 +415,11 @@ uv run python examples/simple_team.py
 |---|---|
 | `simple_team.py` | Three-role interactive team with search, workspace, planning, `/commands`, and `/usage` for per-agent cost reporting via `EventSubscriber` |
 
-See the [Examples README](examples/README.md) for full descriptions and running instructions.
+See the [Examples README](https://github.com/b12consulting/akgentic-agent/blob/master/examples/README.md) for full descriptions and running instructions.
 
 ## Documentation
 
-- [Agent Collaboration System](docs/agent-collaboration.md) — Collaboration model,
+- [Agent Collaboration System](https://github.com/b12consulting/akgentic-agent/blob/master/docs/agent-collaboration.md) — Collaboration model,
   routing mechanics, delegation patterns, and typed protocol walkthrough
 
 ## Development
@@ -488,4 +488,6 @@ docs/
 
 ## License
 
-See the repository root for license information.
+This project is licensed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](https://github.com/b12consulting/akgentic-agent/blob/master/LICENSE).
+
+> **Dual licensing & CLA** — Akgentic is available under the AGPL-3.0 open-source license. A commercial license is also planned for organizations that require alternative terms. Contact [Yuma](https://www.weareyuma.com/en/contact) for more information. External contributions will be accepted once a Contributor License Agreement (CLA) is in place. Until then, please hold off on submitting pull requests.
