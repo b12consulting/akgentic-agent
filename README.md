@@ -415,11 +415,11 @@ uv run python examples/simple_team.py
 |---|---|
 | `simple_team.py` | Three-role interactive team with search, workspace, planning, `/commands`, and `/usage` for per-agent cost reporting via `EventSubscriber` |
 
-See the [Examples README](examples/README.md) for full descriptions and running instructions.
+See the [Examples README](https://github.com/b12consulting/akgentic-agent/blob/master/examples/README.md) for full descriptions and running instructions.
 
 ## Documentation
 
-- [Agent Collaboration System](docs/agent-collaboration.md) — Collaboration model,
+- [Agent Collaboration System](https://github.com/b12consulting/akgentic-agent/blob/master/docs/agent-collaboration.md) — Collaboration model,
   routing mechanics, delegation patterns, and typed protocol walkthrough
 
 ## Development
