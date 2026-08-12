@@ -151,7 +151,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         react_agent_config = ReactAgentConfig(
             model_cfg=self.config.model_cfg,
             runtime_cfg=self.config.runtime_cfg,
-            usage_limits=self.config.usage_limits,
+            run_usage_limits=self.config.run_usage_limits,
+            agent_usage_limits=self.config.agent_usage_limits,
             compaction_cfg=self.config.compaction_cfg,
         )
 
