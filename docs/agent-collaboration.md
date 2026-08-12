@@ -868,17 +868,34 @@ class AgentConfig(BaseConfig):
         prompt: Agent backstory/system prompt (string or PromptTemplate).
         model_cfg: LLM provider and model settings.
         runtime_cfg: Execution parameters (temperature, max tokens, retries).
-        usage_limits: Token and request usage constraints.
+        run_usage_limits: Budget for ONE run; enforced by pydantic-ai, resets per run.
+        agent_usage_limits: Budget for the agent's WHOLE lifetime; enforced pre-flight
+            by ReactAgent, which reseeds it from replayed usage events on restore.
+        compaction_cfg: Context-compaction strategy and auto-trigger (opt-in).
         max_help_requests: Recursion depth limit for delegation chains (default: 5).
         tools: Additional ToolCard instances exposed to the LLM.
     """
     prompt: PromptTemplate
     model_cfg: ModelConfig
     runtime_cfg: RuntimeConfig
-    usage_limits: UsageLimits
+    run_usage_limits: RunUsageLimits
+    agent_usage_limits: AgentUsageLimits
+    compaction_cfg: CompactionConfig
     max_help_requests: int = 5
     tools: list[ToolCard] = []
 ```
+
+**Two usage tiers, neither enforced here.** `BaseAgent.on_start()` forwards both into the
+`ReactAgentConfig` it builds; `akgentic-llm` enforces them. The run tier bounds a single
+`run()` call (pydantic-ai, mid-run, counts reset each run); the agent tier bounds the
+agent's whole lifetime (`ReactAgent`, pre-flight before each run). The agent tier survives a
+resume without being persisted: `ReactAgent` recomputes its counters from the usage events
+replayed through `init_llm_context()`, so `AgentState` stays exactly `{backstory: str}`.
+
+The pre-split `usage_limits` spelling remains accepted as a deprecated constructor keyword
+and read accessor for `run_usage_limits` — it warns, and both are removed in
+akgentic-agent 2.0.0. Supplying `usage_limits` and `run_usage_limits` together raises
+`ValueError`. See the README's *Usage limits: two tiers* section for the migration.
 
 ### BaseAgent
 

@@ -349,9 +349,73 @@ Extends `BaseConfig` from `akgentic-core`:
 | `prompt` | `PromptTemplate` | `PromptTemplate()` | Agent backstory rendered into `AgentState.backstory` and injected as LLM system prompt |
 | `model_cfg` | `ModelConfig` | `ModelConfig()` | LLM provider, model name, API settings |
 | `runtime_cfg` | `RuntimeConfig` | `RuntimeConfig()` | Retries, parallel tools, HTTP timeouts |
-| `usage_limits` | `UsageLimits` | `UsageLimits()` | Token and request caps |
+| `run_usage_limits` | `RunUsageLimits` | `RunUsageLimits()` | Budget for **one** `run()` — token and request caps that reset every run |
+| `agent_usage_limits` | `AgentUsageLimits` | `AgentUsageLimits()` | Budget for the agent's **whole lifetime** — runs and tokens, accumulated across every run |
+| `compaction_cfg` | `CompactionConfig` | `CompactionConfig()` | Context-compaction strategy and auto-trigger (opt-in; off unless `model_cfg.context_length` is set) |
 | `max_help_requests` | `int` | `5` | Maximum delegation depth before error |
 | `tools` | `list[ToolCard]` | `[]` | Tool cards; `TeamTool` is always prepended automatically |
+
+#### Usage limits: two tiers
+
+The two budgets answer different questions, and both are carried into the `ReactAgent` that
+`BaseAgent` builds. **Neither is enforced in `akgentic-agent`** — this package configures,
+`akgentic-llm` enforces.
+
+| tier | class | bounds | enforced by |
+|---|---|---|---|
+| run | `RunUsageLimits` | one `run()` call — requests, tool calls and tokens *within* it | pydantic-ai, mid-run; counts reset every run |
+| agent | `AgentUsageLimits` | the agent's whole lifetime — `run()` calls and cumulative tokens | `ReactAgent`, pre-flight before each run |
+
+```python
+from akgentic.agent.config import AgentConfig
+from akgentic.llm import AgentUsageLimits, ModelConfig, RunUsageLimits
+
+config = AgentConfig(
+    name="@Manager",
+    role="Manager",
+    model_cfg=ModelConfig(provider="openai", model="gpt-4.1"),
+    run_usage_limits=RunUsageLimits(run_request_limit=50, total_tokens_limit=100_000),
+    agent_usage_limits=AgentUsageLimits(agent_request_limit=200, total_tokens_limit=2_000_000),
+)
+```
+
+Both defaults are safe to leave alone. `RunUsageLimits()` keeps a 50-request-per-run brake;
+`AgentUsageLimits()` is all-`None`, and an all-`None` budget never blocks — that is why the
+field is never `None` itself, and why adding a lifetime cap is opt-in rather than a
+behaviour change.
+
+**The agent tier survives a resume.** Its counters are not persisted and are not part of
+`AgentState`. On restore, `ReactAgent` recomputes them from the replayed usage events the
+team restorer already feeds through `init_llm_context()` — so an agent that has spent 180 of
+its 200 runs comes back with 20 left, not 200. Two consequences worth knowing:
+
+- The lifetime token limits bound where a run may **start**, not where it may end. A run's
+  cost is unknown until it completes, so the run that crosses the line finishes and only the
+  next one is refused.
+- `agent_request_limit` is consumed *before* the call executes, so a run that fails partway
+  still counts against the lifetime budget.
+
+Both tiers raise the same `UsageLimitError`, so a caller that already catches it needs no
+change to handle the new tier.
+
+##### Migrating from `usage_limits`
+
+`AgentConfig.usage_limits` was the single pre-split budget. It is now the run tier under a
+new name:
+
+```python
+# before
+AgentConfig(usage_limits=UsageLimits(request_limit=50, total_tokens_limit=100_000))
+
+# after
+AgentConfig(run_usage_limits=RunUsageLimits(run_request_limit=50, total_tokens_limit=100_000))
+```
+
+The old spelling still works for one release cycle: passing `usage_limits=` emits a
+`DeprecationWarning` and populates `run_usage_limits`, and reading `config.usage_limits`
+returns the run tier. Passing both `usage_limits=` and `run_usage_limits=` raises
+`ValueError` rather than silently picking one. **Both are removed in akgentic-agent 2.0.0.**
+`UsageLimits` itself is a deprecated alias of `RunUsageLimits`, removed in akgentic-llm 2.0.0.
 
 ### AgentState
 
