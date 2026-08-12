@@ -387,7 +387,9 @@ class TestNotifyHuman:
 
         agent.send.assert_not_called()
         assert any(
-            record.levelno == logging.WARNING and "usage limit exceeded" in record.getMessage()
+            record.levelno == logging.WARNING
+            and "No user-proxy team member found" in record.getMessage()
+            and "usage limit exceeded" in record.getMessage()
             for record in caplog.records
         )
 
@@ -404,7 +406,11 @@ class TestNotifyHuman:
             agent.notify_human("usage limit exceeded")
 
         agent.send.assert_not_called()
-        assert any(record.levelno == logging.WARNING for record in caplog.records)
+        assert any(
+            record.levelno == logging.WARNING
+            and "No user-proxy team member found" in record.getMessage()
+            for record in caplog.records
+        )
 
     def test_first_user_proxy_wins(self) -> None:
         """AC5: get_team() order decides — the first user proxy is notified."""
