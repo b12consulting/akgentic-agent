@@ -526,8 +526,10 @@ the message is immediately delivered to the newly hired actor.
 
 ### 4. Usage Limit Protection
 
-`receiveMsg_AgentMessage` catches `LLMUsageLimitError` and escalates to the first
-team member with `role="human"` via `notify_human()`:
+`receiveMsg_AgentMessage` catches `LLMUsageLimitError` and escalates via
+`notify_human()` to the team's first user-proxy member — found structurally through
+`ActorAddress.is_user_proxy`, so any role string works; when the team has none, the
+notice is logged and dropped:
 
 ```python
 except LLMUsageLimitError as e:

@@ -6,9 +6,10 @@ All tests use _make_minimal_agent pattern — no live actors or LLM calls. The
 command surface is exercised through a mocked CommandRegistry.
 """
 
+import logging
 import uuid
 from typing import Any, Callable
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from akgentic.agent.agent import BaseAgent
@@ -322,14 +323,26 @@ class TestReceiveAgentMessage:
 # =============================================================================
 
 
+def _make_member(name: str, role: str, is_user_proxy: bool) -> MagicMock:
+    """Return a mock team member with an EXPLICIT is_user_proxy.
+
+    A bare ``MagicMock(spec=ActorAddress)`` auto-returns a truthy Mock for
+    ``is_user_proxy``, which would make the negative cases pass for the wrong
+    reason. Every member used in these tests goes through this helper.
+    """
+    member = MagicMock(spec=ActorAddress)
+    member.name = name
+    member.role = role
+    member.is_user_proxy = is_user_proxy
+    return member
+
+
 class TestNotifyHuman:
-    """Test notify_human sends notification to first Human agent."""
+    """Test notify_human targets the team's user-proxy member."""
 
     def test_sends_notification_to_human(self) -> None:
         agent = _make_minimal_agent()
-        human_member = MagicMock(spec=ActorAddress)
-        human_member.name = "@Human"
-        human_member.role = "human"
+        human_member = _make_member("@Human", role="HumanProxy", is_user_proxy=True)
         agent.get_team = MagicMock(return_value=[human_member])  # type: ignore[method-assign]
 
         agent.notify_human("usage limit exceeded")
@@ -339,6 +352,90 @@ class TestNotifyHuman:
         assert isinstance(sent_msg, AgentMessage)
         assert sent_msg.type == "notification"
         assert "usage limit exceeded" in sent_msg.content
+
+    def test_notifies_user_proxy_under_any_role_string(self) -> None:
+        """AC1: the lookup is structural — the role string is irrelevant."""
+        agent = _make_minimal_agent()
+        human_member = _make_member("@Sam", role="HumanProxy", is_user_proxy=True)
+        agent.get_team = MagicMock(return_value=[human_member])  # type: ignore[method-assign]
+
+        agent.notify_human("usage limit exceeded")
+
+        agent.send.assert_called_once_with(human_member, ANY)
+        sent_msg = agent.send.call_args[0][1]
+        assert isinstance(sent_msg, AgentMessage)
+        assert sent_msg.type == "notification"
+        assert sent_msg.recipient is human_member
+        assert "usage limit exceeded" in sent_msg.content
+
+    def test_role_human_without_user_proxy_is_not_matched(self) -> None:
+        """AC2: no string fallback — role == 'human' alone does not match."""
+        agent = _make_minimal_agent()
+        impostor = _make_member("@NotHuman", role="human", is_user_proxy=False)
+        agent.get_team = MagicMock(return_value=[impostor])  # type: ignore[method-assign]
+
+        agent.notify_human("usage limit exceeded")
+
+        agent.send.assert_not_called()
+
+    def test_no_user_proxy_member_logs_and_returns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """AC3: empty team → warning logged, nothing sent, nothing raised."""
+        agent = _make_minimal_agent()
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.agent.agent"):
+            agent.notify_human("usage limit exceeded")
+
+        agent.send.assert_not_called()
+        assert any(
+            record.levelno == logging.WARNING and "usage limit exceeded" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_only_non_proxy_members_logs_and_returns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC3: a populated team with no user proxy takes the same guard path."""
+        agent = _make_minimal_agent()
+        agent.get_team = MagicMock(  # type: ignore[method-assign]
+            return_value=[_make_member("@Alice", role="analyst", is_user_proxy=False)]
+        )
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.agent.agent"):
+            agent.notify_human("usage limit exceeded")
+
+        agent.send.assert_not_called()
+        assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+    def test_first_user_proxy_wins(self) -> None:
+        """AC5: get_team() order decides — the first user proxy is notified."""
+        agent = _make_minimal_agent()
+        first = _make_member("@First", role="HumanProxy", is_user_proxy=True)
+        second = _make_member("@Second", role="HumanProxy", is_user_proxy=True)
+        agent.get_team = MagicMock(return_value=[first, second])  # type: ignore[method-assign]
+
+        agent.notify_human("usage limit exceeded")
+
+        agent.send.assert_called_once_with(first, ANY)
+
+    @patch("akgentic.agent.agent.sleep")
+    def test_usage_limit_still_raises_warning_error_with_no_user_proxy(
+        self, mock_sleep: MagicMock
+    ) -> None:
+        """AC4: no recipient is still a WarningError, never an AssertionError."""
+        from akgentic.core.agent import WarningError
+        from akgentic.llm import UsageLimitError as LLMUsageLimitError
+
+        agent = _make_minimal_agent()
+        agent.process_message = MagicMock(  # type: ignore[method-assign]
+            side_effect=LLMUsageLimitError("token limit")
+        )
+
+        message = AgentMessage(content="do something")
+
+        with pytest.raises(WarningError, match="LLM usage limit exceeded"):
+            agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Human"))
+
+        agent.send.assert_not_called()
 
 
 # =============================================================================
