@@ -31,7 +31,7 @@ from akgentic.llm import (
     ToolCallEvent,
     aggregate_usage,
 )
-from akgentic.llm.config import RuntimeConfig, UsageLimits
+from akgentic.llm.config import RunUsageLimits, RuntimeConfig
 from akgentic.tool.planning import PlanningTool, UpdatePlanning
 from akgentic.tool.search import SearchTool, WebCrawl, WebFetch, WebSearch
 from akgentic.tool.workspace import WorkspaceTool
@@ -96,7 +96,7 @@ manager_card = AgentCard(
             )
         ),
         model_cfg=ModelConfig(provider="openai", model=LLM_MODEL, temperature=0.3),
-        usage_limits=UsageLimits(request_limit=20, total_tokens_limit=200_000),
+        run_usage_limits=RunUsageLimits(run_request_limit=20, total_tokens_limit=200_000),
         runtime_cfg=RuntimeConfig(),
         tools=tools,
     ),
