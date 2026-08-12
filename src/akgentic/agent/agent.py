@@ -32,7 +32,7 @@ from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput
 from akgentic.core import ActorAddress, Akgent, Orchestrator
 from akgentic.core.agent import WarningError
-from akgentic.core.messages import Message
+from akgentic.core.messages import EventMessage
 from akgentic.llm import (
     AgentUsageSummary,
     LlmUsageEvent,
@@ -256,7 +256,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             observer=self,
         )
 
-    def init_llm_context(self, context: list[Message]) -> None:
+    def init_llm_context(self, context: list[EventMessage]) -> None:
         """Restore LLM conversation context from persisted events.
 
         Pure pass-through: forwards events to ReactAgent which owns
@@ -266,7 +266,14 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Args:
             context: List of EventMessage objects from the restorer.
         """
-        self._react_agent.restore_context(context)
+        # The ignore is llm's list invariance, not a mismatch. ReactAgent declares its
+        # own structural stand-in for this envelope because akgentic-llm may not import
+        # akgentic-core, and core's EventMessage satisfies it — but `list` is invariant,
+        # so list[core.EventMessage] is still not list[llm.EventMessage]. The list is
+        # forwarded by identity (callers rely on that), so neither a copy nor a cast
+        # through llm's non-public Protocol is appropriate here. Retire this line by
+        # widening restore_context to accept a Sequence, which is covariant.
+        self._react_agent.restore_context(context)  # type: ignore[arg-type]
 
     # ============================================================================
     # USAGE TRACKING
