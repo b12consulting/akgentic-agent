@@ -13,9 +13,6 @@ is touched.
 import time
 import warnings
 
-import akgentic.agent.agent as agent_module
-from akgentic.agent.agent import BaseAgent
-from akgentic.agent.config import AgentConfig
 from akgentic.core import ActorSystem, BaseConfig, Orchestrator
 from akgentic.llm import (
     AgentUsageLimits,
@@ -24,6 +21,10 @@ from akgentic.llm import (
     ReactAgentConfig,
     RunUsageLimits,
 )
+
+import akgentic.agent.agent as agent_module
+from akgentic.agent.agent import BaseAgent
+from akgentic.agent.config import AgentConfig
 
 # Two distinguishable sentinels. Identical values would let a transposed keyword pair
 # pass green, which is the most likely way to implement this story wrongly.

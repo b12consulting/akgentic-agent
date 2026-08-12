@@ -12,8 +12,16 @@ documentation instead of behaviour. These run the code the documentation shows.
 import warnings
 
 import pytest
+from akgentic.llm import (
+    AgentUsageLimits,
+    ModelConfig,
+    PromptTemplate,
+    RuntimeConfig,
+    RunUsageLimits,
+    UsageLimits,
+)
+
 from akgentic.agent.config import AgentConfig
-from akgentic.llm import AgentUsageLimits, ModelConfig, RunUsageLimits, UsageLimits
 
 
 class TestTwoTierExample:
@@ -59,6 +67,43 @@ class TestDefaultsClaim:
         """An all-None budget never blocks, which is why the field is never None."""
         agent_tier = AgentConfig().agent_usage_limits
         assert all(value is None for value in agent_tier.model_dump().values())
+
+
+class TestAgentConfigDocstringExample:
+    """The `Example:` block in AgentConfig's own class docstring.
+
+    It shipped for three releases naming a `prompt` type and two `RuntimeConfig`
+    fields that do not exist — the failure mode a reader hits by pasting, and the
+    one nothing in the suite could catch while the example lived only in a
+    docstring. Running it here is what keeps it honest.
+    """
+
+    def test_docstring_example_constructs(self) -> None:
+        config = AgentConfig(
+            prompt=PromptTemplate(template="You are a helpful software developer."),
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            runtime_cfg=RuntimeConfig(retries=3),
+            run_usage_limits=RunUsageLimits(run_request_limit=50, total_tokens_limit=100000),
+            agent_usage_limits=AgentUsageLimits(agent_request_limit=200),
+            max_help_requests=5,
+        )
+
+        assert config.prompt.render() == "You are a helpful software developer."
+        assert config.runtime_cfg.retries == 3
+        assert config.run_usage_limits.run_request_limit == 50
+        assert config.agent_usage_limits.agent_request_limit == 200
+
+    def test_docstring_example_emits_no_deprecation_warning(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            AgentConfig(
+                prompt=PromptTemplate(template="You are a helpful software developer."),
+                model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+                runtime_cfg=RuntimeConfig(retries=3),
+                run_usage_limits=RunUsageLimits(run_request_limit=50),
+                agent_usage_limits=AgentUsageLimits(agent_request_limit=200),
+            )
+        assert [w for w in caught if issubclass(w.category, DeprecationWarning)] == []
 
 
 class TestMigrationExample:

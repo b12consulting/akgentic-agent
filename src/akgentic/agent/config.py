@@ -34,7 +34,7 @@ class AgentConfig(BaseConfig):
     Each agent gets its own configuration with:
     - prompt: Agent's backstory/system prompt
     - model_cfg: LLM model provider and settings
-    - runtime_cfg: Execution parameters (temperature, max tokens, etc.)
+    - runtime_cfg: Execution parameters (retries, tool-call strategy, HTTP client)
     - run_usage_limits: Budget for ONE run; enforced by pydantic-ai, resets per run
     - agent_usage_limits: Budget for the agent's WHOLE lifetime; enforced pre-flight
       by ReactAgent, which reseeds it from replayed usage events on restore
@@ -48,9 +48,10 @@ class AgentConfig(BaseConfig):
     not stored in individual agents.
 
     Attributes:
-        prompt: Agent backstory or system prompt (plain string or template).
+        prompt: Agent backstory or system prompt, as a PromptTemplate.
         model_cfg: LLM model configuration (provider, model name, API settings).
-        runtime_cfg: Runtime execution settings (temperature, max tokens, retries).
+        runtime_cfg: Runtime execution settings (retries, end strategy, HTTP client).
+            Sampling settings such as temperature live on model_cfg, not here.
         run_usage_limits: Per-run token/request budget; the tier pydantic-ai enforces.
         agent_usage_limits: Agent-lifetime token/run budget. Defaults to an all-None
             budget, which never blocks — "unlimited" without a nullable field.
@@ -67,10 +68,11 @@ class AgentConfig(BaseConfig):
         >>> from akgentic.llm.config import (
         ...     AgentUsageLimits, ModelConfig, RunUsageLimits, RuntimeConfig
         ... )
+        >>> from akgentic.llm.prompts import PromptTemplate
         >>> config = AgentConfig(
-        ...     prompt="You are a helpful software developer.",
+        ...     prompt=PromptTemplate(template="You are a helpful software developer."),
         ...     model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
-        ...     runtime_cfg=RuntimeConfig(temperature=0.7, max_tokens=2000),
+        ...     runtime_cfg=RuntimeConfig(retries=3),
         ...     run_usage_limits=RunUsageLimits(
         ...         run_request_limit=50, total_tokens_limit=100000
         ...     ),
@@ -89,7 +91,7 @@ class AgentConfig(BaseConfig):
     )
     runtime_cfg: RuntimeConfig = Field(
         default_factory=RuntimeConfig,
-        description="Runtime execution settings such as temperature, max tokens and retry behavior",
+        description="Runtime execution settings: retries, tool-call end strategy, HTTP client",
     )
     run_usage_limits: RunUsageLimits = Field(
         default_factory=RunUsageLimits,

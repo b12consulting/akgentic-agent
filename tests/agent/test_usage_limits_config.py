@@ -14,7 +14,6 @@ the bill does.
 import warnings
 
 import pytest
-from akgentic.agent.config import AgentConfig
 from akgentic.llm import (
     AgentUsageLimits,
     CompactionConfig,
@@ -24,6 +23,8 @@ from akgentic.llm import (
     UsageLimits,
 )
 from akgentic.llm.prompts import PromptTemplate
+
+from akgentic.agent.config import AgentConfig
 
 # The release that deletes the shim. Every warning and docstring must name it, so
 # removing the shim is a scheduled task rather than an archaeological dig.

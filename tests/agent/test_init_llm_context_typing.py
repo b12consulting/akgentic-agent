@@ -11,8 +11,9 @@ pass-through, forwarding the list **by identity** to `ReactAgent.restore_context
 
 from unittest.mock import MagicMock
 
-from akgentic.agent.agent import BaseAgent
 from akgentic.core.messages import EventMessage
+
+from akgentic.agent.agent import BaseAgent
 
 
 def _bare_agent_with_stubbed_llm() -> BaseAgent:
@@ -55,10 +56,19 @@ class TestCoreEnvelopesAreAccepted:
         assert all(actual is expected for actual, expected in zip(passed, events, strict=True))
         assert [envelope.event for envelope in passed] == [{"seq": 0}, {"seq": 1}, {"seq": 2}]
 
-    def test_every_element_is_a_core_event_message(self) -> None:
-        """Pins the element type the signature names, against the real class."""
-        events = _envelopes(2)
-        assert all(isinstance(envelope, EventMessage) for envelope in events)
+    def test_every_forwarded_element_is_a_core_event_message(self) -> None:
+        """Pins the element type the signature names, on the elements that ARRIVE.
+
+        Asserting the helper's own output would assert isinstance on a class the
+        helper just constructed — a test that cannot fail. The claim worth pinning
+        is that core envelopes are what reaches restore_context.
+        """
+        agent = _bare_agent_with_stubbed_llm()
+
+        agent.init_llm_context(_envelopes(2))
+
+        passed = agent._react_agent.restore_context.call_args[0][0]  # type: ignore[attr-defined]
+        assert passed and all(isinstance(envelope, EventMessage) for envelope in passed)
 
     def test_empty_list_forwarded(self) -> None:
         agent = _bare_agent_with_stubbed_llm()
