@@ -243,8 +243,9 @@ so the guidance is always keyed to the intent that agent actually received:
 prompt = f"You received a request from @Manager. {reply_protocol}\n\n{message.content}"
 ```
 
-On `LLMUsageLimitError`, the agent escalates to the first team member with
-`role="human"` via `notify_human()`.
+On `LLMUsageLimitError`, the agent escalates via `notify_human()` to the team's
+user-proxy member — found structurally through `ActorAddress.is_user_proxy`, so any
+role string works; when the team has none, the notice is logged and dropped.
 
 ### HumanProxy
 

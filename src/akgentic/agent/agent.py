@@ -474,8 +474,14 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         self._react_agent.context.record_operator_action(entry)
 
     def notify_human(self, message: str) -> None:
-        # Sent request to the first Human agent
-        human = next((agent for agent in self.get_team() if agent.role == "human"), None)
+        """Notify the team's user-proxy member; log and return if there is none."""
+        human = next((member for member in self.get_team() if member.is_user_proxy), None)
+        if human is None:
+            logger.warning(
+                "No user-proxy team member found; usage-limit notice not delivered: %s",
+                message,
+            )
+            return
         self.send(human, AgentMessage(content=message, recipient=human, type="notification"))
 
     # ============================================================================

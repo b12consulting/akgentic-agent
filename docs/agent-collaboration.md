@@ -526,8 +526,10 @@ the message is immediately delivered to the newly hired actor.
 
 ### 4. Usage Limit Protection
 
-`receiveMsg_AgentMessage` catches `LLMUsageLimitError` and escalates to the first
-team member with `role="human"` via `notify_human()`:
+`receiveMsg_AgentMessage` catches `LLMUsageLimitError` and escalates via
+`notify_human()` to the team's first user-proxy member — found structurally through
+`ActorAddress.is_user_proxy`, so any role string works; when the team has none, the
+notice is logged and dropped:
 
 ```python
 except LLMUsageLimitError as e:
@@ -737,11 +739,12 @@ StructuredOutput(messages=[
    print(manager_proxy.cmd_get_team_roster())
    ```
 
-5. **Always include a `HumanProxy` with `role="Human"`**
+5. **Always include a `HumanProxy` in the team**
 
    `notify_human()` sends escalation messages (usage-limit exceeded,
-   recursion error) to the first team member with `role="human"`. Without
-   one, error escalations are silently dropped.
+   recursion error) to the team's first user-proxy member — found structurally
+   through `ActorAddress.is_user_proxy`, so any role string works. Without one,
+   error escalations are logged and dropped.
 
 ### ❌ DON'T
 
@@ -920,7 +923,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Hire a new agent by role via TeamTool. Raises ModelRetry on failure.
 
     notify_human(message) -> None
-        Send an AgentMessage to the first 'human' role in the team.
+        Send an AgentMessage to the team's first user-proxy member.
 
     cmd_hire_member(role) -> ActorAddress | str
         Programmatic hire; returns error string instead of raising.
