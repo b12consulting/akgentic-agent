@@ -1,6 +1,7 @@
-"""Team message types and continuation-based routing system.
+"""Team message types.
 
-This module provides message types for agent-to-agent communication.
+This module provides ``AgentMessage``, the single message type used for
+agent-to-agent communication.
 """
 
 from typing import Literal
