@@ -42,15 +42,14 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
+from akgentic.agent.agent import BaseAgent
+from akgentic.agent.config import AgentConfig
+from akgentic.agent.messages import AgentMessage
 from akgentic.core import ActorAddress
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
-
-from akgentic.agent.agent import BaseAgent
-from akgentic.agent.config import AgentConfig
-from akgentic.agent.messages import AgentMessage
 
 # The two turns emit *different* routing decisions. That is what makes the routing
 # assertion discriminating on its own: under v1 semantics the first turn's output would
@@ -94,7 +93,9 @@ def _make_minimal_agent() -> BaseAgent:
     return agent
 
 
-def _structured_output_args(recipient: str, message: str, message_type: str) -> dict:
+def _structured_output_args(
+    recipient: str, message: str, message_type: str
+) -> dict[str, list[dict[str, str]]]:
     """Build valid `StructuredOutput` tool args. All three Request fields are required."""
     return {
         "messages": [
@@ -135,6 +136,8 @@ class TestRetryWinsUnderExhaustiveStrategy:
         react_agent = ReactAgent(config=react_config, deps_type=BaseAgent)
         agent._react_agent = react_agent  # type: ignore[attr-defined]
 
+        flaky_tool_calls = 0
+
         # A plain tool that raises ModelRetry. Chosen over a full
         # ToolFactory(retry_exception=ModelRetry) wiring because the mechanism under test
         # is pydantic-ai's *graph* reaction to a RetryPromptPart, not the tool's
@@ -142,6 +145,8 @@ class TestRetryWinsUnderExhaustiveStrategy:
         # has nothing to do with the invariant being pinned.
         @react_agent.pydantic_agent.tool_plain
         def flaky_tool(value: str) -> str:
+            nonlocal flaky_tool_calls
+            flaky_tool_calls += 1
             raise ModelRetry("needs correction")
 
         model_call_count = 0
@@ -192,6 +197,14 @@ class TestRetryWinsUnderExhaustiveStrategy:
         finally:
             # Close on the way out so no event loop or httpx pool leaks into later tests.
             react_agent.close()
+
+        # (0) The retry came from `flaky_tool` actually running and raising `ModelRetry`,
+        # not from the tool call failing to resolve. Verified by mutation: pointing turn 1
+        # at a name no tool answers to collapses the run back to a single turn, so without
+        # this line that regression would surface as a confusing `assert 1 == 2` on the
+        # count below — reading as "upstream reverted retry-wins" rather than "the tool
+        # stopped resolving".
+        assert flaky_tool_calls == 1
 
         # (1) The extra model turn v2's retry-wins invariant forces. Under v1 the first
         # turn's output would have won immediately and this would be 1.
