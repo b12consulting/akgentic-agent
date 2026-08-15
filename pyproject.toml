@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-agent"
-version = "1.6.3"
+version = "1.6.4"
 description = "Collaborative agent patterns for the Akgentic framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -21,10 +21,10 @@ keywords = ["agents", "ai", "team", "collaboration", "pydantic-ai"]
 
 dependencies = [
     "pydantic>=2.0.0",
-    "pydantic-ai>=1.107.0,<2",
+    "pydantic-ai>=2,<3",
     "akgentic-core>=1.5.4",
-    "akgentic-llm>=1.6.3",
-    "akgentic-tool>=1.6.0",
+    "akgentic-llm>=2.0.0",
+    "akgentic-tool>=1.6.3",
 ]
 
 [project.optional-dependencies]

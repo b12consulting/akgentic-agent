@@ -247,6 +247,41 @@ class TestReceiveAgentMessage:
         assert "exceeded" in agent.notify_human.call_args[0][0]
 
     @patch("akgentic.agent.agent.sleep")
+    def test_usage_limit_message_survives_an_appended_suffix(self, mock_sleep: MagicMock) -> None:
+        """The handler interpolates the limit message verbatim — it never matches it exactly.
+
+        pydantic-ai v2 appends a documentation hint to `UsageLimitExceeded` messages, and
+        `ReactAgent` wraps whatever text it gets into `UsageLimitError`. The handler must
+        therefore stay tolerant of trailing text it has never seen: it passes the message
+        straight through into both the human notice and the `WarningError`. Asserting on a
+        prefix (or containment) keeps this true whatever upstream appends; an equality
+        assertion would turn any upstream wording change into a false failure here.
+        """
+        from akgentic.core.agent import WarningError
+        from akgentic.llm import UsageLimitError as LLMUsageLimitError
+
+        base = "Exceeded the total_tokens_limit of 100 (total_tokens=101)"
+        suffix = " (see the usage-limits documentation for details)"
+
+        agent = _make_minimal_agent()
+        agent.process_message = MagicMock(  # type: ignore[method-assign]
+            side_effect=LLMUsageLimitError(base + suffix)
+        )
+        agent.notify_human = MagicMock()  # type: ignore[method-assign]
+
+        message = AgentMessage(content="do something")
+        sender = _make_mock_sender("@Human")
+
+        with pytest.raises(WarningError) as excinfo:
+            agent.receiveMsg_AgentMessage(message, sender)
+
+        # The full message, suffix included, reaches BOTH the human and the raised error.
+        notice = agent.notify_human.call_args[0][0]
+        assert base in notice
+        assert suffix in notice
+        assert base + suffix in str(excinfo.value)
+
+    @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_a_for_consonant_type(self, mock_sleep: MagicMock) -> None:
         """type='request' (consonant) → prefix uses 'a request' + reply protocol."""
         agent = _make_minimal_agent()
