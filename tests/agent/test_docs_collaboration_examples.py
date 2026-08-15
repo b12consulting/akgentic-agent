@@ -17,7 +17,6 @@ documentation instead of behaviour. These run the code the documentation shows.
 
 import time
 import uuid
-import warnings
 from typing import Any, Callable, cast
 from unittest.mock import MagicMock, patch
 
@@ -41,10 +40,10 @@ from akgentic.llm import (
     RunUsageLimits,
     ToolCallEvent,
 )
-from akgentic.tool.core import ToolFactory
+from akgentic.tool.core import ToolCard, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.event import CommandsAnnouncedEvent
-from akgentic.tool.planning import UpdatePlanning
+from akgentic.tool.planning import GetPlanning, PlanningTool, UpdatePlanning
 from akgentic.tool.team import TeamTool
 from pydantic import ValidationError
 from pydantic_ai import ModelRetry
@@ -625,9 +624,14 @@ class TestNoCmdApiRemains:
 
 
 class TestSimpleTeamAliasSnippet:
-    """DO #4's alias map must point at names TeamTool/PlanningTool really register."""
+    """DO #4's alias map must point at names TeamTool/PlanningTool really register.
 
-    def test_every_alias_target_is_a_canonical_command_name(self) -> None:
+    The alias map is transcribed from ``examples/simple_team.py``; the names it maps
+    *onto* are read from a live registry. Renaming a command in ``akgentic-tool``
+    therefore breaks this test rather than silently staling the snippet.
+    """
+
+    def test_every_alias_target_is_a_real_registered_command(self) -> None:
         documented_aliases = {
             "team": "team_members",
             "roles": "team_roles",
@@ -637,9 +641,16 @@ class TestSimpleTeamAliasSnippet:
             "fire": "fire_member",
         }
 
-        for alias, real in documented_aliases.items():
-            assert not real.startswith("cmd_"), alias
-            assert f"/{real} arg".split()[0] == f"/{real}"
+        registered = _announced_command_names(
+            [TeamTool(), PlanningTool(vector_store=False)]
+        )
+
+        missing = {
+            alias: real
+            for alias, real in documented_aliases.items()
+            if real not in registered
+        }
+        assert not missing, f"alias targets that no command registers: {missing}"
 
 
 # =============================================================================
@@ -827,6 +838,11 @@ class TestUpdatePlanningInstructionsSnippet:
         original = "Update team tasks (create, update, delete)."
         assert UpdatePlanning().format_docstring(original) == original
 
+    def test_planning_is_filtered_to_the_reading_agent_by_default(self) -> None:
+        """The doc used to show the whole board as the default view; it is the opt-out."""
+        assert GetPlanning().filter_by_agent is True
+        assert GetPlanning(filter_by_agent=False).filter_by_agent is False
+
 
 # =============================================================================
 # The README EventSubscriber snippet
@@ -897,6 +913,62 @@ class _CapturingReactAgent:
 
     def close(self) -> None:
         pass
+
+
+def _announced_command_names(tool_cards: list[ToolCard]) -> set[str]:
+    """Start a real BaseAgent carrying *tool_cards*; return the names it announces.
+
+    Goes through the production ``on_start`` path inside a live ActorSystem, so the
+    result is whatever the tools actually register — never a list transcribed from
+    the documentation.
+    """
+    announced: list[CommandsAnnouncedEvent] = []
+
+    class _Subscriber(EventSubscriber):
+        def on_message(self, message: Message) -> None:
+            if isinstance(message, EventMessage) and isinstance(
+                message.event, CommandsAnnouncedEvent
+            ):
+                announced.append(message.event)
+
+    system = ActorSystem()
+    original = agent_module.ReactAgent  # type: ignore[attr-defined]
+    agent_module.ReactAgent = _CapturingReactAgent  # type: ignore[assignment, attr-defined]
+    try:
+        orch_addr = system.createActor(
+            Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
+        )
+        orchestrator = system.proxy_ask(orch_addr, Orchestrator)
+        orchestrator.subscribe(_Subscriber())  # type: ignore[abstract]
+
+        card = AgentCard(
+            description="Coordinates the team",
+            skills=["coordination"],
+            agent_class="akgentic.agent.BaseAgent",
+            config=AgentConfig(
+                name="@Manager",
+                role="Manager",
+                prompt=PromptTemplate(template="You are a manager."),
+                model_cfg=ModelConfig(provider="openai", model="gpt-4.1"),
+                tools=tool_cards,
+            ),
+        )
+        orchestrator.register_agent_profiles([card])
+        manager_addr = orchestrator.createActor(BaseAgent, config=card.get_config_copy())
+
+        deadline = time.monotonic() + 5.0
+        while not announced and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        for_manager = [e for e in announced if e.agent.name == manager_addr.name]
+        assert len(for_manager) == 1, "expected exactly one announcement"
+        return {descriptor.name for descriptor in for_manager[0].commands}
+    finally:
+        agent_module.ReactAgent = original  # type: ignore[attr-defined]
+        try:
+            system.shutdown(timeout=5)
+        except Exception:  # noqa: BLE001 — teardown must not mask a failure
+            pass
 
 
 class TestAnnouncedCommandSet:
@@ -1071,15 +1143,3 @@ class TestHumanProxySnippet:
         assert reply.content == "Yes, proceed"
         assert reply.type == "response"
         assert proxy._current_message is None  # reset in the finally block
-
-
-class TestDocSamplesReadNoMarkdown:
-    """Golden Rule #8 guard, stated so a reviewer can see it was considered."""
-
-    def test_this_module_asserts_on_behaviour_not_documentation(self) -> None:
-        """No test here opens a .md file; the samples are transcribed, not grepped."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            assert Request(
-                message_type="request", message="m", recipient="@X"
-            ).message_type == "request"

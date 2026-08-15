@@ -214,11 +214,13 @@ through via `expose: set[Channels]`:
 | --------------- | ---------------------- | -------------------------------------------------------------------------------------- |
 | `TOOL_CALL`     | `get_tools()`          | LLM-callable functions (`hire_members`, `fire_members`, `update_planning`)             |
 | `SYSTEM_PROMPT` | `get_system_prompts()` | Dynamic prompts injected into LLM context (`team_roster`, `role_profiles`, `planning`) |
-| `COMMAND`       | `get_command_registry()` | Name-keyed `CommandRegistry` for in-agent code and `/`-prefixed messages (`hire_member`, `planning_summary`) |
+| `COMMAND`       | `get_commands()`       | Folded by `ToolFactory.get_command_registry()` into one name-keyed `CommandRegistry`, reached from in-agent code and `/`-prefixed messages (`hire_member`, `planning_summary`) |
 
-`ToolFactory.get_commands()` — the older param-class-keyed dict — is **deprecated** and warns.
-`BaseAgent.on_start()` calls `get_command_registry()`, which keys every command by the callable's
-`__name__` and derives an argument schema from its signature. See
+Note which `get_commands()` is which. The one a `ToolCard` implements is the live extension point —
+that is how a tool declares its COMMAND-channel callables. The **aggregator** of the same name on
+`ToolFactory` is the older param-class-keyed dict; it is **deprecated** and warns.
+`BaseAgent.on_start()` calls `ToolFactory.get_command_registry()` instead, which keys every command
+by the callable's `__name__` and derives an argument schema from its signature. See
 [The Command Registry](#4-the-command-registry) for the two surfaces that reach it.
 
 Two `ToolCard` implementations are central to collaboration — **TeamTool** and
@@ -281,7 +283,11 @@ planning tool provides a shared, persistent task board backed by a `PlanActor`.
 | **`UpdatePlanning`**  | `TOOL_CALL`                | LLM-callable tool to create, update, or delete tasks |
 | **`SearchPlanning`**  | `TOOL_CALL`, `COMMAND`     | Search tasks by status, owner, creator, or description |
 
-At every `act()` call, the LLM sees the current plan state:
+At every `act()` call, the LLM sees the current plan state. `GetPlanning.filter_by_agent` defaults
+to **`True`**, so out of the box each agent sees only the tasks it owns or created, under a
+`**Your tasks** (owner or creator: @Manager):` header — and
+`No tasks assigned to or created by @Manager yet.` when it has none. Pass
+`GetPlanning(filter_by_agent=False)` to show the whole board instead:
 
 ```
 **Team planning:** 3 tasks total
@@ -295,9 +301,8 @@ Owners: @Developer456: 1 | @Manager: 1 | @QA789: 1
 Use get_planning_task(id) for exact ID lookup or search_planning(...) to filter tasks.
 ```
 
-The ` — Output: …` segment appears only when a task actually has an output. With
-`GetPlanning(filter_by_agent=True)` the list is narrowed to the reading agent's own tasks and the
-header becomes `**Your tasks** (owner or creator: @Manager):`.
+The totals line and the owner breakdown are the same either way; only the task list narrows. The
+` — Output: …` segment appears only when a task actually has an output.
 
 #### Custom Instructions via `UpdatePlanning`
 
