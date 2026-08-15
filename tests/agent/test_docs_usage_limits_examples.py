@@ -85,7 +85,6 @@ class TestAgentConfigDocstringExample:
             runtime_cfg=RuntimeConfig(retries=3),
             run_usage_limits=RunUsageLimits(run_request_limit=50, total_tokens_limit=100000),
             agent_usage_limits=AgentUsageLimits(agent_request_limit=200),
-            max_help_requests=5,
         )
 
         assert config.prompt.render() == "You are a helpful software developer."

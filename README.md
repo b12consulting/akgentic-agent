@@ -353,7 +353,6 @@ Extends `BaseConfig` from `akgentic-core`:
 | `run_usage_limits` | `RunUsageLimits` | `RunUsageLimits()` | Budget for **one** `run()` — token and request caps that reset every run |
 | `agent_usage_limits` | `AgentUsageLimits` | `AgentUsageLimits()` | Budget for the agent's **whole lifetime** — runs and tokens, accumulated across every run |
 | `compaction_cfg` | `CompactionConfig` | `CompactionConfig()` | Context-compaction strategy and auto-trigger (opt-in; off unless `model_cfg.context_length` is set) |
-| `max_help_requests` | `int` | `5` | Maximum delegation depth before error |
 | `tools` | `list[ToolCard]` | `[]` | Tool cards; `TeamTool` is always prepended automatically |
 
 #### Usage limits: two tiers

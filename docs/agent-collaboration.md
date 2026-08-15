@@ -875,7 +875,6 @@ class AgentConfig(BaseConfig):
         agent_usage_limits: Budget for the agent's WHOLE lifetime; enforced pre-flight
             by ReactAgent, which reseeds it from replayed usage events on restore.
         compaction_cfg: Context-compaction strategy and auto-trigger (opt-in).
-        max_help_requests: Recursion depth limit for delegation chains (default: 5).
         tools: Additional ToolCard instances exposed to the LLM.
     """
     prompt: PromptTemplate
@@ -884,7 +883,6 @@ class AgentConfig(BaseConfig):
     run_usage_limits: RunUsageLimits
     agent_usage_limits: AgentUsageLimits
     compaction_cfg: CompactionConfig
-    max_help_requests: int = 5
     tools: list[ToolCard] = []
 ```
 
