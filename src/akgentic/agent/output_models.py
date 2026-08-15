@@ -1,7 +1,8 @@
-"""Structured output models for agent response patterns.
+"""Structured output models for agent responses.
 
-This module defines Pydantic models that enable agents to return structured responses
-in three distinct patterns:
+Defines the single schema the REACT loop reasons against (``StructuredOutput``),
+the ``Request`` entries it carries, and ``REPLY_PROTOCOLS`` — the per-message-type
+guidance prefixed to an inbound prompt in ``BaseAgent.receiveMsg_AgentMessage``.
 """
 
 from typing import Literal

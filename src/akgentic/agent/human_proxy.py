@@ -1,11 +1,9 @@
-"""HumanProxy agent with continuation-aware message handling.
+"""HumanProxy: team-aware human-in-the-loop proxy agent.
 
-Extends akgentic-core's UserProxy to provide team-aware human interaction with
-automatic answer routing through continuation chains. Enables human-in-the-loop
-workflows where agents can request human input and receive answers that properly
-route back through multi-agent chains.
-
-Migrated from V1: akgentic-framework/libs/akgentic-agent/akgentic_team/core/human_proxy.py
+Extends akgentic-core's UserProxy so a team agent can address an AgentMessage to
+the human and get the human's reply back. ``process_human_input`` addresses that
+reply to the sender of the message being answered — one hop, back to the agent
+that asked.
 """
 
 from __future__ import annotations
@@ -20,30 +18,36 @@ logger = logging.getLogger(__name__)
 
 
 class HumanProxy(UserProxy):
-    """UserProxy with team message handling and continuation support.
+    """UserProxy that receives team AgentMessages and relays the human's reply.
 
     HumanProxy extends UserProxy with:
-    - receiveMsg_HelpRequestMessage: Receives help requests from team agents
-    - receiveMsg_ResultMessage: Receives final results to display to human
-    - process_human_input: Routes human responses back through continuation chains
-
-    The continuation system enables multi-hop request/answer routing:
-    Manager → Dev → Tester → Dev → Manager → Human → Manager → ...
+    - receiveMsg_AgentMessage: receives any AgentMessage addressed to the human
+      and logs it — the request is not yet queued or forwarded anywhere
+    - process_human_input: sends the human's reply to the agent that sent the
+      message being answered
 
     Usage:
         >>> from akgentic.core import ActorSystem
         >>> from akgentic.core.agent_config import BaseConfig
-        >>> from akgentic.agent import HumanProxy
+        >>> from akgentic.agent import AgentMessage, HumanProxy
         >>>
         >>> system = ActorSystem()
         >>> config = BaseConfig(name="human", role="HumanProxy")
         >>> proxy_addr = system.createActor(HumanProxy, config=config)
         >>>
-        >>> # Agent sends help request
-        >>> agent.send(proxy_addr, HelpRequestMessage(...))
+        >>> # Stand-in for the agent that asks — any actor address will do here
+        >>> asker_addr = system.createActor(HumanProxy, config=config)
         >>>
-        >>> # Human responds
-        >>> proxy_ref.proxy().process_human_input("My answer", help_req).get()
+        >>> # `incoming` is the message the proxy received. Its sender is stamped
+        >>> # by send() on the way in, and process_human_input asserts it is set.
+        >>> incoming = AgentMessage(
+        ...     content="Proceed?", recipient=proxy_addr, sender=asker_addr
+        ... )
+        >>>
+        >>> # Human responds; the reply is addressed to incoming.sender
+        >>> system.proxy_ask(proxy_addr, HumanProxy).process_human_input(
+        ...     "My answer", incoming
+        ... ).get()
 
     Attributes:
         Inherits config and state from UserProxy (BaseConfig, BaseState).
@@ -52,11 +56,12 @@ class HumanProxy(UserProxy):
     def receiveMsg_AgentMessage(  # noqa: N802
         self, message: AgentMessage, sender: ActorAddress
     ) -> None:
-        """Handle AgentMessage from agents - store for human processing.
+        """Handle an AgentMessage from an agent — currently log-only.
 
-        When an agent needs human input, it sends a AgentMessage. This
-        method receives and stores the request for human processing. The human's
-        response will be sent back via process_human_input().
+        When an agent needs human input it sends an AgentMessage. This method
+        logs it and nothing else: the message is not stored, queued or forwarded
+        (see the comment below for what a real implementation would add). The
+        human's response is sent separately, via process_human_input().
 
         Args:
             message: The AgentMessage from an agent.
@@ -69,18 +74,16 @@ class HumanProxy(UserProxy):
         # In a real implementation, this would:
         # - Queue the request for human review
         # - Send to UI for human response
-        # - Store request context for continuation tracking
         # For now, just log it - human responds via process_human_input()
 
     def process_human_input(self, content: str, message: Message) -> None:
-        """Process human input and route back through continuation chain.
+        """Process human input and send it back to the agent that asked.
 
-        Takes human's response to an AgentMessage and creates a new AgentMessage
-        that routes back to the requesting agent via the continuation chain. The
-        recipient (destinataire) is derived from ``message.sender`` -- i.e. the
-        agent that originally sent the incoming message is the one that receives
-        the human's answer. Supports multi-hop routing where answers automatically
-        flow back through multiple agents.
+        Takes the human's response to an AgentMessage and sends a new AgentMessage
+        carrying it. The recipient (destinataire) is derived from
+        ``message.sender`` -- i.e. the agent that originally sent the incoming
+        message is the one that receives the human's answer. This is a single hop;
+        any further routing is whatever that agent decides to do on its own turn.
 
         This method simulates the ``on_receive()`` lifecycle by setting
         ``_current_message`` before calling ``send()`` (so that ``parent_id``
@@ -92,11 +95,11 @@ class HumanProxy(UserProxy):
                 field determines the recipient of the outgoing response.
 
         Example:
-            >>> # Agent A asks human for input
-            >>> help_req = AgentMessage(content="Should we proceed?", ...)
+            >>> # Agent A asks the human for input
+            >>> incoming = AgentMessage(content="Should we proceed?", ...)
             >>> # Human responds
-            >>> human_proxy.process_human_input("Yes, proceed", help_req)
-            >>> # AgentMessage routes back to Agent A (message.sender)
+            >>> human_proxy.process_human_input("Yes, proceed", incoming)
+            >>> # The reply is sent to Agent A (incoming.sender)
         """
 
         # Simulate the on_receive() lifecycle so that send() can read
@@ -109,7 +112,6 @@ class HumanProxy(UserProxy):
             assert destinataire is not None, "AgentMessage must have a sender"
 
             # Send the answer back to the requesting agent
-            # The continuation chain ensures it routes correctly even in multi-hop scenarios
             self.send(
                 destinataire,
                 AgentMessage(

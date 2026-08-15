@@ -1,21 +1,24 @@
 """BaseAgent: LLM-powered team agent with delegation and collaboration.
 BaseAgent integrates with akgentic-llm's ReactAgent for all LLM management,
-with team-specific message handling and structured output patterns.
+with team-specific message handling and a static structured-output schema.
 
 Architecture:
 - Extends Akgent[AgentConfig, AgentState] from akgentic-core (pykka actor model)
 - Composes ReactAgent (akgentic-llm) for model, http client, context, usage limits
 - Composes ToolFactory (akgentic-tool) aggregating ToolCard[] into 3 channels:
   · TOOL_CALL — LLM-callable tools (hire_members, fire_members, + config.tools)
-  · SYSTEM_PROMPT — dynamic prompts (team_roster, role_profiles, backstory)
+  · SYSTEM_PROMPT — dynamic prompts (TeamTool yields team_roster, role_profiles)
   · COMMAND — programmatic commands exposed via a generic CommandRegistry
     (built once in on_start; dispatched by name from /-prefixed messages)
 - TeamTool auto-injected if not already in config.tools
-- ReactAgent.run_sync(output_type=T) for both str and structured output
+- ReactAgent.run_sync(output_type=StructuredOutput) — the only type act() asks for
 - get_output_type() applied inside ReactAgent.run() — no leakage into BaseAgent
 - Implements TeamManagementToolObserver protocol (structural typing)
-- Continuation-based routing for multi-hop delegation chains
-- Message handlers: UserMessage → ResultMessage, HelpRequest ↔ HelpAnswer
+- One message handler of its own, receiveMsg_AgentMessage: all team traffic is
+  AgentMessage, so there is no per-message-type handler set here. Akgent still
+  contributes the lifecycle handler receiveMsg_StopRecursively
+- Delegation is a plain send per Request in the LLM's StructuredOutput. Each hop
+  is an independent turn — no call stack, no automatic return path
 """
 
 import logging
@@ -59,7 +62,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
     Composition:
     - ReactAgent (akgentic-llm): model instantiation, HTTP retry, usage limits,
-      context history, REACT loop. All LLM calls delegate to run_sync().
+      context history, REACT loop. Reasoning turns go through run_sync();
+      compact() and clear() bypass it — compact() is ReactAgent's own synchronous
+      bridge onto the agent loop, clear() a plain wrapper over the context.
     - ToolFactory (akgentic-tool): aggregates ToolCard[] into tools, system prompts,
       and commands via 3-channel architecture (TOOL_CALL, SYSTEM_PROMPT, COMMAND).
     - TeamTool: auto-injected if absent from config.tools; provides hire/fire
@@ -71,30 +76,38 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       to ToolFactory/TeamTool without explicit interface inheritance.
 
     Execution in act():
-    - All paths → ReactAgent.run_sync(output_type=T) which wraps T with
-      get_output_type() internally and manages context, limits, and REACT loop
+    - Always → ReactAgent.run_sync(output_type=StructuredOutput). act()'s own
+      output_type argument is kept for signature stability and never reaches the
+      REACT loop. ReactAgent.run() wraps the type with get_output_type()
+      internally and manages context, limits, and the REACT loop.
 
-    Message Flow (continuation-based routing):
-    - UserMessage → act_with_output_and_optional_requests → ResultMessage
-    - HelpRequestMessage → act_with_output_or_requests → HelpAnswerMessage
-    - HelpAnswerMessage → route via Continuation chain → HelpAnswerMessage/ResultMessage
-    - Continuation implements distributed call stack for multi-hop delegation:
-      e.g. Human → Manager → Dev → Tester → Dev → Manager → Human
+    Message Flow:
+    - receiveMsg_AgentMessage is the only handler this class defines (Akgent
+      contributes receiveMsg_StopRecursively). /-prefixed content is offered to
+      the CommandRegistry first; everything else — including a /-prefixed token
+      the registry does not recognise — is prefixed with the reply protocol for
+      its message type and handed to process_message().
+    - process_message() runs one act() turn and sends one AgentMessage per
+      Request in the resulting StructuredOutput. A recipient starting with "@"
+      resolves to an existing member; anything else is hired by role. A recipient
+      that resolves to None is skipped.
 
-    Structured Output Patterns:
-    - MessageOrRequests (either/or): LLM returns EITHER answer OR help requests
-    - MessageAndOptionalRequests (both): LLM returns answer AND optional requests
+    Structured Output:
+    - One type: StructuredOutput (output_models.py), a list of Request, each
+      carrying message_type, message and recipient. An empty list = no delegation.
 
     Tools exposed to LLM (via ToolFactory.get_tools()):
-    - hire_members(roles) → list[tuple[str, str]]
-    - fire_members(names) → list[str]
+    - hire_members(roles: list[str]) → str
+    - fire_members(names: list[str]) → str
     - Additional tools from config.tools ToolCards
 
-    System Prompts (via ToolFactory.get_system_prompts() + @react_agent.system_prompt):
-    - current_datetime (from ReactAgent)
-    - agent_backstory (from AgentState)
-    - GetTeamRoster dynamic prompt (from TeamTool)
-    - GetRoleProfiles dynamic prompt (from TeamTool)
+    System Prompts (all registered in on_start; ReactAgent registers none):
+    - agent_backstory (from AgentState.backstory)
+    - current_date
+    - whatever ToolFactory.get_system_prompts() yields — from TeamTool, a team
+      roster and/or a role-profiles prompt, each only if SYSTEM_PROMPT is in that
+      capability's expose set
+    - mailbox_notifications, only when the mailbox is non-empty at on_start
 
     Commands (programmatic, via CommandRegistry built in on_start):
     - A single generic CommandRegistry holds every COMMAND-channel callable keyed
@@ -108,7 +121,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       command set without per-command coupling.
 
     Internal method (used by process_message()):
-    - hire_member(role) → ActorAddress  (raises ModelRetry on failure)
+    - hire_member(role) → ActorAddress. A failed hire raises ModelRetry; see
+      hire_member() for where that retry is, and is not, honoured.
     """
 
     def on_start(self) -> None:
@@ -118,13 +132,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         - create_model() / create_model_settings() / create_http_client()
         - ContextManager for conversation history
         - Usage limits conversion
-        - current_datetime_prompt system prompt
 
-        Additional dynamic system prompts (backstory, team context, request context)
-        are registered via @self._react_agent.system_prompt after construction.
+        Every dynamic system prompt is registered here, after construction, via
+        @self._react_agent.system_prompt: agent_backstory, current_date, whatever
+        ToolFactory.get_system_prompts() yields (from TeamTool: a team roster
+        and/or a role-profiles prompt), and mailbox_notifications when the mailbox
+        is non-empty at start. ReactAgent contributes none of its own.
 
-        Tools (hire_members, fire_members) are registered at construction time
-        as bound methods — pydantic-ai treats them as plain tools without RunContext.
+        Tools (hire_members, fire_members) come from TeamTool.get_tools() as
+        closures over the orchestrator proxy — not bound methods of this agent —
+        and take no RunContext, so pydantic-ai treats them as plain tools.
         Commands are aggregated into a single generic CommandRegistry, held for the
         agent's lifetime, and announced once via a CommandsAnnouncedEvent.
         """
@@ -177,8 +194,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         self._react_agent = self._build_react_agent(react_agent_config, tools, toolsets)
 
-        # ── Additional dynamic system prompts ─────────────────────────────────
-        # ReactAgent already registers: current_datetime_prompt + config.system_prompts
+        # ── Dynamic system prompts ────────────────────────────────────────────
+        # ReactAgent registers none of its own: its system_prompt is a bare
+        # decorator wrapper over pydantic-ai, and ReactAgentConfig has no
+        # system_prompts field. Everything the model sees is registered below.
         @self._react_agent.system_prompt
         def agent_backstory(ctx: RunContext[BaseAgent]) -> str:
             return ctx.deps.state.backstory
@@ -263,13 +282,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Args:
             context: List of EventMessage objects from the restorer.
         """
-        # The ignore is llm's list invariance, not a mismatch. ReactAgent declares its
-        # own structural stand-in for this envelope because akgentic-llm may not import
-        # akgentic-core, and core's EventMessage satisfies it — but `list` is invariant,
-        # so list[core.EventMessage] is still not list[llm.EventMessage]. The list is
-        # forwarded by identity (callers rely on that), so neither a copy nor a cast
-        # through llm's non-public Protocol is appropriate here. Retire this line by
-        # widening restore_context to accept a Sequence, which is covariant.
         self._react_agent.restore_context(context)
 
     # ============================================================================
@@ -325,8 +337,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             StructuredOutput (cast to the caller's output_type).
 
         Raises:
-            LLMUsageLimitError: When usage limits exceeded; sends help request
-                to Human and wraps the LLMUsageLimitError.
+            LLMUsageLimitError: Propagated unchanged from ReactAgent.run_sync()
+                when a usage limit is exceeded. This method neither notifies
+                anyone nor wraps it — receiveMsg_AgentMessage does both.
         """
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
         prompt: UserPrompt = user_content
@@ -368,18 +381,22 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 )
 
     def receiveMsg_AgentMessage(self, message: AgentMessage, sender: ActorAddress) -> None:  # noqa: N802
-        """Handle incoming AgentMessage.
+        """Handle an incoming AgentMessage — the agent's only message handler.
 
-        This is a generic handler for messages of type AgentMessage. Depending on the
-        content and recipient, this method can be extended to route messages to specific
-        handlers or process them directly.
+        Content starting with ``/`` is offered to the command registry first; if a
+        command handles it, the method returns without involving the LLM. Otherwise
+        the raw content is prefixed with the reply protocol for ``message.type``
+        (see REPLY_PROTOCOLS) and handed to process_message() for one LLM turn.
 
         Args:
             message: The AgentMessage instance containing the message content and recipient.
             sender: The ActorAddress of the sender of the message.
 
-        Returns:
-            None: This method can be extended to send responses or route messages as needed.
+        Raises:
+            WarningError: When the turn exceeds a usage limit. notify_human() runs
+                first — a no-op with a log line when the team has no user-proxy
+                member. LLMUsageLimitError is the only exception caught here, so
+                anything else propagates out of the handler untouched.
         """
 
         logger.info(
@@ -496,8 +513,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Resolves the typed ``hire_member`` callable from the command registry and
         invokes it with the native ``role`` (native ``ActorAddress`` return — no
-        ``/hire …`` string round-trip). Used internally by ``process_message`` —
-        raises ModelRetry on failure so the LLM can retry with a different role.
+        ``/hire …`` string round-trip). Used internally by ``process_message``.
+
+        A failed hire raises ``ModelRetry``: the registry retry-wraps every command,
+        converting the tool layer's ``RetriableError``. **On this path nothing
+        honours that retry.** ``process_message`` runs after ``act()`` has already
+        returned, so the REACT loop is over, and ``receiveMsg_AgentMessage``'s only
+        ``except`` clause is for ``LLMUsageLimitError`` — so the exception leaves
+        the actor message handler. It is deliberately not swallowed. Retry *is*
+        honoured on the other path: when the model calls the ``hire_members`` tool
+        mid-reasoning, pydantic-ai is still inside the loop and retries there.
 
         Args:
             role: Role to hire (must exist in agent catalog)
@@ -508,7 +533,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Raises:
             RuntimeError: If the hire_member command is not registered
                 (TeamTool not configured).
-            ModelRetry: If role is invalid or hire fails (propagated for LLM retry).
+            ModelRetry: If role is invalid or the hire fails.
         """
         if not self._command_registry.has("hire_member"):
             raise RuntimeError("hire_member command not available — TeamTool not configured")
