@@ -396,6 +396,13 @@ its 200 runs comes back with 20 left, not 200. Two consequences worth knowing:
 - `agent_request_limit` is consumed *before* the call executes, so a run that fails partway
   still counts against the lifetime budget.
 
+**A retrying tool now costs an extra model turn.** Under `end_strategy="exhaustive"` (the
+default), pydantic-ai v2 suppresses an output produced in the same round as a function tool
+that raised `ModelRetry`, and keeps the run open for another model turn. Since agents here
+routinely emit a `StructuredOutput` alongside a tool call, and tools raise `ModelRetry` by
+design, that second turn is charged to *both* tiers — so an agent near either budget can
+trip a limit on a turn that previously completed. Budget for it when sizing tight limits.
+
 Both tiers raise the same `UsageLimitError`, so a caller that already catches it needs no
 change to handle the new tier.
 
