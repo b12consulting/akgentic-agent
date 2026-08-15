@@ -392,10 +392,43 @@ class TestRealConsumerCallShape:
                 model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
                 runtime_cfg=RuntimeConfig(retries=5),
                 usage_limits=limits,
-                max_help_requests=5,
             )
         assert cfg.run_usage_limits.run_request_limit == 50
         assert cfg.run_usage_limits.total_tokens_limit == 100000
-        assert cfg.max_help_requests == 5
         # The agent tier the old caller never named still exists, unlimited.
         assert cfg.agent_usage_limits.agent_request_limit is None
+
+
+# =============================================================================
+# max_help_requests is gone for good
+# =============================================================================
+
+
+class TestMaxHelpRequestsRemoved:
+    """`max_help_requests` advertised a delegation-depth cap that no code path ever
+    applied: it was declared, documented, copied into a private attribute, and read
+    by nobody. It is deleted rather than enforced or annotated as inert.
+
+    The guard is on `model_fields`, not on constructor behaviour, and that is the
+    point. `AgentConfig` inherits Pydantic's `extra="ignore"`, so
+    `AgentConfig(max_help_requests=5)` neither raises before the removal nor after
+    it — a construction-based test would pass green with the field reinstated.
+    Only the field registry distinguishes the two states.
+    """
+
+    def test_field_is_not_declared(self) -> None:
+        assert "max_help_requests" not in AgentConfig.model_fields
+
+    def test_instance_carries_no_such_attribute(self) -> None:
+        assert not hasattr(AgentConfig(), "max_help_requests")
+
+    def test_passing_it_is_ignored_rather_than_stored(self) -> None:
+        """Unchanged observable behaviour: the kwarg was inert before and is inert now.
+
+        Deliberately NOT `extra="forbid"` — that would turn every existing caller
+        into a hard ValidationError, and it is a decision about the whole config
+        surface rather than this one field.
+        """
+        cfg = AgentConfig(max_help_requests=5)
+        assert not hasattr(cfg, "max_help_requests")
+        assert "max_help_requests" not in cfg.model_dump()

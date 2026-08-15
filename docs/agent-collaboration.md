@@ -1058,8 +1058,6 @@ class AgentConfig(BaseConfig):
         agent_usage_limits: Budget for the agent's WHOLE lifetime; enforced pre-flight
             by ReactAgent, which reseeds it from replayed usage events on restore.
         compaction_cfg: Context-compaction strategy and auto-trigger (opt-in).
-        max_help_requests: Intended delegation-depth cap. on_start() reads it into
-            _max_help_requests, but NO code path enforces it today.
         tools: Additional ToolCard instances exposed to the LLM.
     """
     prompt: PromptTemplate = PromptTemplate()
@@ -1068,7 +1066,6 @@ class AgentConfig(BaseConfig):
     run_usage_limits: RunUsageLimits = RunUsageLimits()
     agent_usage_limits: AgentUsageLimits = AgentUsageLimits()
     compaction_cfg: CompactionConfig = CompactionConfig()
-    max_help_requests: int = 5
     tools: list[ToolCard] = []
 ```
 

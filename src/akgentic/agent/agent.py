@@ -136,9 +136,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # ── State ───────────────────────────────────────────────────────────────
         self.state = AgentState(backstory=self.config.prompt.render()).observer(self)
 
-        # Private attributes (not serialized)
-        self._max_help_requests: int = self.config.max_help_requests
-
         # ── Add TeamTool automatically (without mutating config) ──────────────
         # TeamTool is hardcoded in akgentic-agent package
         has_team_tool = any(isinstance(t, TeamTool) for t in self.config.tools)

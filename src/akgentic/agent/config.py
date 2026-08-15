@@ -39,7 +39,6 @@ class AgentConfig(BaseConfig):
     - agent_usage_limits: Budget for the agent's WHOLE lifetime; enforced pre-flight
       by ReactAgent, which reseeds it from replayed usage events on restore
     - compaction_cfg: Context-compaction strategy and auto-trigger settings
-    - max_help_requests: Recursion depth limit for delegation chains
 
     Neither tier is enforced here: both are carried into the ReactAgentConfig that
     BaseAgent builds, and enforced inside ReactAgent (akgentic-llm).
@@ -57,7 +56,6 @@ class AgentConfig(BaseConfig):
             budget, which never blocks — "unlimited" without a nullable field.
         compaction_cfg: Context-compaction strategy and auto-trigger config (opt-in;
             off unless model_cfg.context_length is set).
-        max_help_requests: Maximum delegation depth (default: 5).
 
     Deprecated:
         ``usage_limits`` survives as a constructor keyword and a read accessor for
@@ -77,7 +75,6 @@ class AgentConfig(BaseConfig):
         ...         run_request_limit=50, total_tokens_limit=100000
         ...     ),
         ...     agent_usage_limits=AgentUsageLimits(agent_request_limit=200),
-        ...     max_help_requests=5
         ... )
     """
 
@@ -104,10 +101,6 @@ class AgentConfig(BaseConfig):
     compaction_cfg: CompactionConfig = Field(
         default_factory=CompactionConfig,
         description="Context-compaction strategy and auto-trigger config (opt-in, off by default)",
-    )
-    max_help_requests: int = Field(
-        default=5,
-        description="Maximum delegation depth to prevent infinite request chains",
     )
     tools: list[ToolCard] = Field(
         default_factory=list,

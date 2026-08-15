@@ -725,7 +725,6 @@ class TestAgentConfigDocumentedShape:
         assert isinstance(config.run_usage_limits, RunUsageLimits)
         assert isinstance(config.agent_usage_limits, AgentUsageLimits)
         assert isinstance(config.compaction_cfg, CompactionConfig)
-        assert config.max_help_requests == 5
         assert config.tools == []
 
     def test_prompt_is_a_prompt_template_not_a_bare_string(self) -> None:
