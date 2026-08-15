@@ -10,8 +10,11 @@
 - [Key Implementation](#key-implementation)
 - [Usage Examples](#usage-examples)
 - [Best Practices](#best-practices)
-- [Comparison with akgentic-team](#comparison-with-akgentic-team)
+- [Routing Patterns: Continuation vs. LLM-Driven](#routing-patterns-continuation-vs-llm-driven)
 - [API Reference](#api-reference)
+- [Testing](#testing)
+- [Related Documentation](#related-documentation)
+- [Contributing](#contributing)
 
 ---
 
@@ -19,30 +22,24 @@
 
 ### The Challenge: Simplifying Multi-Agent Routing
 
-`akgentic-team` solved multi-agent collaboration with a **continuation call stack** — a
-framework mechanism that tracked the exact chain of requests and automatically routed
-answers back through it. Powerful, but the complexity lived in the framework:
-developers had to understand `HelpRequestMessage`, `HelpAnswerMessage`, `Continuation`,
-and the `current_idx` pointer to reason about message flow.
+A multi-agent system has to decide **who owns routing**. One answer is a framework-managed
+**continuation call stack**: the framework records the exact chain of requests and routes every
+answer back through it automatically. That guarantees delivery, but the complexity lands on the
+developer — reasoning about message flow means reasoning about the framework's bookkeeping.
 
-`akgentic-agent` shifts the routing responsibility to the LLM itself. The framework
-stays minimal; the agent knows who it is talking to and produces explicit, directed
-messages:
+`akgentic-agent` takes the other answer: routing is the **LLM's** job. The framework stays
+minimal, and the agent produces explicit, directed messages.
 
-**Without LLM-driven routing (akgentic-team):**
+**What LLM-driven routing buys:**
 
-- ✅ Automatic answer routing through the chain
-- ❌ Developers must understand `Continuation` mechanics
-- ❌ Two message types (`HelpRequestMessage`, `HelpAnswerMessage`) add model complexity
-- ❌ Framework owns the routing graph; the LLM is unaware of it
+- ✅ A single `AgentMessage` type — no request/answer message pair to model
+- ✅ The LLM reasons about routing, over a conversation history it can actually see
+- ✅ Hire-by-role: the LLM addresses a _role_ and the framework hires on demand
+- ✅ No hidden call stack — the agent sees the dialogue, not framework state
+- ✅ An unresolvable `@member` is skipped at routing time instead of failing the run
 
-**With LLM-driven routing (akgentic-agent):**
-
-- ✅ Single `AgentMessage` type — vastly simpler model
-- ✅ The LLM reasons about routing; conversation context is visible to it
-- ✅ Hire-by-role: LLM addresses a _role_ and the framework hires automatically
-- ✅ Transparent to the LLM — it sees the conversation history, not a hidden call stack
-- ✅ Schema-constrained recipients prevent invalid routing at generation time
+**What it costs:** nothing *forces* the LLM to reply to the right party. See
+[Routing Patterns](#routing-patterns-continuation-vs-llm-driven) for when that matters.
 
 ### Real-World Scenarios
 
@@ -77,8 +74,8 @@ Both agents reply to "@Manager" when done
 Manager consolidates answers and replies to the original sender
 ```
 
-The LLM naturally expresses fan-out delegation. The continuation model would have
-required multiple sequential `HelpRequestMessage` instances.
+The LLM expresses fan-out delegation in a single output. A continuation call stack would need
+one request per collaborator, sequenced by hand.
 
 ---
 
@@ -91,9 +88,15 @@ Each agent invocation produces a `StructuredOutput` — a list of zero or more
 
 ```python
 class Request(BaseModel):
-    message: str    # What to say
-    recipient: str  # Who to say it to
+    message_type: Literal[   # REQUIRED, and declared first — the sender's intent
+        "request", "response", "notification", "instruction", "acknowledgment"
+    ]
+    message: str             # What to say
+    recipient: str           # Who to say it to
 ```
+
+All three fields are required: constructing a `Request` without `message_type` raises a
+Pydantic `ValidationError`.
 
 The `recipient` field drives all routing logic in `process_message()`:
 
@@ -109,7 +112,7 @@ plain string, and `process_message()` resolves it (`@name` → `get_team_member`
 
 ### Context is the "Call Stack"
 
-Where `akgentic-team` maintained a `Continuation` object tracking who asked whom,
+Where a continuation call stack keeps framework state tracking who asked whom,
 `akgentic-agent` relies on `ReactAgent`'s `ContextManager`. Every message an agent
 sends or receives is appended to its LLM conversation history. When the agent is
 invoked again (after a collaborator replies), the full dialogue is available in context.
@@ -131,9 +134,13 @@ index pointer, no framework-managed stack.
                               │
                    ┌──────────▼──────────┐
                    │    AgentMessage     │
+                   │  type: Literal[5]   │
+                   │       = "request"   │
                    │  content: str       │
-                   │  recipient:         │
-                   │    ActorAddress     │
+                   │  (+ Message fields: │
+                   │   id, parent_id,    │
+                   │   team_id, sender,  │
+                   │   recipient, …)     │
                    └──────────┬──────────┘
                               │
               ┌───────────────┴─────────────────┐
@@ -154,7 +161,7 @@ index pointer, no framework-managed stack.
               │
    ┌──────────▼──────────────────────────────────────────────────┐
    │  StructuredOutput                                           │
-   │  messages: list[Request({message, recipient})]              │
+   │  messages: list[Request({message_type, message, recipient})]│
    └──────────┬──────────────────────────────────────────────────┘
               │
      For each Request:
@@ -169,10 +176,16 @@ index pointer, no framework-managed stack.
 ```python
 class AgentMessage(Message):
     """Single message type for all inter-agent communication."""
-    content: str  # Message body (the only field added over Message)
+    type: Literal[
+        "request", "response", "notification", "instruction", "acknowledgment"
+    ] = "request"          # the sender's intent, defaulting to "request"
+    content: str           # message body
 
 class Request(BaseModel):
-    """One entry in the LLM's StructuredOutput."""
+    """One entry in the LLM's StructuredOutput. Every field is required."""
+    message_type: Literal[
+        "request", "response", "notification", "instruction", "acknowledgment"
+    ]
     message: str    # Raw message text
     recipient: str  # "@MemberName" or "RoleName"
 
@@ -181,9 +194,15 @@ class StructuredOutput(BaseModel):
     messages: list[Request] = []
 ```
 
-`AgentMessage` carries only `content`. The target actor address is resolved by
-`process_message()` from the `recipient` string in each `Request` — the
-message itself does not carry a pre-resolved address.
+`AgentMessage` adds exactly two fields of its own — `type` and `content`. Everything else
+(`id`, `parent_id`, `team_id`, `timestamp`, `sender`, `recipient`, `display_type`) is inherited
+from `akgentic-core`'s `Message`.
+
+The two `type` fields are the same protocol seen from both ends: `process_message()` copies
+`request.message_type` straight onto the `AgentMessage.type` it sends, so the receiver reads the
+sender's intent as first-class data. It also fills the inherited `recipient` with the resolved
+`ActorAddress` — the string→address resolution happens in `process_message()`, and the delivered
+message records its outcome.
 
 ### ToolFactory & 3-Channel Architecture
 
@@ -195,7 +214,14 @@ through via `expose: set[Channels]`:
 | --------------- | ---------------------- | -------------------------------------------------------------------------------------- |
 | `TOOL_CALL`     | `get_tools()`          | LLM-callable functions (`hire_members`, `fire_members`, `update_planning`)             |
 | `SYSTEM_PROMPT` | `get_system_prompts()` | Dynamic prompts injected into LLM context (`team_roster`, `role_profiles`, `planning`) |
-| `COMMAND`       | `get_commands()`       | Programmatic API for code and slash-commands (`cmd_hire_member`, `cmd_get_planning`)   |
+| `COMMAND`       | `get_commands()`       | Folded by `ToolFactory.get_command_registry()` into one name-keyed `CommandRegistry`, reached from in-agent code and `/`-prefixed messages (`hire_member`, `planning_summary`) |
+
+Note which `get_commands()` is which. The one a `ToolCard` implements is the live extension point —
+that is how a tool declares its COMMAND-channel callables. The **aggregator** of the same name on
+`ToolFactory` is the older param-class-keyed dict; it is **deprecated** and warns.
+`BaseAgent.on_start()` calls `ToolFactory.get_command_registry()` instead, which keys every command
+by the callable's `__name__` and derives an argument schema from its signature. See
+[The Command Registry](#4-the-command-registry) for the two surfaces that reach it.
 
 Two `ToolCard` implementations are central to collaboration — **TeamTool** and
 **PlanningTool** — described in the next section.
@@ -225,20 +251,24 @@ what roles are available, and to hire or fire members.
 make routing decisions. At every `act()` call, the LLM sees:
 
 ```
-**Team members:**
+**Here is the team member list by name (and role):**
 @Manager (role: Manager) - [you]
 @Developer456 (role: Developer)
 @QA789 (role: QA)
 
-**Available team roles:**
+**Here is the available team role list (for hiring):**
 Manager: Helpful manager coordinating team work (Skills: coordination, delegation)
 Developer: Full-stack developer (Skills: coding, architecture)
 QA: Quality assurance engineer (Skills: testing, automation)
 ```
 
-Combined with the `{team}` and `{roles}` variables injected into the `StructuredOutput`
-docstring, the LLM has full team visibility without the developer hard-coding
-any team structure into prompts.
+Actors whose name starts with `#` (tool actors) are excluded from the roster, and the agent
+reading it is marked `- [you]`.
+
+That is the whole mechanism. The roster and the role catalog reach the LLM through the
+`SYSTEM_PROMPT` channel, regenerated on every call. **Nothing is injected into the output
+schema** — `act()` reasons against the static `StructuredOutput` type — so the developer never
+hard-codes team structure into a prompt, and the schema never varies from call to call.
 
 ### PlanningTool — Coordinating Complex Multi-Agent Work
 
@@ -251,15 +281,28 @@ planning tool provides a shared, persistent task board backed by a `PlanActor`.
 | **`GetPlanning`**     | `SYSTEM_PROMPT`, `COMMAND` | Injects the full task list into every LLM call       |
 | **`GetPlanningTask`** | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to retrieve a single task by ID    |
 | **`UpdatePlanning`**  | `TOOL_CALL`                | LLM-callable tool to create, update, or delete tasks |
+| **`SearchPlanning`**  | `TOOL_CALL`, `COMMAND`     | Search tasks by status, owner, creator, or description |
 
-At every `act()` call, the LLM sees the current plan state:
+At every `act()` call, the LLM sees the current plan state. `GetPlanning.filter_by_agent` defaults
+to **`True`**, so out of the box each agent sees only the tasks it owns or created, under a
+`**Your tasks** (owner or creator: @Manager):` header — and
+`No tasks assigned to or created by @Manager yet.` when it has none. Pass
+`GetPlanning(filter_by_agent=False)` to show the whole board instead:
 
 ```
-Team planning:
-- ID 1 [started] Design auth flow — Output:  (Owner: @Developer456, Creator: @Manager)
-- ID 2 [pending] Write integration tests — Output:  (Owner: @QA789, Creator: @Manager)
+**Team planning:** 3 tasks total
+Owners: @Developer456: 1 | @Manager: 1 | @QA789: 1
+
+**All tasks:**
+- ID 1 [started] Design auth flow (Owner: @Developer456, Creator: @Manager)
+- ID 2 [pending] Write integration tests (Owner: @QA789, Creator: @Manager)
 - ID 3 [completed] Review security requirements — Output: OWASP checklist applied (Owner: @Manager, Creator: @Manager)
+
+Use get_planning_task(id) for exact ID lookup or search_planning(...) to filter tasks.
 ```
+
+The totals line and the owner breakdown are the same either way; only the task list narrows. The
+` — Output: …` segment appears only when a task actually has an output.
 
 #### Custom Instructions via `UpdatePlanning`
 
@@ -287,12 +330,19 @@ This produces a tool docstring the LLM sees as:
 ```
 Update team tasks (create, update, delete).
 
+Field constraints (violating them causes a validation error):
+- description: max 300 characters — keep it concise.
+- output: max 150 characters — will be truncated automatically if exceeded.
+
 Additional Instructions:
 CRITICAL: Always keep the plan updated.
 Create tasks when your task involves other team members
 or is complex enough to require multiple steps.
 ...
 ```
+
+`format_docstring()` appends `"\n\nAdditional Instructions:\n"` plus the text; with no
+`instructions` set, the original docstring is returned untouched.
 
 #### How TeamTool + PlanningTool Work Together
 
@@ -351,13 +401,17 @@ sequenceDiagram
     participant User
     participant Manager
 
-    User->>Manager: AgentMessage("Plan the sprint")
+    User->>Manager: AgentMessage("Plan the sprint", type="request")
     activate Manager
+    Note over Manager: receiveMsg_AgentMessage prepends the reply<br/>protocol for "request" to the raw content
     Manager->>Manager: act() → StructuredOutput
-    Note over Manager: [{message: "Here is the plan", recipient: "@User"}]
-    Manager->>User: AgentMessage("Here is the plan")
+    Note over Manager: [{message_type: "response", message: "Here is the plan",<br/>recipient: "@User"}]
+    Manager->>User: AgentMessage("Here is the plan", type="response")
     deactivate Manager
 ```
+
+Every arrow above carries the **raw** `request.message`. The `"You received a … from …"` line is
+never on the wire — each receiver builds its own from the `type` it was handed.
 
 ### 2. Two-Hop Delegation (Known Member)
 
@@ -367,25 +421,31 @@ sequenceDiagram
     participant Manager
     participant Developer
 
-    User->>Manager: AgentMessage("Estimate feature X")
+    User->>Manager: AgentMessage("Estimate feature X", type="request")
     activate Manager
+    Note over Manager: prefixes locally:<br/>"You received a request from @User. …"
     Manager->>Manager: act() → StructuredOutput
-    Note over Manager: [{recipient: "@Developer", message: "Estimate feature X"}]
-    Manager->>Developer: AgentMessage("You received a request from Manager...")
+    Note over Manager: [{recipient: "@Developer", message_type: "request",<br/>message: "Estimate feature X"}]
+    Manager->>Developer: AgentMessage("Estimate feature X", type="request")
     deactivate Manager
 
     activate Developer
+    Note over Developer: prefixes locally:<br/>"You received a request from @Manager. …"
     Developer->>Developer: act() → StructuredOutput
-    Note over Developer: [{recipient: "@Manager", message: "3 days"}]
-    Developer->>Manager: AgentMessage("You received a response from @Developer456: 3 days")
+    Note over Developer: [{recipient: "@Manager", message_type: "response",<br/>message: "3 days"}]
+    Developer->>Manager: AgentMessage("3 days", type="response")
     deactivate Developer
 
     activate Manager
+    Note over Manager: prefixes locally:<br/>"You received a response from @Developer456. …"
     Manager->>Manager: act() → StructuredOutput
-    Note over Manager: [{recipient: "@User", message: "Estimate: 3 days"}]
-    Manager->>User: AgentMessage("You received a response from @Manager: Estimate: 3 days")
+    Note over Manager: [{recipient: "@User", message_type: "response",<br/>message: "Estimate: 3 days"}]
+    Manager->>User: AgentMessage("Estimate: 3 days", type="response")
     deactivate Manager
 ```
+
+The prefix is built by the **receiver**, from the `type` on the message it just received — it is
+not part of the payload the sender transmits.
 
 ### 3. Hire-by-Role Delegation
 
@@ -399,16 +459,16 @@ sequenceDiagram
     participant NewActor as SecurityEngineer (new)
 
     Manager->>Manager: act() → StructuredOutput
-    Note over Manager: [{recipient: "SecurityEngineer", message: "Audit auth flow"}]
-    Manager->>Manager: process_message: "SecurityEngineer" not prefixed with "@"<br/>→ detected as role name
-    Manager->>Manager: hire_member("SecurityEngineer")
+    Note over Manager: [{recipient: "SecurityEngineer", message_type: "request",<br/>message: "Audit auth flow"}]
+    Manager->>Manager: process_message: "SecurityEngineer" not prefixed with "@"<br/>→ treated as a role name
+    Manager->>Manager: hire_member("SecurityEngineer")<br/>→ registry.callable("hire_member")
     Manager->>Orchestrator: createActor(SecurityEngineer role)
     Orchestrator-->>Manager: @SecurityEngineer456 address
-    Manager->>NewActor: AgentMessage("You received a request from @Manager...")
+    Manager->>NewActor: AgentMessage("Audit auth flow", type="request")
     activate NewActor
-    Note over NewActor: System prompts: roster (sees full team) + roles + planning
+    Note over NewActor: prefixes locally, then system prompts:<br/>roster (sees full team) + roles + planning
     NewActor->>NewActor: act() → StructuredOutput
-    NewActor->>Manager: AgentMessage("You received an answer from @SecurityEngineer456...")
+    NewActor->>Manager: AgentMessage("Audit complete: …", type="response")
     deactivate NewActor
 ```
 
@@ -432,20 +492,20 @@ flowchart TD
 
 ### 5. Mailbox Notification
 
-When an agent is busy processing a long REACT loop and new messages arrive from
-other team members, `BaseAgent` surfaces a mailbox notification in the next system
-prompt:
+`on_start()` can register one more dynamic system prompt, `mailbox_notifications`, whose intent
+is to tell a busy agent that other team members are waiting:
 
-```mermaid
-sequenceDiagram
-    participant Dev as Developer
-    participant QA
-
-    Dev->>Dev: Long REACT loop running
-    QA->>Dev: AgentMessage (queued in mailbox)
-    Note over Dev: mailbox_notifications system prompt fires:<br/>"1 new message from QA. Consider wrapping up."
-    Dev->>Dev: LLM wraps up → sends reply to QA
 ```
+NOTICE: 2 new message(s) arrived in your mailbox from team member(s): @QA789, @Manager.
+Consider wrapping up the current thread to process them.
+```
+
+**Read the wiring before relying on it.** The prompt is registered only when
+`self.get_mailbox()` is non-empty *at `on_start()` time*, and the closure captures that call's
+**snapshot** — `get_mailbox()` builds a new list each time it is called, and it is called once.
+A message that arrives later does not change what the prompt reports, and on an agent whose
+mailbox was empty at start-up the prompt is never registered at all. In practice that is every
+agent, so this notification does not currently fire for messages arriving mid-run.
 
 ---
 
@@ -510,21 +570,89 @@ Story 5.1 / ADR-004; the intent-driven 5-type protocol itself is unchanged.
 
 ### 3. Hire-by-Role (hire_member)
 
-When the LLM names a role instead of a `@member`, `process_message` calls
-`hire_member(role)` which delegates to `TeamTool`'s `HireTeamMember` command:
+When the LLM names a role instead of a `@member`, `process_message` calls `hire_member(role)`,
+which resolves `TeamTool`'s `hire_member` command from the registry's **typed** surface and
+invokes it with the native argument — no `/hire …` string round-trip, and the native
+`ActorAddress` comes straight back:
 
 ```python
 def hire_member(self, role: str) -> ActorAddress:
-    if self._hire_member_command is None:
+    if not self._command_registry.has("hire_member"):
         raise RuntimeError("hire_member command not available — TeamTool not configured")
-    return self._hire_member_command(role)
+
+    hire = self._command_registry.callable("hire_member")
+    return cast(ActorAddress, hire(role))
 ```
 
 Internally, `TeamTool` asks the `Orchestrator` to create a new actor of the
 requested role and register it in the team roster. The address is returned and
 the message is immediately delivered to the newly hired actor.
 
-### 4. Usage Limit Protection
+If the role does not exist in the agent catalog, the command raises a `RetriableError`, which
+`ToolFactory` has wrapped into `ModelRetry` — so the LLM gets to try a different role rather than
+the run dying.
+
+### 4. The Command Registry
+
+`on_start()` folds every `COMMAND`-channel capability of the agent's tool cards into a single
+`CommandRegistry`, adds `compact` and `clear` as command-only built-ins, and announces the whole
+set exactly once so services can discover it without per-command coupling:
+
+```python
+self._command_registry = tool_factory.get_command_registry(
+    extra_commands=[self.compact, self.clear]
+)
+self.notify_event(
+    CommandsAnnouncedEvent(
+        agent=self.myAddress,
+        commands=self._command_registry.descriptors(),
+    )
+)
+```
+
+Commands are keyed by the callable's `__name__`. The canonical names are therefore
+`hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`,
+`get_planning_task`, `search_planning`, `compact`, `clear` — the exact set depends on which tool
+cards the agent carries. Two surfaces reach that one table:
+
+| Surface | Call | Returns | Used by |
+|---|---|---|---|
+| **typed / in-agent** | `registry.callable("hire_member")(role)` | native value (`ActorAddress` here) | `hire_member()`, `act()`'s media expansion |
+| **human / text** | `registry.dispatch("/hire_member Developer")` | `str` | `/`-prefixed messages from a human |
+
+`registry.has(name)` tests availability; `registry.descriptors()` returns serializable discovery
+metadata (name, description, argument schema, owning tool card).
+
+#### Slash dispatch
+
+`receiveMsg_AgentMessage()` inspects the **raw** content before any prefixing. A leading `/`
+routes the message to `_dispatch_command()`, which never reaches the LLM path:
+
+```python
+if message.content.startswith("/") and self._dispatch_command(message, sender):
+    return
+```
+
+`_dispatch_command()` dispatches the text, sends the result back to the sender as a
+`notification` `AgentMessage` — a non-`request` type, so it does not start a reply loop — and
+records one synthetic, human-attributed **operator action** in the LLM context, so the agent
+reasons about what the human did without mistaking it for its own tool call.
+
+The fallback is what makes this safe to put in front of every message:
+
+- **Unknown leading token** → `dispatch` raises `CommandNotRecognized`; `_dispatch_command()`
+  swallows it and returns `False`, so the message continues down the normal LLM path with its
+  original content. **No operator action is recorded** — the command never ran.
+- **Known command, bad arguments** (or the body raising) → caught *inside* `dispatch`, returned
+  as a result string. Handled exactly like a success; never falls back to the LLM.
+
+```python
+# From the human side — see examples/simple_team.py
+human_addr.send(manager_addr, AgentMessage(content="/team_members"))
+human_addr.send(manager_addr, AgentMessage(content="/hire_member DevOpsEngineer"))
+```
+
+### 5. Usage Limit Protection
 
 `receiveMsg_AgentMessage` catches `LLMUsageLimitError` and escalates via
 `notify_human()` to the team's first user-proxy member — found structurally through
@@ -548,8 +676,8 @@ returns `None` and delivery is skipped rather than raising.
 
 ### Example 1: Minimal Team with Planning
 
-This is the typical setup for a collaborative team. Taken from
-[src/agent_team.py](../../src/agent_team.py):
+This is the typical setup for a collaborative team. Adapted from
+[examples/simple_team.py](https://github.com/b12consulting/akgentic-agent/blob/master/examples/simple_team.py):
 
 ```python
 from akgentic.agent import AgentConfig, AgentMessage, BaseAgent, HumanProxy
@@ -572,8 +700,9 @@ tools = [planning_tool]  # add search_tool, knowledge_graph, etc. as needed
 
 # TeamTool is NOT listed here — it is auto-injected by BaseAgent
 
+# `role` is NOT an AgentCard constructor keyword — AgentCard.role is a read-only
+# property reading config.role. Passing role= here would be silently ignored.
 manager_card = AgentCard(
-    role="Manager",
     description="Helpful manager coordinating team work",
     skills=["coordination", "delegation"],
     agent_class="akgentic.agent.BaseAgent",
@@ -623,11 +752,11 @@ not code you write — the LLM produces this output:
 # The LLM returns:
 StructuredOutput(messages=[
     # Reply to the original sender
-    Request(message="I'll coordinate...", recipient="@Human"),
+    Request(message_type="response", message="I'll coordinate...", recipient="@Human"),
     # Direct send to existing member
-    Request(message="Implement OAuth", recipient="@Developer456"),
+    Request(message_type="instruction", message="Implement OAuth", recipient="@Developer456"),
     # Hire a new role on demand
-    Request(message="Audit auth flow", recipient="SecurityEngineer"),
+    Request(message_type="request", message="Audit auth flow", recipient="SecurityEngineer"),
 ])
 
 # process_message() resolves each:
@@ -666,7 +795,9 @@ UpdatePlan(
 )
 # Then returns:
 StructuredOutput(messages=[
-    Request(message="Start with Task 1: design the auth flow", recipient="@Developer456"),
+    Request(message_type="instruction",
+            message="Start with Task 1: design the auth flow",
+            recipient="@Developer456"),
 ])
 
 # Developer's LLM call
@@ -675,7 +806,9 @@ StructuredOutput(messages=[
 UpdatePlan(update_tasks=[TaskUpdate(id=1, status="completed", output="JWT + OAuth2 design")])
 # Then returns:
 StructuredOutput(messages=[
-    Request(message="Design complete — JWT + OAuth2. Ready for Task 2.", recipient="@Manager"),
+    Request(message_type="response",
+            message="Design complete — JWT + OAuth2. Ready for Task 2.",
+            recipient="@Manager"),
 ])
 
 # Manager's LLM call #2
@@ -729,32 +862,63 @@ StructuredOutput(messages=[
    The agent will be invoked again when the next `AgentMessage` arrives, with
    full context history preserved.
 
-4. **Use `cmd_` commands for programmatic / slash-command operations**
+4. **Drive an agent with `/`-prefixed messages, and read the command set from the registry**
+
+   A human operator does not call methods on the agent — they send it a message that starts
+   with `/`. `receiveMsg_AgentMessage()` intercepts it, the agent's `CommandRegistry` dispatches
+   it, and the result comes back as a `notification` on the event stream:
 
    ```python
-   # From agent_team.py interactive loop
-   addr = manager_proxy.cmd_hire_member("DevOpsEngineer")
-   result = manager_proxy.cmd_fire_member("@DevOpsEngineer456")
-   print(manager_proxy.cmd_get_planning())
-   print(manager_proxy.cmd_get_team_roster())
+   # From examples/simple_team.py — the interactive loop
+   human_addr.send(manager_addr, AgentMessage(content="/team_members"))
+   human_addr.send(manager_addr, AgentMessage(content="/hire_member DevOpsEngineer"))
+   human_addr.send(manager_addr, AgentMessage(content="/fire_member @DevOpsEngineer456"))
    ```
+
+   A CLI is free to offer friendlier aliases, as long as it maps them onto the **real** command
+   names before sending — `simple_team.py` does exactly this:
+
+   ```python
+   command_aliases = {
+       "team": "team_members",
+       "roles": "team_roles",
+       "planning": "planning_summary",
+       "task": "get_planning_task",
+       "hire": "hire_member",
+       "fire": "fire_member",
+   }
+   real = command_aliases.get(command, command)
+   human_addr.send(manager_addr, AgentMessage(content=f"/{real} {arg}".rstrip()))
+   ```
+
+   In-agent Python code takes the typed surface instead, which preserves native return values:
+
+   ```python
+   if agent._command_registry.has("hire_member"):
+       address = agent._command_registry.callable("hire_member")("DevOpsEngineer")
+   ```
+
+   Never hard-code the list of available commands. Read it from
+   `registry.descriptors()`, or from the `CommandsAnnouncedEvent` the agent emits once at
+   start-up — a transcribed list is exactly what drifts.
 
 5. **Always include a `HumanProxy` in the team**
 
-   `notify_human()` sends escalation messages (usage-limit exceeded,
-   recursion error) to the team's first user-proxy member — found structurally
-   through `ActorAddress.is_user_proxy`, so any role string works. Without one,
-   error escalations are logged and dropped.
+   `notify_human()` sends the usage-limit escalation — currently its only caller — to the
+   team's first user-proxy member, found structurally through `ActorAddress.is_user_proxy`, so
+   any role string works. Without one, the notice is logged and dropped.
 
 ### ❌ DON'T
 
 1. **Don't confuse role names with member names**
 
    ```
-   # Wrong: "@" prefix is for existing members, not roles
-   recipient: "@Designer"   (if no Designer has been hired yet → member_err)
+   # Wrong: "@" prefix is for existing members, not roles.
+   # If no Designer has been hired, get_team_member returns None and the
+   # message is silently dropped — no error, no delivery.
+   recipient: "@Designer"
 
-   # Right: bare role name triggers auto-hire
+   # Right: a bare role name triggers auto-hire
    recipient: "Designer"
    ```
 
@@ -788,26 +952,35 @@ StructuredOutput(messages=[
 
 ---
 
-## Comparison with akgentic-team
+## Routing Patterns: Continuation vs. LLM-Driven
 
-| Aspect                   | akgentic-team (deprecated)                               | akgentic-agent                                            |
+The design contrast that shaped this package. A **continuation call stack** is the classic
+answer to multi-agent routing: the framework records the chain of requests and walks answers
+back down it. `akgentic-agent` is the other answer.
+
+| Aspect                   | Continuation call stack                                  | akgentic-agent                                            |
 | ------------------------ | -------------------------------------------------------- | --------------------------------------------------------- |
-| **Message types**        | `HelpRequestMessage`, `HelpAnswerMessage`, `UserMessage` | `AgentMessage` only                                       |
-| **Routing mechanism**    | Framework `Continuation` call stack                      | LLM `StructuredOutput` recipients                         |
-| **Answer routing**       | Automatic via `current_idx` decrement                    | LLM explicitly names sender as recipient                  |
-| **Delegation**           | `HelpRequestMessage(owner=target)`                       | `Request(recipient="@Target")`                            |
-| **Hire-by-role**         | Via `TeamFactory` at setup time                          | LLM names a role; hired at runtime                        |
-| **Context tracking**     | `Continuation.message_path` + `current_idx`              | `ReactAgent.ContextManager` conversation history          |
-| **Fan-out (parallel)**   | Multiple sequential `HelpRequestMessage`                 | Single `StructuredOutput` with multiple `Request` entries |
-| **LLM visibility**       | LLM unaware of routing graph                             | LLM owns the routing graph                                |
-| **Developer complexity** | Must understand `Continuation` mechanics                 | Prompt-level: describe who is in the team                 |
+| **Message types**        | A request/answer pair, plus a terminal result type       | `AgentMessage` only                                       |
+| **Routing mechanism**    | Framework-owned call stack                               | LLM `StructuredOutput` recipients                         |
+| **Answer routing**       | Automatic — the framework unwinds the stack              | The LLM explicitly names the sender as recipient          |
+| **Hire-by-role**         | Team composition fixed at setup time                     | The LLM names a role; hired at runtime                    |
+| **Context tracking**     | Framework state: the recorded request path               | `ReactAgent`'s `ContextManager` conversation history      |
+| **Fan-out (parallel)**   | One request per collaborator, sequenced by hand          | Single `StructuredOutput` with multiple `Request` entries |
+| **LLM visibility**       | The LLM is unaware of the routing graph                  | The LLM owns the routing graph                            |
+| **Developer complexity** | Must reason about the stack to follow message flow       | Prompt-level: describe who is in the team                 |
 
-### When the Continuation Model Still Applies
+### The trade-off this makes
 
-If you need **guaranteed answer routing back** to a specific caller through a
-multi-hop chain (audit trail, formal call stack semantics), the continuation
-model remains the correct tool. `akgentic-agent` does not implement this
-guarantee — the LLM _should_ reply to the right party, but is not forced to.
+If you need **guaranteed answer routing back** to a specific caller through a multi-hop chain
+(audit trail, formal call-stack semantics), a continuation model is the correct tool.
+`akgentic-agent` deliberately does not provide that guarantee: the LLM _should_ reply to the
+right party, and the reply protocol in the prompt tells it to, but nothing forces it.
+
+> **Not to be confused with `akgentic-team`.** That package is an active part of this workspace
+> and solves a different problem entirely: team **lifecycle** — create, resume, stop and delete
+> teams, with event-sourced persistence (`TeamManager`, `TeamRestorer`, `PersistenceSubscriber`,
+> `EventStore`). It is complementary to this package, not an alternative routing mechanism, and
+> it is not deprecated.
 
 ---
 
@@ -817,29 +990,37 @@ guarantee — the LLM _should_ reply to the right party, but is not forced to.
 
 ```python
 class AgentMessage(Message):
-    """Single message type for all inter-agent communication.
+    """Base message type for team communication.
 
     Attributes:
-        content: The message body.
+        type: The sender's intent, defaulting to "request".
+        content: The message text content.
     """
+    type: Literal[
+        "request", "response", "notification", "instruction", "acknowledgment"
+    ] = "request"
     content: str
 ```
 
-`AgentMessage` inherits `id`, `sender`, and `team_id` from `Message`.
-It does **not** carry a pre-resolved recipient — the target address is
-resolved by `process_message()` from the `Request.recipient` string.
+`AgentMessage` declares exactly those two fields. It inherits `id`, `parent_id`, `team_id`,
+`timestamp`, `sender`, `recipient` and `display_type` from `akgentic-core`'s `Message`.
+
+The `recipient` string on a `Request` is what `process_message()` resolves; the resolved
+`ActorAddress` is then set on the inherited `recipient` field of the `AgentMessage` it sends.
 
 ### Request
 
 ```python
 class Request(BaseModel):
-    """A directed message produced by the LLM.
+    """A message directed to a specific team member or role.
+
+    All three fields are required.
 
     Attributes:
         message_type: Intent of the message (request, response, notification, etc.).
         message: The message content to send.
-        recipient: Target expressed as "@MemberName" or "RoleName".
-            Schema-constrained to valid values at generation time.
+        recipient: Target expressed as "@MemberName" or "RoleName". A plain string,
+            unconstrained in the schema — validity is resolved at routing time.
     """
     message_type: Literal["request", "response", "notification", "instruction", "acknowledgment"]
     message: str
@@ -865,25 +1046,28 @@ class StructuredOutput(BaseModel):
 
 ```python
 class AgentConfig(BaseConfig):
-    """Per-agent configuration.
+    """Per-agent configuration. Every field has a default.
 
     Attributes:
-        prompt: Agent backstory/system prompt (string or PromptTemplate).
-        model_cfg: LLM provider and model settings.
-        runtime_cfg: Execution parameters (temperature, max tokens, retries).
+        prompt: Agent backstory/system prompt, as a PromptTemplate (not a bare string).
+        model_cfg: LLM provider and model settings — including sampling settings such
+            as temperature, which live here and NOT on runtime_cfg.
+        runtime_cfg: Execution parameters — retries, tool-call end strategy,
+            parallel tool calls, HTTP client settings.
         run_usage_limits: Budget for ONE run; enforced by pydantic-ai, resets per run.
         agent_usage_limits: Budget for the agent's WHOLE lifetime; enforced pre-flight
             by ReactAgent, which reseeds it from replayed usage events on restore.
         compaction_cfg: Context-compaction strategy and auto-trigger (opt-in).
-        max_help_requests: Recursion depth limit for delegation chains (default: 5).
+        max_help_requests: Intended delegation-depth cap. on_start() reads it into
+            _max_help_requests, but NO code path enforces it today.
         tools: Additional ToolCard instances exposed to the LLM.
     """
-    prompt: PromptTemplate
-    model_cfg: ModelConfig
-    runtime_cfg: RuntimeConfig
-    run_usage_limits: RunUsageLimits
-    agent_usage_limits: AgentUsageLimits
-    compaction_cfg: CompactionConfig
+    prompt: PromptTemplate = PromptTemplate()
+    model_cfg: ModelConfig = ModelConfig()
+    runtime_cfg: RuntimeConfig = RuntimeConfig()
+    run_usage_limits: RunUsageLimits = RunUsageLimits()
+    agent_usage_limits: AgentUsageLimits = AgentUsageLimits()
+    compaction_cfg: CompactionConfig = CompactionConfig()
     max_help_requests: int = 5
     tools: list[ToolCard] = []
 ```
@@ -900,6 +1084,11 @@ and read accessor for `run_usage_limits` — it warns, and both are removed in
 akgentic-agent 2.0.0. Supplying `usage_limits` and `run_usage_limits` together raises
 `ValueError`. See the README's *Usage limits: two tiers* section for the migration.
 
+Do not confuse those two shims with the `UsageLimits` **class**, which is a separate,
+`akgentic-llm`-owned deprecated alias of `RunUsageLimits`. That one still ships and still warns;
+its removal is not scheduled for a named release. Only the two `AgentConfig` shims above have a
+fixed removal target.
+
 ### BaseAgent
 
 ```python
@@ -913,47 +1102,65 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         delegating to ReactAgent.run_sync(output_type=StructuredOutput).
 
     process_message(message_content, sender) -> None
-        Core routing engine. Calls act(), resolves recipients,
-        delivers AgentMessage instances with enriched content.
+        Core routing engine. Calls act(), resolves each Request.recipient, and
+        sends the RAW request.message as an AgentMessage carrying request.message_type.
+        It does not enrich the content — the receiver adds the reply protocol.
 
     receiveMsg_AgentMessage(message, sender) -> None
-        Pykka message handler. Entry point for all incoming messages.
+        Pykka message handler. Entry point for all incoming messages. Intercepts
+        "/"-prefixed content as a command; otherwise prepends the REPLY_PROTOCOLS
+        line for message.type and calls process_message().
 
     hire_member(role) -> ActorAddress
-        Hire a new agent by role via TeamTool. Raises ModelRetry on failure.
+        Hire by role through the registry's typed hire_member command.
+        Raises RuntimeError if that command is not registered (no TeamTool);
+        ModelRetry propagates when the role is invalid or the hire fails.
 
     notify_human(message) -> None
-        Send an AgentMessage to the team's first user-proxy member.
+        Send a notification AgentMessage to the team's first user-proxy member;
+        logs and returns when the team has none.
 
-    cmd_hire_member(role) -> ActorAddress | str
-        Programmatic hire; returns error string instead of raising.
+    get_usage_summary(by_run=False) -> AgentUsageSummary
+        Query the orchestrator for this agent's LlmUsageEvents and aggregate them
+        into a cost summary. Callable via a Pykka proxy.
 
-    cmd_fire_member(name) -> str
-        Programmatic fire; returns confirmation or error string.
+    compact() -> str
+        Compact the conversation history into a summary. Also registered as /compact.
 
-    cmd_get_planning() -> str
-        Return formatted team planning (requires PlanningTool).
+    clear() -> str
+        Clear the conversation; the system prompt regenerates on the next run.
+        Also registered as /clear.
 
-    cmd_get_team_roster() -> str
-        Return formatted team roster.
+    init_llm_context(context) -> None
+        Restore LLM conversation context from persisted events (pure pass-through
+        to ReactAgent).
 
-    cmd_get_role_profiles() -> str
-        Return available role definitions.
+    on_start() -> None
+        Build state, ToolFactory, the CommandRegistry, and the ReactAgent; register
+        the dynamic system prompts; emit one CommandsAnnouncedEvent.
+
+    on_stop() -> None
+        Close the ReactAgent (never raises), then run the base teardown.
     """
 ```
+
+There is **no `cmd_*` method on `BaseAgent`.** Commands live in the `CommandRegistry` under
+their canonical names — see [The Command Registry](#4-the-command-registry).
 
 ### HumanProxy
 
 ```python
 class HumanProxy(UserProxy):
-    """Human-in-the-loop agent serving as telemetry sink and input bridge.
+    """Human-in-the-loop agent: message sink and input bridge.
 
     receiveMsg_AgentMessage(message, sender) -> None
-        Telemetry sink: pushes incoming messages into the event system.
-        Consumer is pluggable (console, WebSocket, WhatsApp, email, etc.).
+        Logs receipt. The base implementation publishes nothing of its own —
+        subscribers see the content through the SentMessage that the SENDING
+        agent emits. Override this hook to queue for a UI, WebSocket, email, etc.
 
     process_human_input(content, message) -> None
-        Routes human response back as AgentMessage to the requesting agent.
+        Routes the human's reply back to message.sender as an AgentMessage with
+        type="response", setting _current_message first so parent_id threading works.
     """
 ```
 
@@ -961,23 +1168,25 @@ class HumanProxy(UserProxy):
 
 ## Testing
 
-Run the agent package tests:
+Run the agent package tests from this repository's root:
 
 ```bash
-cd packages/akgentic-agent
-python -m pytest tests/ -v
-python -m pytest tests/ --cov=akgentic.agent
+uv run pytest tests/ -v
+uv run pytest tests/ --cov=akgentic.agent
 ```
+
+Integration tests are deselected by default (`addopts = "-m 'not integration'"`) because they
+make real LLM calls. Run them with `uv run pytest tests/ -m integration`.
 
 ---
 
 ## Related Documentation
 
-- [akgentic-core Actor System](../../akgentic-core/docs/)
-- [akgentic-llm ReactAgent](../../akgentic-llm/docs/)
-- [akgentic-tool ToolCard & TeamTool](../../akgentic-tool/docs/)
-- [Continuation System (akgentic-team, deprecated)](../akgentic-team/docs/continuation-system.md)
-- [Project Architecture](../../docs/architecture.md)
+- [akgentic-core](https://github.com/b12consulting/akgentic-core) — actor system, `Orchestrator`, `AgentCard`, `Message`
+- [akgentic-llm](https://github.com/b12consulting/akgentic-llm) — `ReactAgent`, `ContextManager`, usage limits, compaction
+- [akgentic-tool](https://github.com/b12consulting/akgentic-tool) — `ToolCard`, `ToolFactory`, `CommandRegistry`, `TeamTool`, `PlanningTool`
+- [akgentic-team](https://github.com/b12consulting/akgentic-team) — team lifecycle and event-sourced persistence
+- [akgentic-quick-start](https://github.com/b12consulting/akgentic-quick-start) — the workspace that aggregates every package
 
 ---
 
