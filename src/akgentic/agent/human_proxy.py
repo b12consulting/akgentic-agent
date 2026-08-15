@@ -35,8 +35,14 @@ class HumanProxy(UserProxy):
         >>> config = BaseConfig(name="human", role="HumanProxy")
         >>> proxy_addr = system.createActor(HumanProxy, config=config)
         >>>
-        >>> # An agent asks the human something; `incoming` is what the proxy got
-        >>> incoming = AgentMessage(content="Proceed?", recipient=proxy_addr)
+        >>> # Stand-in for the agent that asks — any actor address will do here
+        >>> asker_addr = system.createActor(HumanProxy, config=config)
+        >>>
+        >>> # `incoming` is the message the proxy received. Its sender is stamped
+        >>> # by send() on the way in, and process_human_input asserts it is set.
+        >>> incoming = AgentMessage(
+        ...     content="Proceed?", recipient=proxy_addr, sender=asker_addr
+        ... )
         >>>
         >>> # Human responds; the reply is addressed to incoming.sender
         >>> system.proxy_ask(proxy_addr, HumanProxy).process_human_input(

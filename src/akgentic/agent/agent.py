@@ -14,8 +14,9 @@ Architecture:
 - ReactAgent.run_sync(output_type=StructuredOutput) — the only type act() asks for
 - get_output_type() applied inside ReactAgent.run() — no leakage into BaseAgent
 - Implements TeamManagementToolObserver protocol (structural typing)
-- One message handler, receiveMsg_AgentMessage: every inbound message is an
-  AgentMessage, so there is no per-message-type handler set
+- One message handler of its own, receiveMsg_AgentMessage: all team traffic is
+  AgentMessage, so there is no per-message-type handler set here. Akgent still
+  contributes the lifecycle handler receiveMsg_StopRecursively
 - Delegation is a plain send per Request in the LLM's StructuredOutput. Each hop
   is an independent turn — no call stack, no automatic return path
 """
@@ -62,7 +63,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     Composition:
     - ReactAgent (akgentic-llm): model instantiation, HTTP retry, usage limits,
       context history, REACT loop. Reasoning turns go through run_sync();
-      compact() and clear() use ReactAgent's own synchronous bridges instead.
+      compact() and clear() bypass it — compact() is ReactAgent's own synchronous
+      bridge onto the agent loop, clear() a plain wrapper over the context.
     - ToolFactory (akgentic-tool): aggregates ToolCard[] into tools, system prompts,
       and commands via 3-channel architecture (TOOL_CALL, SYSTEM_PROMPT, COMMAND).
     - TeamTool: auto-injected if absent from config.tools; provides hire/fire
@@ -80,9 +82,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       internally and manages context, limits, and the REACT loop.
 
     Message Flow:
-    - receiveMsg_AgentMessage is the only handler. /-prefixed content is offered
-      to the CommandRegistry first; anything else is prefixed with the reply
-      protocol for its message type and handed to process_message().
+    - receiveMsg_AgentMessage is the only handler this class defines (Akgent
+      contributes receiveMsg_StopRecursively). /-prefixed content is offered to
+      the CommandRegistry first; everything else — including a /-prefixed token
+      the registry does not recognise — is prefixed with the reply protocol for
+      its message type and handed to process_message().
     - process_message() runs one act() turn and sends one AgentMessage per
       Request in the resulting StructuredOutput. A recipient starting with "@"
       resolves to an existing member; anything else is hired by role. A recipient
@@ -392,9 +396,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             sender: The ActorAddress of the sender of the message.
 
         Raises:
-            WarningError: When the turn exceeds a usage limit. The user-proxy member
-                is notified first; LLMUsageLimitError is the only exception caught
-                here, so anything else propagates out of the handler untouched.
+            WarningError: When the turn exceeds a usage limit. notify_human() runs
+                first — a no-op with a log line when the team has no user-proxy
+                member. LLMUsageLimitError is the only exception caught here, so
+                anything else propagates out of the handler untouched.
         """
 
         logger.info(
