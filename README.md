@@ -20,6 +20,7 @@ to each other via structured LLM output.
 - [Configuration](#configuration)
 - [Tool Channels](#tool-channels)
 - [Examples](#examples)
+- [Documentation](#documentation)
 - [Development](#development)
 - [License](#license)
 
@@ -57,8 +58,11 @@ HumanProxy ──send()──► BaseAgent (Manager)
                       ├─ "@Name" → resolve to existing actor
                       └─ "Role"  → hire_member(role) → create actor
                              │
-                    send AgentMessage with enriched content:
-                      "You received a request from @Manager:\n\n<message>"
+                    send AgentMessage(content=request.message,
+                                      type=request.message_type)
+                      └─ the RAW message — the sender does not enrich it.
+                         The receiving agent prepends its own reply
+                         protocol when it runs the loop above.
 ```
 
 ## Installation
@@ -87,9 +91,10 @@ orchestrator_addr = actor_system.createActor(
 )
 orchestrator_proxy = actor_system.proxy_ask(orchestrator_addr, Orchestrator)
 
-# Define and register a role blueprint
+# Define and register a role blueprint.
+# NOTE: there is no `role=` keyword on AgentCard — `card.role` is a read-only
+# property reading `config.role`, which is the single source of truth.
 manager_card = AgentCard(
-    role="Manager",
     description="Project manager who coordinates specialists",
     skills=["coordination", "delegation"],
     agent_class="akgentic.agent.BaseAgent",
@@ -144,16 +149,14 @@ me", an `instruction` means "go do this on my behalf".
 
 Intent flows through the system in two complementary ways:
 
-1. **When sending** — The LLM chooses an intent for each outbound `Request`. The
-   framework delivers it as an `AgentMessage` whose `type` field preserves that intent,
-   and whose `content` is enriched with the sender and intent
-   (e.g., `"You received a request from @Manager: ..."`).
+1. **When sending** — The LLM chooses an intent for each outbound `Request`. `process_message()`
+   delivers the **raw** `request.message` as an `AgentMessage` whose `type` field carries that
+   intent unchanged. The sender does not rewrite the content.
 
-2. **When receiving** — The receiving agent's LLM sees the intent both in the message
-   content (conversation history) and in its structured output schema (a per-call
-   docstring that includes the sender, the intent, and a reply protocol). This **double
-   reinforcement** ensures the LLM knows how to respond — even when the conversation
-   history contains multiple interleaved exchanges.
+2. **When receiving** — `receiveMsg_AgentMessage()` prepends a one-line reply protocol, keyed on
+   the incoming `type` via `REPLY_PROTOCOLS`, to the raw content before handing it to the LLM.
+   The guidance is therefore always the one matching the intent *that* agent received, and it
+   reaches the LLM through the **prompt** — not through the output schema.
 
 ### AgentMessage
 
@@ -251,11 +254,12 @@ role string works; when the team has none, the notice is logged and dropped.
 
 `HumanProxy` extends `UserProxy` from `akgentic-core`. It serves two roles:
 
-- **Telemetry sink** — `receiveMsg_AgentMessage()` pushes incoming messages into the
-  event system. The consumer is pluggable: console printer, WebSocket to a frontend,
-  WhatsApp, email, etc.
-- **Human input bridge** — `process_human_input()` routes a human's reply back to the
-  agent that asked.
+- **Message sink** — `receiveMsg_AgentMessage()` logs receipt. The base implementation
+  publishes nothing of its own; subscribers see the content through the `SentMessage` the
+  *sending* agent emits. Override the hook to queue for a console printer, a WebSocket to a
+  frontend, WhatsApp, email, etc.
+- **Human input bridge** — `process_human_input()` routes a human's reply back to
+  `message.sender` as an `AgentMessage` with `type="response"`.
 
 ```python
 # Send a message from the human to an agent
@@ -298,14 +302,18 @@ can be instantiated from it on demand without hard-coding actor addresses.
 
 ```python
 AgentCard(
-    role="Developer",
     description="Writes and reviews code",
     skills=["python", "testing"],
     agent_class="akgentic.agent.BaseAgent",   # FQCN string or class reference
-    config=AgentConfig(...),
+    config=AgentConfig(name="@Developer", role="Developer"),
     routes_to=["Reviewer", "Tester"],         # roles this agent can hire
 )
 ```
+
+**`role` is not a constructor keyword.** `AgentCard.role` is a read-only property that reads
+`config.role`, so that config field is the single source of truth. Passing `role=` to the
+constructor is silently ignored by Pydantic — the card would end up with whatever
+`config.role` says, or an empty role if you set neither.
 
 `register_agent_profiles([card, ...])` stores cards in the Orchestrator so any agent can
 hire a role by name without knowing the class.
@@ -315,11 +323,15 @@ hire a role by name without knowing the class.
 ### Dynamic Hiring
 
 When `process_message()` sees `recipient="Developer"` (no `@` prefix), it calls
-`hire_member("Developer")` which:
+`hire_member("Developer")`, which resolves the registry's typed `hire_member` command
+(`TeamTool`) and invokes it. That command:
 
 1. Looks up the `AgentCard` for `"Developer"` in the Orchestrator
 2. Calls `createActor(agent_class, config=card.get_config_copy())`
 3. Returns the new actor address for immediate message delivery
+
+If no `hire_member` command is registered — `TeamTool` was removed from `config.tools` — the
+method raises `RuntimeError` rather than failing silently.
 
 The LLM in the sending agent triggers this transparently by naming a role instead of a
 team member.
@@ -329,6 +341,11 @@ team member.
 Attach an `EventSubscriber` to the Orchestrator to observe all messages and events:
 
 ```python
+from akgentic.core import EventSubscriber
+from akgentic.core.messages import Message
+from akgentic.core.messages.orchestrator import EventMessage, SentMessage
+from akgentic.llm import ToolCallEvent
+
 class MessagePrinter(EventSubscriber):
     def on_message(self, message: Message) -> None:
         if isinstance(message, SentMessage):
@@ -349,7 +366,7 @@ Extends `BaseConfig` from `akgentic-core`:
 |---|---|---|---|
 | `prompt` | `PromptTemplate` | `PromptTemplate()` | Agent backstory rendered into `AgentState.backstory` and injected as LLM system prompt |
 | `model_cfg` | `ModelConfig` | `ModelConfig()` | LLM provider, model name, API settings |
-| `runtime_cfg` | `RuntimeConfig` | `RuntimeConfig()` | Retries, parallel tools, HTTP timeouts |
+| `runtime_cfg` | `RuntimeConfig` | `RuntimeConfig()` | Retries, tool-call end strategy, parallel tools, HTTP client settings |
 | `run_usage_limits` | `RunUsageLimits` | `RunUsageLimits()` | Budget for **one** `run()` — token and request caps that reset every run |
 | `agent_usage_limits` | `AgentUsageLimits` | `AgentUsageLimits()` | Budget for the agent's **whole lifetime** — runs and tokens, accumulated across every run |
 | `compaction_cfg` | `CompactionConfig` | `CompactionConfig()` | Context-compaction strategy and auto-trigger (opt-in; off unless `model_cfg.context_length` is set) |
@@ -418,11 +435,14 @@ AgentConfig(usage_limits=UsageLimits(request_limit=50, total_tokens_limit=100_00
 AgentConfig(run_usage_limits=RunUsageLimits(run_request_limit=50, total_tokens_limit=100_000))
 ```
 
-The old spelling still works for one release cycle: passing `usage_limits=` emits a
-`DeprecationWarning` and populates `run_usage_limits`, and reading `config.usage_limits`
-returns the run tier. Passing both `usage_limits=` and `run_usage_limits=` raises
-`ValueError` rather than silently picking one. **Both are removed in akgentic-agent 2.0.0.**
-`UsageLimits` itself is a deprecated alias of `RunUsageLimits`, removed in akgentic-llm 2.0.0.
+The old spelling still works: passing `usage_limits=` emits a `DeprecationWarning` and populates
+`run_usage_limits`, and reading `config.usage_limits` returns the run tier. Passing both
+`usage_limits=` and `run_usage_limits=` raises `ValueError` rather than silently picking one.
+**Both are removed in akgentic-agent 2.0.0.**
+
+`UsageLimits` — the pre-split class itself — is a separate, `akgentic-llm`-owned deprecated alias
+of `RunUsageLimits`. It still ships and still warns; **its removal is not scheduled for a named
+release.** Only the two `AgentConfig` shims above carry a fixed removal target.
 
 ### AgentState
 
@@ -440,40 +460,123 @@ Runtime state extending `BaseState`:
 |---|---|---|
 | `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `web_search()`, `workspace_read()` |
 | `SYSTEM_PROMPT` | LLM system prompt (per call) | team roster, role profiles, backstory, mailbox notifications |
-| `COMMAND` | Python caller | `cmd_hire_member()`, `cmd_fire_member()`, `cmd_get_planning()`, `cmd_get_team_roster()` |
+| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary` |
 
 `TeamTool` is always prepended to `config.tools` if not already present, ensuring every
 `BaseAgent` can hire and fire members.
 
-### Programmatic Commands
+### The Command Registry
 
-Access via `actor_system.proxy_ask(agent_addr, BaseAgent)`:
+`on_start()` builds **one** `CommandRegistry` from every `COMMAND`-channel capability of the
+agent's tool cards, adds `compact` and `clear` as command-only built-ins, and announces the whole
+set once as a `CommandsAnnouncedEvent`:
 
-| Command | Returns | Description |
+```python
+self._command_registry = tool_factory.get_command_registry(
+    extra_commands=[self.compact, self.clear]
+)
+self.notify_event(
+    CommandsAnnouncedEvent(
+        agent=self.myAddress,
+        commands=self._command_registry.descriptors(),
+    )
+)
+```
+
+Commands are keyed by the **callable's `__name__`**. The canonical names are therefore
+`hire_member`, `fire_member`, `team_members`, … — there is no `cmd_` prefix on any of them.
+
+Two surfaces reach the same table:
+
+| Surface | Call | Returns |
 |---|---|---|
-| `cmd_hire_member(role)` | `ActorAddress \| str` | Hire by role; returns error string on failure |
-| `cmd_fire_member(name)` | `str` | Fire by name; returns confirmation or error |
-| `cmd_get_planning()` | `str` | Full team planning text (requires `PlanningTool`) |
-| `cmd_get_team_roster()` | `str` | Current team member list |
-| `cmd_get_role_profiles()` | `str` | Available roles and descriptions |
-| `cmd_get_planning_task(id)` | `Task \| str` | Single planning task by ID |
-| `get_usage_summary(by_run)` | `AgentUsageSummary` | Aggregated LLM usage and cost; queries orchestrator for `LlmUsageEvent`s via `aggregate_usage()` from `akgentic.llm`. Pass `by_run=True` for per-run breakdown. Callable via Pykka proxy. |
+| **human / text** | `registry.dispatch("/hire_member Developer")` | `str` — the result, rendered |
+| **typed / in-agent** | `registry.callable("hire_member")("Developer")` | the command's **native** value (here an `ActorAddress`) |
+
+`registry.has(name)` tests availability before either call, and `registry.descriptors()` returns
+serializable discovery metadata — name, description, argument schema, and owning tool card.
+`BaseAgent` uses both surfaces itself: `hire_member()` resolves the typed callable, and `act()`
+expands media references the same way.
+
+```python
+if not self._command_registry.has("hire_member"):
+    raise RuntimeError("hire_member command not available — TeamTool not configured")
+
+hire = self._command_registry.callable("hire_member")
+return cast(ActorAddress, hire(role))
+```
+
+#### Slash commands: how a human drives an agent
+
+A message whose content starts with `/` is intercepted in `receiveMsg_AgentMessage()` **before**
+the LLM path and handed to `_dispatch_command()`. That method dispatches the text, replies to the
+sender with a `notification` `AgentMessage` carrying the result, and records one
+human-attributed operator action in the agent's LLM context — so the agent reasons about what the
+human did on its next turn, without mistaking it for its own tool call.
+
+```python
+human_addr.send(manager_addr, AgentMessage(content="/team_members"))
+human_addr.send(manager_addr, AgentMessage(content="/hire_member DevOpsEngineer"))
+human_addr.send(manager_addr, AgentMessage(content="/fire_member @DevOpsEngineer456"))
+```
+
+An unrecognised leading token raises `CommandNotRecognized`, which `_dispatch_command()` swallows
+so the message falls through to the normal LLM path with its original content — a sentence that
+happens to start with a slash is never lost, and nothing is injected into the context. Failures
+*after* a command has been identified (missing or malformed arguments, or the command body
+raising) are caught inside `dispatch()` and returned as a result string; those never fall back to
+the LLM.
+
+Arguments are `shlex`-split and coerced against the command's signature. A token is treated as a
+keyword only when the text before its first `=` names a real parameter, so
+`/hire_member Developer name=@Ada` binds both, while a positional value containing `=` is left
+intact.
+
+#### Which commands exist
+
+The registry contents follow from the tool cards attached to the agent:
+
+| Command | Provided by | Description |
+|---|---|---|
+| `hire_member(role, name=None)` | `TeamTool` | Hire by role; native return is the new `ActorAddress` |
+| `fire_member(name)` | `TeamTool` | Fire a member by name |
+| `team_members()` | `TeamTool` | Current team roster |
+| `team_roles()` | `TeamTool` | Available roles and descriptions |
+| `planning_summary()` | `PlanningTool` | Full team planning text |
+| `get_planning_task(task_id)` | `PlanningTool` | Single planning task by ID |
+| `search_planning(...)` | `PlanningTool` | Search the shared task board |
+| `compact()` / `clear()` | `BaseAgent` built-ins | Compact or clear the conversation context |
+
+Do not hand-transcribe this table into your own code: read the set from
+`registry.descriptors()`, or from the `CommandsAnnouncedEvent` the agent emits at start-up. Those
+cannot drift from the registry; a copied list can.
+
+### Methods on the Pykka proxy
+
+Separately from the command channel, `BaseAgent`'s own public methods are reachable through
+`actor_system.proxy_ask(agent_addr, BaseAgent)`:
+
+| Method | Returns | Description |
+|---|---|---|
+| `get_usage_summary(by_run)` | `AgentUsageSummary` | Aggregated LLM usage and cost; queries the orchestrator for `LlmUsageEvent`s and folds them via `aggregate_usage()` from `akgentic.llm`. Pass `by_run=True` for a per-run breakdown. |
 
 ### Media Expansion
 
-When `WorkspaceTool` is in `config.tools`, `act()` expands inline file references before
-the LLM call:
+When the registry carries an `_expand_media_refs` command — `WorkspaceTool` is what provides it —
+`act()` expands inline file references before the LLM call:
 
 ```
 !!file.png               → BinaryContent injected into the prompt
-!!"my screenshot.png"   → same, for paths with spaces
-!!*.png                  → glob — all matching files
-!!nonexistent.png        → "!!_nonexistent.png_[Error: no image found]" forwarded to LLM
+!!"my screenshot.png"    → same, for paths with spaces
+!!*.png                  → glob — every matching image, sorted by path
+!!report.pdf             → "!!report.pdf[=> Use workspace_read tool]" forwarded to the LLM
+!!nonexistent.png        → "!!nonexistent.png[Error: no image found in the workspace]"
 ```
 
-Expansion happens in `act()` before `run_sync()`. Errors and document hints
-(`[=> Use workspace_read tool]`) are forwarded to the LLM rather than silently dropped.
-Agents without `WorkspaceTool` are unaffected — the expansion block is a no-op.
+Expansion happens in `act()` before `run_sync()`, and only when the expansion actually changed
+something: if the command returns the prompt unchanged, the plain string is sent as-is. Errors and
+document hints are forwarded to the LLM rather than silently dropped. Agents whose registry has no
+`_expand_media_refs` are unaffected — the block is a no-op.
 
 ## Examples
 
@@ -502,41 +605,64 @@ See the [Examples README](https://github.com/b12consulting/akgentic-agent/blob/m
 
 ### Setup
 
+Standalone, from this repository's root — `akgentic-core`, `akgentic-llm` and `akgentic-tool`
+resolve from PyPI under the floors in `pyproject.toml`. This is what CI does:
+
+```bash
+uv venv
+uv pip install -e ".[dev]"
+```
+
+Inside the `akgentic-quick-start` workspace, install every package from source instead:
+
 ```bash
 uv sync --all-packages --all-extras
 ```
 
 ### Commands
 
+From this repository's root:
+
 ```bash
 # Run tests
-uv run pytest packages/akgentic-agent/tests/
+uv run pytest tests/
 
 # Run tests with coverage
-uv run pytest packages/akgentic-agent/tests/ --cov=akgentic.agent --cov-fail-under=80
+uv run pytest tests/ --cov=akgentic.agent --cov-fail-under=80
 
 # Lint
-uv run ruff check packages/akgentic-agent/src/
+uv run ruff check src/
 
 # Format
-uv run ruff format packages/akgentic-agent/src/
+uv run ruff format src/
 
 # Type check
-uv run mypy packages/akgentic-agent/src/
+uv run mypy src/
 ```
+
+From the workspace root, prefix the paths with `packages/akgentic-agent/`.
+
+`addopts = "-m 'not integration'"` deselects the integration tests by default: they make real LLM
+calls (gated by `OPENAI_API_KEY`) and poll for actor quiescence. Run them explicitly with
+`uv run pytest tests/ -m integration`.
 
 ### CI Pipeline
 
-The package uses GitHub Actions for continuous integration. On every push and pull
-request, the pipeline:
+The package uses GitHub Actions for continuous integration. On every push, on pull requests
+against `master`, and on manual dispatch, the pipeline:
 
-1. Checks out the full `akgentic-quick-start` workspace (with all submodules)
-2. Overrides the `akgentic-agent` submodule with the current branch
-3. Installs all dependencies via `uv sync --all-packages --all-extras`
-4. Runs **mypy** (strict type checking)
-5. Runs **ruff** (linting)
-6. Runs **pytest** with coverage (minimum 80%, branch coverage enabled)
-7. Updates the coverage badge gist on `master` pushes
+1. Checks out **this repository only** — no workspace, no submodules
+2. Installs uv and Python 3.12, and creates a virtualenv
+3. Installs the package and its dev extra with `uv pip install -e ".[dev]"`, so the sibling
+   akgentic packages come from PyPI at their declared floors
+4. Runs **mypy** on `src/` (strict type checking)
+5. Runs **ruff check** on `src/`
+6. Runs **pytest** on `tests/` with coverage over `akgentic.agent` (`--cov-fail-under=80`)
+7. Updates the coverage badge gist — only on `master` pushes
+
+Because step 3 resolves the siblings from PyPI, a change that depends on an unreleased
+`akgentic-core`/`llm`/`tool` commit will be red here until that package ships, even when the
+workspace is green locally. That is a merge-order signal, not a defect in this package.
 
 > **Note:** No pre-commit hooks are configured in this package. Quality checks run
 > exclusively in CI.
