@@ -273,7 +273,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # forwarded by identity (callers rely on that), so neither a copy nor a cast
         # through llm's non-public Protocol is appropriate here. Retire this line by
         # widening restore_context to accept a Sequence, which is covariant.
-        self._react_agent.restore_context(context)  # type: ignore[arg-type]
+        self._react_agent.restore_context(context)
 
     # ============================================================================
     # USAGE TRACKING
