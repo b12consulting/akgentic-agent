@@ -1183,7 +1183,7 @@ make real LLM calls. Run them with `uv run pytest tests/ -m integration`.
 - [akgentic-llm](https://github.com/b12consulting/akgentic-llm) — `ReactAgent`, `ContextManager`, usage limits, compaction
 - [akgentic-tool](https://github.com/b12consulting/akgentic-tool) — `ToolCard`, `ToolFactory`, `CommandRegistry`, `TeamTool`, `PlanningTool`
 - [akgentic-team](https://github.com/b12consulting/akgentic-team) — team lifecycle and event-sourced persistence
-- [akgentic-quick-start](https://github.com/b12consulting/akgentic-quick-start) — the workspace that aggregates every package
+- [akgentic-framework](https://github.com/b12consulting/akgentic-framework) — the open-source bundle that aggregates every package (PyPI: `akgentic-framework`)
 
 ---
 

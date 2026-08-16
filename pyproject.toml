@@ -44,11 +44,11 @@ build-backend = "hatchling.build"
 packages = ["src/akgentic"]
 
 # Note: akgentic-* dependencies have NO [tool.uv.sources] entry here.
-# - Inside the akgentic-quick-start workspace, the workspace root's
+# - Inside the akgentic-framework bundle workspace, the workspace root's
 #   [tool.uv.sources] resolves them as editable workspace members.
 # - In standalone CI, they resolve from PyPI under the floors declared above.
 
-# Previously inherited from the akgentic-quick-start workspace root; the
+# Previously inherited from the akgentic-framework bundle workspace root; the
 # standalone-package CI no longer checks out the workspace.
 # - asyncio_mode='auto' so async tests run (default is 'strict').
 # - integration tests make real LLM calls (gated by OPENAI_API_KEY) and

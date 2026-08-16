@@ -4,8 +4,8 @@
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gpiroux/69ad301e9b6491972aa7324eb8953f8a/raw/coverage.json)](https://github.com/b12consulting/akgentic-agent/actions/workflows/ci.yml)
 
 LLM-driven collaborative agents for the
-[Akgentic](https://github.com/b12consulting/akgentic-quick-start) multi-agent framework.
-`BaseAgent` composes the actor runtime, LLM integration, and tool infrastructure into a
+[Akgentic](https://github.com/b12consulting/akgentic-framework) multi-agent framework
+(open-source bundle). `BaseAgent` composes the actor runtime, LLM integration, and tool infrastructure into a
 single unit where agents communicate through a typed message protocol and route messages
 to each other via structured LLM output.
 
@@ -67,14 +67,44 @@ HumanProxy ──send()──► BaseAgent (Manager)
 
 ## Installation
 
-```bash
-git clone git@github.com:b12consulting/akgentic-quick-start.git
-cd akgentic-quick-start
-git submodule update --init --recursive
+Published on PyPI. Python 3.12 or newer.
 
-uv venv && source .venv/bin/activate
-uv sync --all-packages --all-extras
+```bash
+uv add akgentic-agent
+# or
+pip install akgentic-agent
 ```
+
+That is the whole install. `akgentic-core`, `akgentic-llm`, `akgentic-tool` and
+`pydantic-ai` come with it as ordinary dependencies — no workspace checkout, no
+submodules.
+
+### As part of the framework bundle
+
+`akgentic-framework` is the meta-distribution that pins every akgentic package
+at versions built and tested together. Install `akgentic-agent` through it when
+you want the release-wide pin rather than a single package:
+
+```bash
+pip install "akgentic-framework[agent]"   # this package + its closure, release-pinned
+pip install "akgentic-framework[all]"     # the whole framework
+```
+
+### Working on the package itself
+
+To develop `akgentic-agent` rather than use it, clone the open-source bundle
+[akgentic-framework](https://github.com/b12consulting/akgentic-framework), which
+carries every package together as submodules:
+
+```bash
+git clone git@github.com:b12consulting/akgentic-framework.git
+cd akgentic-framework
+git submodule update --init
+# uncomment the two "SOURCE MODE" blocks in pyproject.toml
+uv sync
+```
+
+Source mode resolves `akgentic-*` to the local checkouts, editable.
 
 ## Quick Start
 
@@ -605,7 +635,7 @@ See the [Examples README](https://github.com/b12consulting/akgentic-agent/blob/m
 
 ### Setup
 
-Standalone, from this repository's root — `akgentic-core`, `akgentic-llm` and `akgentic-tool`
+From this repository's root — `akgentic-core`, `akgentic-llm` and `akgentic-tool`
 resolve from PyPI under the floors in `pyproject.toml`. This is what CI does:
 
 ```bash
@@ -613,11 +643,10 @@ uv venv
 uv pip install -e ".[dev]"
 ```
 
-Inside the `akgentic-quick-start` workspace, install every package from source instead:
-
-```bash
-uv sync --all-packages --all-extras
-```
+To exercise this package against unreleased sibling code, work from the
+[akgentic-framework](https://github.com/b12consulting/akgentic-framework) bundle
+in source mode instead — see
+[Working on the package itself](#working-on-the-package-itself).
 
 ### Commands
 
@@ -631,16 +660,14 @@ uv run pytest tests/
 uv run pytest tests/ --cov=akgentic.agent --cov-fail-under=80
 
 # Lint
-uv run ruff check src/
+uv run ruff check src/ tests/
 
 # Format
-uv run ruff format src/
+uv run ruff format src/ tests/
 
 # Type check
 uv run mypy src/
 ```
-
-From the workspace root, prefix the paths with `packages/akgentic-agent/`.
 
 `addopts = "-m 'not integration'"` deselects the integration tests by default: they make real LLM
 calls (gated by `OPENAI_API_KEY`) and poll for actor quiescence. Run them explicitly with
