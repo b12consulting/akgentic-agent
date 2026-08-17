@@ -21,7 +21,7 @@ Architecture:
   is an independent turn — no call stack, no automatic return path
 """
 
-import logging
+import logging  # noqa: I001
 import os
 import random
 from datetime import datetime, timezone
@@ -47,7 +47,7 @@ from akgentic.llm import (
 from akgentic.llm import UsageLimitError as LLMUsageLimitError
 from akgentic.tool.core import CommandRegistry, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
-from akgentic.tool.event import CommandsAnnouncedEvent
+from akgentic.tool.core.event import CommandsAnnouncedEvent
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace.readers import MediaContent
 
