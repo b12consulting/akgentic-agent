@@ -5,6 +5,13 @@ have lifetime budget: the agent is asked to conclude without tools and the
 requester gets an answer. An agent-tier breach is terminal: a human is paged.
 The base class stays a backstop.
 
+The policy itself now lives in the ``guard_usage_limits`` decorator rather than
+inside the handler, so every test here drives the **decorated handler** and makes
+the turn breach by raising out of ``act()`` — the one call the handler makes that
+can reach the LLM. The guard is covered directly, on its own, in
+``test_usage_limit_guard.py``; this file stays the BaseAgent-shaped view of the
+same policy.
+
 Every test here asserts the **outcome** — what the requester received, whether a
 human was notified, whether WarningError escaped — not merely that a mock was
 called. The tiers are told apart by exception class; no test reads message text
@@ -97,6 +104,9 @@ def _breaching_agent(error: Exception) -> tuple[BaseAgent, MagicMock]:
     conclusion" would hold even for an answer addressed to a third agent — the
     exact failure this suite exists to catch. ``hire_member`` is stubbed to fail
     loudly, because a conclusion should never hire anyone.
+
+    The breach is raised out of ``act()`` — the handler's own LLM call — so the
+    decorated handler is driven end to end rather than through a seam.
     """
     agent = _make_agent()
     requester = _make_address(REQUESTER)
@@ -106,7 +116,7 @@ def _breaching_agent(error: Exception) -> tuple[BaseAgent, MagicMock]:
     agent.hire_member = MagicMock(  # type: ignore[method-assign]
         side_effect=AssertionError("a tool-free conclusion must not hire anyone")
     )
-    agent.process_message = MagicMock(side_effect=error)  # type: ignore[method-assign]
+    agent.act = MagicMock(side_effect=error)  # type: ignore[method-assign]
     return agent, requester
 
 
@@ -154,22 +164,24 @@ class TestRunTierConcludes:
         agent._react_agent.conclude_without_tools_sync.assert_called_once()  # type: ignore[attr-defined]
 
     @patch("akgentic.agent.agent.sleep")
-    def test_records_exactly_one_early_conclusion_in_its_own_context(
+    def test_a_successful_conclusion_writes_nothing_to_its_own_context(
         self, mock_sleep: MagicMock
     ) -> None:
-        """AC3: the next turn is not blind to the turn having been cut short."""
+        """The early-conclusion operator-action record is gone, on purpose.
+
+        Story 18.1 appended a synthetic entry saying the turn had concluded early.
+        The reason handed to the conclusion already carries that fact, and the
+        conclusion's own exchange lands in the context like any other turn, so the
+        entry restated what the history already said. ``_record_operator_action``
+        is now reached only from ``_dispatch_command`` — a human's slash command,
+        which is a genuinely out-of-band event.
+        """
         agent, _ = _breaching_agent(RunUsageLimitError("run request limit"))
         agent._react_agent.conclude_without_tools_sync.return_value = _conclusion()  # type: ignore[attr-defined]
 
         agent.receiveMsg_AgentMessage(_make_message(), _make_address(REQUESTER))
 
-        record = agent._react_agent.context.record_operator_action  # type: ignore[attr-defined]
-        record.assert_called_once()
-        entry = record.call_args[0][0]
-        assert "concluded early" in entry
-        # The slash-command entry is human-attributed by design; this one must not
-        # borrow that wording — no human did this, and the agent reads it next turn.
-        assert "The human ran" not in entry
+        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
 
     @patch("akgentic.agent.agent.sleep")
     def test_the_reason_prompt_names_the_requester(self, mock_sleep: MagicMock) -> None:

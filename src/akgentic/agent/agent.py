@@ -12,12 +12,16 @@ Architecture:
     (built once in on_start; dispatched by name from /-prefixed messages)
 - TeamTool auto-injected if not already in config.tools
 - ReactAgent.run_sync(output_type=...) — act() forwards the caller's type;
-  process_message() asks for StructuredOutput, so the team path stays schema-driven
+  receiveMsg_AgentMessage asks for StructuredOutput, so the team path stays
+  schema-driven
 - get_output_type() applied inside ReactAgent.run() — no leakage into BaseAgent
 - Implements TeamManagementToolObserver protocol (structural typing)
 - One message handler of its own, receiveMsg_AgentMessage: all team traffic is
   AgentMessage, so there is no per-message-type handler set here. Akgent still
   contributes the lifecycle handler receiveMsg_StopRecursively
+- The usage-limit tier policy is applied, not written here: the handler carries
+  @guard_usage_limits(output_type=..., route=...) from usage_limits.py. See
+  custom_agent.py for a second agent class doing the same with its own schema
 - Delegation is a plain send per Request in the LLM's StructuredOutput. Each hop
   is an independent turn — no call stack, no automatic return path
 """
@@ -27,27 +31,25 @@ import os
 import random
 from datetime import datetime, timezone
 from time import sleep
-from typing import Any, NoReturn, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput
+from akgentic.agent.usage_limits import guard_usage_limits
+from akgentic.agent.utils import resolve_recipient
 from akgentic.core import ActorAddress, Akgent, Orchestrator
-from akgentic.core.agent import WarningError
 from akgentic.core.messages import EventMessage
 from akgentic.llm import (
-    AgentUsageLimitError,
     AgentUsageSummary,
     LlmUsageEvent,
     ReactAgent,
     ReactAgentConfig,
-    RunUsageLimitError,
     UserPrompt,
     aggregate_usage,
 )
-from akgentic.llm import UsageLimitError as LLMUsageLimitError
 from akgentic.tool.core import CommandRegistry, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
@@ -82,25 +84,24 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     - ReactAgent.run_sync(output_type=<the caller's type>). act() forwards its
       own output_type argument unchanged; ReactAgent.run() wraps it with
       get_output_type() internally and manages context, limits, and the REACT
-      loop. process_message() passes StructuredOutput, which is why the team
-      delegation path is schema-driven.
+      loop. receiveMsg_AgentMessage passes StructuredOutput, which is why the
+      team delegation path is schema-driven.
 
     Message Flow:
     - receiveMsg_AgentMessage is the only handler this class defines (Akgent
       contributes receiveMsg_StopRecursively). /-prefixed content is offered to
       the CommandRegistry first; everything else — including a /-prefixed token
       the registry does not recognise — is prefixed with the reply protocol for
-      its message type and handed to process_message().
-    - process_message() runs one act() turn and hands the resulting
-      StructuredOutput to _route_output(), which sends one AgentMessage per
-      Request. A recipient starting with "@" resolves to an existing member;
-      anything else is hired by role. A recipient that resolves to None is
-      skipped.
-    - A usage breach is branched on by tier (never on message text): a run-tier
-      breach gets one tool-free conclusion, routed through that same
-      _route_output() and recorded as an early conclusion in the agent's own
-      context; an agent-tier breach, or a conclusion that delivers nothing,
-      notifies the human and raises WarningError.
+      its message type and run as one act() turn.
+    - That turn's StructuredOutput goes to _route_output(), which sends one
+      AgentMessage per Request. A recipient starting with "@" resolves to an
+      existing member; anything else is hired by role. A recipient that resolves
+      to None is skipped.
+    - A usage breach is branched on by tier (never on message text), by the
+      @guard_usage_limits decorator rather than by this class: a run-tier breach
+      gets one tool-free conclusion, delivered through that same _route_output();
+      an agent-tier breach, or a conclusion that delivers nothing, notifies the
+      human and raises WarningError.
 
     Structured Output:
     - One type: StructuredOutput (output_models.py), a list of Request, each
@@ -130,7 +131,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     - on_start emits exactly one CommandsAnnouncedEvent so services can discover the
       command set without per-command coupling.
 
-    Internal method (used by process_message()):
+    Internal method (used by _route_output()):
     - hire_member(role) → ActorAddress. A failed hire raises ModelRetry; see
       hire_member() for where that retry is, and is not, honoured.
     """
@@ -335,26 +336,27 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         - Runs the full REACT loop (tools, retries, system prompts)
 
         Recipient validity is NOT constrained in the schema — it is enforced at
-        routing time in process_message(). Reply-protocol guidance is carried in
+        routing time in _route_output(). Reply-protocol guidance is carried in
         the prompt (see receiveMsg_AgentMessage), not the output-schema docstring.
 
         Args:
             user_content: User message to process.
             output_type: The type the REACT loop reasons against. Forwarded to
                 ReactAgent.run_sync(), which wraps it with get_output_type().
-                process_message() passes StructuredOutput.
+                receiveMsg_AgentMessage passes StructuredOutput.
 
         Returns:
             An instance of output_type, as produced by the REACT loop.
 
         Raises:
             RunUsageLimitError: The turn exhausted its own budget. Recoverable —
-                receiveMsg_AgentMessage answers it with a tool-free conclusion.
+                the @guard_usage_limits decorator on the calling handler answers
+                it with a tool-free conclusion.
             AgentUsageLimitError: The agent's lifetime budget is spent. Terminal.
             LLMUsageLimitError: Base of both, if akgentic-llm raises it directly.
                 All three are propagated unchanged from ReactAgent.run_sync():
                 this method neither notifies anyone nor wraps them, and it does
-                not tell the tiers apart — receiveMsg_AgentMessage does all of it.
+                not tell the tiers apart — the decorator does all of it.
         """
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
         prompt: UserPrompt = user_content
@@ -373,13 +375,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         return cast(T, output)
 
-    def process_message(self, message_content: str, sender: ActorAddress) -> None:
 
-        output = self.act(message_content, StructuredOutput)
-
-        self._route_output(output)
-
-    def _route_output(self, output: StructuredOutput) -> None:
+    def _route_output(self, output: StructuredOutput) -> bool:
         """Send one AgentMessage per Request — the class's single routed send path.
 
         A recipient starting with ``@`` resolves to an existing member via
@@ -387,22 +384,25 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         resolves to ``None`` is skipped, so the model naming someone who does not
         exist costs a delivery, not an exception.
 
-        Extracted so the normal turn (``process_message``) and the tool-free
-        conclusion of an interrupted turn (``_try_conclude_without_tools``) deliver
-        through exactly the same code. The name matches ADR-008 §1 so the
-        dev-overridable usage-limit capability merges with this extraction rather
-        than renaming it.
+        Extracted so the normal turn and the tool-free conclusion of an interrupted
+        turn deliver through exactly the same code: ``receiveMsg_AgentMessage``
+        calls it directly, and hands it to ``@guard_usage_limits`` as the ``route``
+        argument so a breached turn is delivered the same way. The name matches
+        ADR-008 §1 so the dev-overridable usage-limit capability merges with this
+        extraction rather than renaming it.
 
         Args:
             output: The StructuredOutput whose Requests are to be delivered.
-        """
-        for request in output.messages:
-            recipient = request.recipient
 
-            if recipient.startswith("@"):
-                member = self.get_team_member(recipient)
-            else:
-                member = self.hire_member(recipient)
+        Returns:
+            Whether anything was actually delivered. The usage-limit guard asks
+            this to tell a real conclusion from one that routed nothing — it
+            cannot inspect the output itself, since the schema is the caller's.
+        """
+        delivered = False
+
+        for request in output.messages:
+            member = resolve_recipient(self, request.recipient)
 
             if member is not None:
                 self.send(
@@ -413,35 +413,38 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                         recipient=member,
                     ),
                 )
+                delivered = True
 
+        return delivered
+
+    @guard_usage_limits(output_type=StructuredOutput, route=_route_output)
     def receiveMsg_AgentMessage(self, message: AgentMessage, sender: ActorAddress) -> None:  # noqa: N802
         """Handle an incoming AgentMessage — the agent's only message handler.
 
         Content starting with ``/`` is offered to the command registry first; if a
         command handles it, the method returns without involving the LLM. Otherwise
         the raw content is prefixed with the reply protocol for ``message.type``
-        (see REPLY_PROTOCOLS) and handed to process_message() for one LLM turn.
+        (see REPLY_PROTOCOLS) and run as one act() turn, whose StructuredOutput
+        goes to _route_output().
 
-        A usage breach is handled by tier, told apart by exception class and never
-        by message text (ADR-016 §D1). A run-tier breach — the turn ran out of its
-        own budget while the agent may still have lifetime budget — first attempts
-        one tool-free conclusion so the requester gets what was already gathered;
-        only if that attempt delivers nothing does it escalate. An agent-tier
-        breach is terminal and escalates immediately, with no attempt. The base
-        class stays as a backstop clause, declared LAST: both tiers subclass it, so
-        a base-class clause placed first would catch them both and the branch would
-        never run.
+        This body carries no ``try``/``except`` of its own. The usage-limit tier
+        policy is the decorator's (see ``usage_limits.guard_usage_limits``), which
+        is handed this handler's schema and routing so an interrupted turn is
+        concluded and delivered exactly as a normal one would be. Written once
+        there rather than copied here, because the ``except`` ordering it depends on
+        is load-bearing and a wrong copy fails silently.
 
         Args:
             message: The AgentMessage instance containing the message content and recipient.
             sender: The ActorAddress of the sender of the message.
 
         Raises:
-            WarningError: When the turn exceeds a usage limit and no conclusion was
-                delivered. notify_human() runs first — a no-op with a log line when
-                the team has no user-proxy member. A run-tier breach that concluded
-                successfully raises nothing. Usage-limit errors are the only ones
-                caught here, so anything else propagates out of the handler untouched.
+            WarningError: Raised by the decorator when the turn exceeds a usage
+                limit and no conclusion was delivered. notify_human() runs first —
+                a no-op with a log line when the team has no user-proxy member. A
+                run-tier breach that concluded successfully raises nothing.
+                Usage-limit errors are the only ones the decorator catches, so
+                anything else propagates out of the handler untouched.
         """
 
         logger.info(
@@ -449,153 +452,27 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             f"from {sender} ({len(message.content)} chars)"
         )
 
-        # Computed before the try so the usage-limit handlers can name the requester.
-        # A message may legitimately carry no sender (Message.sender is optional), in
-        # which case there is no requester to answer — kept as None rather than the
-        # "unknown" placeholder, which is prose here but would become a routing target
-        # in the tool-free conclusion.
-        requester = message.sender.name if message.sender else None
-        sender_name = requester or "unknown"
+        # "unknown" is prose for the prompt. The guard keeps its own requester as
+        # None, because a placeholder there would become a routing target in the
+        # tool-free conclusion — it would answer a member called "unknown".
+        sender_name = message.sender.name if message.sender else "unknown"
 
-        try:
-            sleep(random.uniform(0.25, 0.5))  # Simulate processing delay
+        sleep(random.uniform(0.25, 0.5))  # Simulate processing delay
 
-            # Slash-command interception runs on the RAW content (before the
-            # typed-protocol prefix) so dispatch sees the leading "/<command>".
-            if message.content.startswith("/") and self._dispatch_command(message, sender):
-                return
+        # Slash-command interception runs on the RAW content (before the
+        # typed-protocol prefix) so dispatch sees the leading "/<command>".
+        if message.content.startswith("/") and self._dispatch_command(message, sender):
+            return
 
-            article = "an" if message.type[0] in "aeiou" else "a"
-            prefixed_content = (
-                f"You received {article} {message.type} from {sender_name}. "
-                f"{REPLY_PROTOCOLS.get(message.type, '').format(sender=sender_name)}"
-                f"\n\n{message.content}"
-            )
-            self.process_message(prefixed_content, sender)
-
-        # ── Usage-limit tiers, most specific FIRST (ADR-016 §D1/§D4) ───────────
-        # Both subclasses are listed before LLMUsageLimitError: they inherit from
-        # it, so a base clause placed first would swallow both tiers silently.
-        except RunUsageLimitError as e:
-            # Recoverable: the turn is out of budget, the agent may not be. One
-            # tool-free conclusion; if it delivers nothing, fall through to the
-            # escalation below — reporting THIS error, not any secondary one.
-            if not self._try_conclude_without_tools(e, requester):
-                self._escalate_usage_limit(e)
-
-        except AgentUsageLimitError as e:
-            # Terminal: the lifetime budget that would pay for a conclusion is
-            # exactly the one that is spent. No attempt.
-            self._escalate_usage_limit(e)
-
-        except LLMUsageLimitError as e:
-            # Backstop, LAST: an akgentic-llm that raises the base class directly
-            # must still be handled.
-            self._escalate_usage_limit(e)
-
-    def _escalate_usage_limit(self, error: LLMUsageLimitError) -> NoReturn:
-        """Notify the team's human about a usage breach and end the turn.
-
-        The unchanged escalation this handler has always performed, extracted so
-        all three ``except`` clauses share one body and the text is provably
-        identical across tiers.
-
-        Args:
-            error: The usage-limit error to report. On a run-tier breach whose
-                conclusion failed this is the **original** breach, not whatever
-                the failed conclusion raised.
-
-        Raises:
-            WarningError: Always.
-        """
-        self.notify_human(
-            f"The agent {self.config.name} has exceeded its usage limits ({error}). \n"
-            + "Please review the agent's activity and give your instruction."
+        article = "an" if message.type[0] in "aeiou" else "a"
+        prefixed_content = (
+            f"You received {article} {message.type} from {sender_name}. "
+            f"{REPLY_PROTOCOLS.get(message.type, '').format(sender=sender_name)}"
+            f"\n\n{message.content}"
         )
-        raise WarningError(f"LLM usage limit exceeded: {error}")
-
-    def _try_conclude_without_tools(
-        self, error: RunUsageLimitError, requester: str | None
-    ) -> bool:
-        """Turn a run-tier breach into one delivered answer, or report failure.
-
-        Runs exactly one tool-free conclusion through the ReactAgent sync bridge —
-        on the actor's own thread, like every other LLM call in this class — asking
-        for a StructuredOutput and delivering it through ``_route_output``, the same
-        routing the normal turn uses. There is deliberately **no retry and no
-        counter**: ``akgentic-llm``'s agent-tier pre-flight consumes lifetime budget
-        before each call, so repeated run-tier breaches walk the agent into its
-        terminal tier by construction (ADR-016 §D4).
-
-        The reason names the requester because the returned StructuredOutput is
-        LLM-authored: the model chooses each recipient, so an answer that does not
-        name them can be routed perfectly and still leave the requester with nothing.
-
-        A conclusion that produces no Request is a **failure**, not a quiet success:
-        the requester received nothing, exactly as if the call had raised. It is
-        reported as such before anything is routed or recorded.
-
-        A turn with no identifiable requester is not attempted at all. The reason has
-        nobody to name, and a placeholder such as "unknown" would not stay prose: the
-        model would echo it as the Request's recipient, and ``_route_output`` treats
-        any recipient without a leading ``@`` as a role to **hire** — so the teardown
-        of a breached turn would spin up a member called "unknown", or raise
-        ``ModelRetry`` out of the actor's message handler. Escalation is the honest
-        outcome when there is no one to answer.
-
-        Args:
-            error: The run-tier breach that interrupted the turn.
-            requester: Name of the requester whose message was being answered, or
-                ``None`` when the incoming message carried no sender.
-
-        Returns:
-            ``True`` when at least one Request was routed and the early conclusion
-            was recorded in the agent's context; ``False`` when there was no
-            requester to answer, or the attempt raised or produced nothing — in
-            which case nothing was sent and nothing was recorded, and the caller
-            escalates.
-        """
-        if requester is None:
-            logger.warning(
-                "[%s] run-tier usage breach on a message with no sender; "
-                "there is no requester to conclude to, escalating instead",
-                self.config.name,
-            )
-            return False
-
-        reason = (
-            f"This turn has run out of its tool-call budget ({error}), so you cannot "
-            "call any further tool and this is your last chance to answer.\n"
-            f"Answer {requester} now with what you have already gathered. State your "
-            "conclusion plainly, say explicitly which parts you could not check or "
-            "finish, and do not promise follow-up work — the turn ends with this answer.\n"
-            f"Address the answer to {requester}."
-        )
-        try:
-            output = self._react_agent.conclude_without_tools_sync(
-                reason, deps=self, output_type=StructuredOutput
-            )
-        except Exception:
-            logger.exception(
-                "[%s] tool-free conclusion failed after a run-tier usage breach",
-                self.config.name,
-            )
-            return False
-
-        if not output.messages:
-            logger.warning(
-                "[%s] tool-free conclusion produced no message; escalating instead",
-                self.config.name,
-            )
-            return False
+        output = self.act(prefixed_content, StructuredOutput)
 
         self._route_output(output)
-        self._record_operator_action(
-            f"[System action] This turn hit its per-run usage limit ({error}) and was "
-            f"concluded early, without further tool calls. What you sent {requester} "
-            "is all that was delivered; anything you had not finished is still unfinished."
-        )
-        return True
 
     def _dispatch_command(self, message: AgentMessage, sender: ActorAddress) -> bool:
         """Dispatch a ``/``-prefixed message through the command registry.
@@ -612,11 +489,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         handled here exactly like a success and never fall back to the LLM.
 
         On any dispatched (non-``CommandNotRecognized``) outcome, exactly one
-        synthetic, human-attributed operator-action entry is appended to the
-        ReactAgent context via :meth:`_inject_operator_action`, so the agent
-        reasons about the human's action (and its result) on its next turn
-        without mistaking it for its own tool call. The fallback branch performs
-        no injection — the command never ran.
+        synthetic, human-attributed operator-action entry is composed here and
+        appended to the ReactAgent context via :meth:`_record_operator_action`, so
+        the agent reasons about the human's action (and its result) on its next
+        turn without mistaking it for its own tool call. The fallback branch
+        records nothing — the command never ran.
 
         Args:
             message: The incoming AgentMessage whose raw content starts with ``/``.
@@ -635,38 +512,21 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             sender,
             AgentMessage(content=result, type="notification", recipient=sender),
         )
-        self._inject_operator_action(message.content, result)
-        return True
 
-    def _inject_operator_action(self, command_text: str, result: str) -> None:
-        """Record one human-attributed operator-action entry for the agent.
-
-        Builds a user-role entry framing the slash command as the human
-        operator's action (never the agent's own tool call) and hands it to the
-        LLM ``ContextManager``. The context owns the buffer-vs-append decision:
-        before the agent's first model run it buffers the entry (folded into the
-        next run's prompt by ``ReactAgent.run``); afterwards it appends the entry
-        directly. The agent stays ignorant of pydantic-ai's first-run injection
-        rule — that coupling lives entirely in ``akgentic-llm`` (ADR-007 §3).
-
-        Args:
-            command_text: The original ``/``-prefixed text the human sent.
-            result: The string ``dispatch`` returned for that command.
-        """
         self._record_operator_action(
-            f'[Operator action] The human ran "{command_text}". \nResult:\n{result}'
+            f'[Operator action] The human ran "{message.content}". \nResult:\n{result}'
         )
+        return True
 
     def _record_operator_action(self, entry: str) -> None:
         """Hand one out-of-band, user-role entry to the LLM ContextManager.
 
         The single point where this class writes something the agent did not say
-        itself into its own history — a human's slash command
-        (:meth:`_inject_operator_action`) or a turn cut short and concluded early
-        (:meth:`_try_conclude_without_tools`). The wording of the entry belongs to
-        the caller, because the two events are not the same event and must not be
-        framed as one; the buffer-vs-append decision belongs to the context
-        (ADR-007 §3) and is not reimplemented here.
+        itself into its own history. Its one caller today is
+        :meth:`_dispatch_command`, for a human's slash command. The wording of the
+        entry belongs to the caller, so a second kind of out-of-band event can
+        never be framed as the first; the buffer-vs-append decision belongs to the
+        context (ADR-007 §3) and is not reimplemented here.
 
         Args:
             entry: The pre-composed entry text.
@@ -699,15 +559,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Resolves the typed ``hire_member`` callable from the command registry and
         invokes it with the native ``role`` (native ``ActorAddress`` return — no
-        ``/hire …`` string round-trip). Used internally by ``process_message``.
+        ``/hire …`` string round-trip). Reached from ``_route_output`` via
+        ``resolve_recipient``.
 
         A failed hire raises ``ModelRetry``: the registry retry-wraps every command,
         converting the tool layer's ``RetriableError``. **On this path nothing
-        honours that retry.** ``process_message`` runs after ``act()`` has already
-        returned, so the REACT loop is over, and every ``except`` clause in
-        ``receiveMsg_AgentMessage`` is for a usage-limit error — so the exception
-        leaves the actor message handler. It is deliberately not swallowed. Retry *is*
-        honoured on the other path: when the model calls the ``hire_members`` tool
+        honours that retry.** ``_route_output`` runs after ``act()`` has already
+        returned, so the REACT loop is over, and the usage-limit guard around the
+        handler catches only usage-limit errors — so the exception leaves the actor
+        message handler. It is deliberately not swallowed. Retry *is* honoured on
+        the other path: when the model calls the ``hire_members`` tool
         mid-reasoning, pydantic-ai is still inside the loop and retries there.
 
         Args:

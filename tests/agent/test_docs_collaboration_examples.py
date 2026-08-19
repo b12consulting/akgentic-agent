@@ -110,6 +110,21 @@ def _make_agent(
     return agent
 
 
+def _stub_act(agent: BaseAgent) -> MagicMock:
+    """Stub ``act`` — the handler's only LLM call — returning an empty output.
+
+    ``receiveMsg_AgentMessage`` calls ``act`` and hands the result straight to
+    ``_route_output``; there is no method between the two to patch, so a test
+    about what the handler *asks for* stubs the LLM call itself.
+    """
+    return _stub(agent, "act", return_value=StructuredOutput())
+
+
+def _run_turn(agent: BaseAgent, prompt: str = "prompt") -> bool:
+    """Drive one routed turn the way ``receiveMsg_AgentMessage`` does."""
+    return agent._route_output(agent.act(prompt, StructuredOutput))
+
+
 # =============================================================================
 # The data model: README `StructuredOutput and Request` + collaboration `Data Model`
 # =============================================================================
@@ -197,7 +212,7 @@ class TestAgentMessageSnippet:
             assert inherited in AgentMessage.model_fields
 
     def test_carries_a_recipient_field_it_can_hold_an_address_in(self) -> None:
-        """The old text claimed it did not; process_message sets it on every send."""
+        """The old text claimed it did not; _route_output sets it on every send."""
         address = _make_address("@Developer456")
         message = AgentMessage(content="x", recipient=address)
         assert message.recipient is address
@@ -299,11 +314,11 @@ class TestReplyProtocolsTable:
 
 
 # =============================================================================
-# Routing and delivery — the `process_message` snippet in both documents
+# Routing and delivery — the `_route_output` snippet in both documents
 # =============================================================================
 
 
-class TestProcessMessageSnippet:
+class TestRoutedTurnSnippet:
     """`Key Implementation §1` and the README `Routing and Delivery` prose."""
 
     def _agent_returning(self, output: StructuredOutput) -> BaseAgent:
@@ -325,7 +340,7 @@ class TestProcessMessageSnippet:
         get_team_member = _stub(agent, "get_team_member", return_value=member)
         hire = _stub(agent, "hire_member")
 
-        agent.process_message("prompt", _make_address("@Human"))
+        assert _run_turn(agent) is True
 
         get_team_member.assert_called_once_with("@Assistant")
         hire.assert_not_called()
@@ -345,7 +360,7 @@ class TestProcessMessageSnippet:
         hired = _make_address("@SecurityEngineer456")
         hire = _stub(agent, "hire_member", return_value=hired)
 
-        agent.process_message("prompt", _make_address("@Human"))
+        _run_turn(agent)
 
         hire.assert_called_once_with("SecurityEngineer")
         assert cast(MagicMock, agent.send).call_args[0][0] is hired
@@ -366,7 +381,7 @@ class TestProcessMessageSnippet:
         member = _make_address("@Developer456")
         _stub(agent, "get_team_member", return_value=member)
 
-        agent.process_message("prompt", _make_address("@Human"))
+        _run_turn(agent)
 
         sent = cast(MagicMock, agent.send).call_args[0][1]
         assert sent.content == "Implement OAuth"
@@ -386,15 +401,19 @@ class TestProcessMessageSnippet:
         )
         _stub(agent, "get_team_member", return_value=None)
 
-        agent.process_message("prompt", _make_address("@Human"))
+        assert _run_turn(agent) is False
 
         cast(MagicMock, agent.send).assert_not_called()
 
     def test_an_empty_output_list_sends_nothing(self) -> None:
-        """Example 3: the agent's turn simply ends."""
+        """Example 3: the agent's turn simply ends.
+
+        ``_route_output`` reports ``False`` — the answer the usage-limit guard asks
+        for when it has to tell a real conclusion from one that routed nothing.
+        """
         agent = self._agent_returning(StructuredOutput(messages=[]))
 
-        agent.process_message("prompt", _make_address("@Human"))
+        assert _run_turn(agent) is False
 
         cast(MagicMock, agent.send).assert_not_called()
 
@@ -405,14 +424,14 @@ class TestReceiverSidePrefixSnippet:
     @patch("akgentic.agent.agent.sleep", MagicMock())
     def test_receiver_prepends_the_protocol_for_the_intent_it_received(self) -> None:
         agent = _make_agent()
-        process_message = _stub(agent, "process_message")
+        act = _stub_act(agent)
 
         message = AgentMessage(content="Estimate feature X", type="request")
         message.sender = _make_address("@Manager")
 
         agent.receiveMsg_AgentMessage(message, _make_address("@Manager"))
 
-        prompt = process_message.call_args[0][0]
+        prompt = act.call_args[0][0]
         # The subject here is the COMPOSITION — framing, article, protocol, blank
         # line, raw content — not the protocol's wording, which is pinned verbatim
         # by TestReplyProtocolsTable. Deriving that one span keeps this test on its
@@ -426,26 +445,24 @@ class TestReceiverSidePrefixSnippet:
     def test_the_article_agrees_with_the_intent(self) -> None:
         """The prefix says `an instruction` / `an acknowledgment`, but `a request`."""
         agent = _make_agent()
-        process_message = _stub(agent, "process_message")
+        act = _stub_act(agent)
 
         message = AgentMessage(content="Do X", type="instruction")
         message.sender = _make_address("@Manager")
         agent.receiveMsg_AgentMessage(message, _make_address("@Manager"))
 
-        assert process_message.call_args[0][0].startswith(
-            "You received an instruction from @Manager."
-        )
+        assert act.call_args[0][0].startswith("You received an instruction from @Manager.")
 
     @patch("akgentic.agent.agent.sleep", MagicMock())
     def test_raw_content_is_preserved_after_the_prefix(self) -> None:
         agent = _make_agent()
-        process_message = _stub(agent, "process_message")
+        act = _stub_act(agent)
 
         message = AgentMessage(content="3 days", type="response")
         message.sender = _make_address("@Developer456")
         agent.receiveMsg_AgentMessage(message, _make_address("@Developer456"))
 
-        assert process_message.call_args[0][0].endswith("\n\n3 days")
+        assert act.call_args[0][0].endswith("\n\n3 days")
 
 
 # =============================================================================
@@ -562,29 +579,27 @@ class TestSlashDispatchFallback:
     def test_an_unrecognised_slash_message_reaches_the_normal_llm_path(self) -> None:
         """Documented: a sentence that happens to start with a slash is never lost."""
         agent = _make_agent(commands={"team_members": team_members})
-        process_message = _stub(agent, "process_message")
+        act = _stub_act(agent)
 
         message = AgentMessage(content="/usr/local is full — please fix", type="request")
         message.sender = _make_address("@Human")
 
         agent.receiveMsg_AgentMessage(message, _make_address("@Human"))
 
-        process_message.assert_called_once()
-        assert process_message.call_args[0][0].endswith(
-            "\n\n/usr/local is full — please fix"
-        )
+        act.assert_called_once()
+        assert act.call_args[0][0].endswith("\n\n/usr/local is full — please fix")
 
     @patch("akgentic.agent.agent.sleep", MagicMock())
     def test_a_recognised_slash_message_never_reaches_the_llm_path(self) -> None:
         agent = _make_agent(commands={"team_members": team_members})
-        process_message = _stub(agent, "process_message")
+        act = _stub_act(agent)
 
         message = AgentMessage(content="/team_members", type="request")
         message.sender = _make_address("@Human")
 
         agent.receiveMsg_AgentMessage(message, _make_address("@Human"))
 
-        process_message.assert_not_called()
+        act.assert_not_called()
 
 
 class TestHireMemberSnippet:
@@ -627,7 +642,7 @@ class TestNoCmdApiRemains:
     def test_the_documented_replacements_are_real_methods(self) -> None:
         for method in (
             "act",
-            "process_message",
+            "_route_output",
             "receiveMsg_AgentMessage",
             "hire_member",
             "notify_human",
@@ -726,7 +741,7 @@ class TestActOutputTypePassThrough:
     """Both documents show `run_sync(..., output_type=output_type)`.
 
     The snippet is only honest if the caller's type really reaches the loop, and the
-    delegation path is only schema-driven because ``process_message()`` names
+    delegation path is only schema-driven because ``receiveMsg_AgentMessage`` names
     ``StructuredOutput`` itself. One test per half of that claim.
     """
 
@@ -744,17 +759,22 @@ class TestActOutputTypePassThrough:
         kwargs = _react_agent_of(agent).run_sync.call_args[1]
         assert kwargs["output_type"] is Summary
 
-    def test_process_message_asks_the_loop_for_structured_output(self) -> None:
+    @patch("akgentic.agent.agent.sleep", MagicMock())
+    def test_the_handler_asks_the_loop_for_structured_output(self) -> None:
         """The routing path names StructuredOutput itself — pass-through keeps it schema-driven.
 
-        Driven through ``process_message()`` rather than ``act()`` directly: the claim is
-        about what the *routing* entry point asks for, so re-pointing it at another type
-        must turn this red.
+        Driven through ``receiveMsg_AgentMessage`` rather than ``act()`` directly: the
+        claim is about what the *routing* entry point asks for, so re-pointing it at
+        another type must turn this red. The handler is also what the guard decorator
+        was given ``StructuredOutput`` for, so the normal turn and an interrupted one
+        reason against the same schema by construction.
         """
         agent = _make_agent()
         _react_agent_of(agent).run_sync.return_value = StructuredOutput()
 
-        agent.process_message("anything", _make_address("@Human"))
+        message = AgentMessage(content="anything", type="request")
+        message.sender = _make_address("@Human")
+        agent.receiveMsg_AgentMessage(message, _make_address("@Human"))
 
         kwargs = _react_agent_of(agent).run_sync.call_args[1]
         assert kwargs["output_type"] is StructuredOutput
