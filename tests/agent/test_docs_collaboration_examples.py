@@ -275,6 +275,23 @@ class TestReplyProtocolsTable:
             "acknowledgment": "Receipt confirmed. No further action needed.",
         }
 
+    def test_the_protocols_state_mechanics_and_never_team_policy(self) -> None:
+        """The constraint the wording serves, which a verbatim copy cannot express.
+
+        These lines sit at the most salient position in the prompt, so anything
+        they say about *who does the work* is applied to every agent in every
+        team. Saying "you may also delegate" made coordinators do their
+        specialists' work; saying "delegate" made specialists fan out to each
+        other. Both directions are policy and belong in the agents' own prompts.
+
+        This is the invariant a future wording change must not break — the
+        verbatim table above only pins today's text.
+        """
+        for intent, protocol in REPLY_PROTOCOLS.items():
+            lowered = protocol.lower()
+            assert "delegate" not in lowered, f"{intent} states delegation policy"
+            assert "carry out the task" not in lowered, f"{intent} assigns the work itself"
+
     def test_every_intent_a_request_can_carry_has_a_protocol_line(self) -> None:
         """A missing key would silently degrade the receiver prefix to no guidance."""
         intents = Request.model_fields["message_type"].annotation
@@ -396,10 +413,13 @@ class TestReceiverSidePrefixSnippet:
         agent.receiveMsg_AgentMessage(message, _make_address("@Manager"))
 
         prompt = process_message.call_args[0][0]
+        # The subject here is the COMPOSITION — framing, article, protocol, blank
+        # line, raw content — not the protocol's wording, which is pinned verbatim
+        # by TestReplyProtocolsTable. Deriving that one span keeps this test on its
+        # own subject and stops a deliberate rewording from failing it.
+        protocol = REPLY_PROTOCOLS["request"].format(sender="@Manager")
         assert prompt == (
-            "You received a request from @Manager. "
-            "A reply is expected: respond to @Manager with the result."
-            "\n\nEstimate feature X"
+            f"You received a request from @Manager. {protocol}\n\nEstimate feature X"
         )
 
     @patch("akgentic.agent.agent.sleep", MagicMock())

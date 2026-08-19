@@ -12,13 +12,14 @@ from typing import Any, Callable
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
+from akgentic.core import ActorAddress
+from akgentic.tool.errors import CommandNotRecognized
+from pydantic_ai import ModelRetry
+
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
-from akgentic.core import ActorAddress
-from akgentic.tool.errors import CommandNotRecognized
-from pydantic_ai import ModelRetry
 
 # =============================================================================
 # HELPERS (same pattern as test_agent.py)
@@ -218,11 +219,8 @@ class TestReceiveAgentMessage:
 
         agent.receiveMsg_AgentMessage(message, sender)
 
-        expected = (
-            "You received a request from @Alice. "
-            f"{REPLY_PROTOCOLS['request'].format(sender='@Alice')}"
-            "\n\nhello world"
-        )
+        protocol = REPLY_PROTOCOLS["request"].format(sender="@Alice")
+        expected = f"You received a request from @Alice. {protocol}\n\nhello world"
         agent.process_message.assert_called_once_with(expected, sender)
 
     @patch("akgentic.agent.agent.sleep")
@@ -293,11 +291,8 @@ class TestReceiveAgentMessage:
         sender = _make_mock_sender("@Bob")
         agent.receiveMsg_AgentMessage(message, sender)
 
-        expected = (
-            "You received a request from @Bob. "
-            f"{REPLY_PROTOCOLS['request'].format(sender='@Bob')}"
-            "\n\ndo this"
-        )
+        protocol = REPLY_PROTOCOLS["request"].format(sender="@Bob")
+        expected = f"You received a request from @Bob. {protocol}\n\ndo this"
         agent.process_message.assert_called_once_with(expected, sender)
 
     @patch("akgentic.agent.agent.sleep")
@@ -312,9 +307,8 @@ class TestReceiveAgentMessage:
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Carol"))
 
         called_content = agent.process_message.call_args[0][0]
-        assert called_content.startswith(
-            f"You received an acknowledgment from @Carol. {REPLY_PROTOCOLS['acknowledgment']}"
-        )
+        protocol = REPLY_PROTOCOLS["acknowledgment"]
+        assert called_content.startswith(f"You received an acknowledgment from @Carol. {protocol}")
         assert called_content.endswith("ack")
 
     @patch("akgentic.agent.agent.sleep")
@@ -329,10 +323,8 @@ class TestReceiveAgentMessage:
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Manager"))
 
         called_content = agent.process_message.call_args[0][0]
-        assert called_content.startswith(
-            "You received an instruction from @Manager. "
-            f"{REPLY_PROTOCOLS['instruction'].format(sender='@Manager')}"
-        )
+        protocol = REPLY_PROTOCOLS["instruction"].format(sender="@Manager")
+        assert called_content.startswith(f"You received an instruction from @Manager. {protocol}")
         assert called_content.endswith("step 1")
 
     @patch("akgentic.agent.agent.sleep")

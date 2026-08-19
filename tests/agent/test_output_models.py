@@ -65,6 +65,23 @@ class TestReplyProtocols:
                     "it may describe only what arrived and whether a reply is expected"
                 )
 
+    def test_reply_directed_entries_state_the_expected_reply(self) -> None:
+        """AC-5: request and instruction each say what reply the sender expects.
+
+        Was ``test_carry_out_then_form``, which pinned the phrasing "Carry out the
+        task, then …". That phrasing was deliberately retired: it assigned the work
+        to the receiver from the most salient position in the prompt, which is team
+        policy rather than message mechanics, and it is what made coordinators do
+        their specialists' work. The convention worth guarding is that both
+        reply-directed intents name the sender and state whether a reply is owed —
+        not the particular verb they use to say it.
+        """
+        assert "{sender}" in REPLY_PROTOCOLS["request"]
+        assert "{sender}" in REPLY_PROTOCOLS["instruction"]
+        # request always owes a reply; instruction owes one only on request.
+        assert "reply is expected" in REPLY_PROTOCOLS["request"].lower()
+        assert "acknowledge" in REPLY_PROTOCOLS["instruction"].lower()
+
     def test_sender_placeholder_in_reply_directed_values(self) -> None:
         """request and instruction reference the sender via {sender}; others do not."""
         assert "{sender}" in REPLY_PROTOCOLS["request"]
@@ -94,10 +111,13 @@ class TestPromptCarriedReplyProtocol:
         sender = "@Manager"
         protocol = REPLY_PROTOCOLS["request"].format(sender=sender)
         prefix = f"You received a request from {sender}. {protocol}"
-        assert prefix == (
-            "You received a request from @Manager. "
-            "A reply is expected: respond to @Manager with the result."
-        )
+        # The subject is the AC-3 framing and the {sender} substitution, not the
+        # protocol's wording — asserting the composed literal here would just
+        # duplicate TestReplyProtocolsTable's verbatim pin and break with it.
+        assert prefix.startswith("You received a request from @Manager. ")
+        assert prefix.endswith(protocol)
+        assert "{sender}" not in prefix
+        assert "@Manager" in protocol
 
 
 class TestRequestMessageType:
