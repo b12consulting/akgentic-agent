@@ -262,28 +262,34 @@ class TestBaseAgentMediaExpansion:
 
 
 # =============================================================================
-# AC-1/AC-2: act() reasons against the static StructuredOutput type
+# AC-1/AC-2: act() passes the caller's output_type straight to the REACT loop
 # =============================================================================
 
 
-class TestActUsesStaticStructuredOutput:
-    """Story 5-5: act() uses the static StructuredOutput schema, no per-call subclass."""
+class TestActPassesOutputTypeThrough:
+    """act() hands run_sync the type it was given; no per-call subclass is built."""
 
-    def test_act_calls_run_sync_with_static_structured_output(self) -> None:
-        """AC-1: act() passes output_type=StructuredOutput to run_sync."""
+    def test_act_calls_run_sync_with_the_output_type_it_was_given(self) -> None:
+        """AC-1: act() forwards its output_type argument; run_sync sees no substitute.
+
+        Two calls, two different types: asserting only the StructuredOutput case would
+        pass just as well against a hardcoded StructuredOutput, which is the defect this
+        guards.
+        """
         agent = _make_minimal_agent(name="@Manager")
 
-        captured_kwargs: dict[str, Any] = {}
+        captured_types: list[Any] = []
 
         def capture_run_sync(prompt: Any, **kwargs: Any) -> StructuredOutput:
-            captured_kwargs.update(kwargs)
+            captured_types.append(kwargs["output_type"])
             return StructuredOutput()
 
         agent._react_agent.run_sync.side_effect = capture_run_sync  # type: ignore[attr-defined]
 
         agent.act("do something", output_type=StructuredOutput)
+        agent.act("do something else", output_type=str)
 
-        assert captured_kwargs["output_type"] is StructuredOutput
+        assert captured_types == [StructuredOutput, str]
 
     def test_no_build_structured_output_type_method(self) -> None:
         """AC-1: the per-call subclass builder no longer exists on BaseAgent."""

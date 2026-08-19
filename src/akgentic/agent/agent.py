@@ -11,7 +11,8 @@ Architecture:
   · COMMAND — programmatic commands exposed via a generic CommandRegistry
     (built once in on_start; dispatched by name from /-prefixed messages)
 - TeamTool auto-injected if not already in config.tools
-- ReactAgent.run_sync(output_type=StructuredOutput) — the only type act() asks for
+- ReactAgent.run_sync(output_type=...) — act() forwards the caller's type;
+  process_message() asks for StructuredOutput, so the team path stays schema-driven
 - get_output_type() applied inside ReactAgent.run() — no leakage into BaseAgent
 - Implements TeamManagementToolObserver protocol (structural typing)
 - One message handler of its own, receiveMsg_AgentMessage: all team traffic is
@@ -76,10 +77,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       to ToolFactory/TeamTool without explicit interface inheritance.
 
     Execution in act():
-    - Always → ReactAgent.run_sync(output_type=StructuredOutput). act()'s own
-      output_type argument is kept for signature stability and never reaches the
-      REACT loop. ReactAgent.run() wraps the type with get_output_type()
-      internally and manages context, limits, and the REACT loop.
+    - ReactAgent.run_sync(output_type=<the caller's type>). act() forwards its
+      own output_type argument unchanged; ReactAgent.run() wraps it with
+      get_output_type() internally and manages context, limits, and the REACT
+      loop. process_message() passes StructuredOutput, which is why the team
+      delegation path is schema-driven.
 
     Message Flow:
     - receiveMsg_AgentMessage is the only handler this class defines (Akgent
@@ -315,13 +317,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     # ============================================================================
 
     def act(self, user_content: str, output_type: type[T]) -> T:
-        """Execute one LLM REACT loop against the static StructuredOutput schema.
+        """Execute one LLM REACT loop against the output type the caller names.
 
         Delegates entirely to ReactAgent.run_sync(), which:
         - Manages context history via ContextManager
         - Enforces usage limits
-        - Wraps StructuredOutput with get_output_type() for provider-aware
-          structured output (NativeOutput for OpenAI/Anthropic, raw type otherwise)
+        - Wraps output_type with get_output_type() for provider-aware structured
+          output (NativeOutput for OpenAI/Anthropic, raw type otherwise)
         - Runs the full REACT loop (tools, retries, system prompts)
 
         Recipient validity is NOT constrained in the schema — it is enforced at
@@ -330,11 +332,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Args:
             user_content: User message to process.
-            output_type: Retained for call-site/signature stability; the REACT loop
-                always reasons against the static StructuredOutput type.
+            output_type: The type the REACT loop reasons against. Forwarded to
+                ReactAgent.run_sync(), which wraps it with get_output_type().
+                process_message() passes StructuredOutput.
 
         Returns:
-            StructuredOutput (cast to the caller's output_type).
+            An instance of output_type, as produced by the REACT loop.
 
         Raises:
             LLMUsageLimitError: Propagated unchanged from ReactAgent.run_sync()
@@ -354,7 +357,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     for p in parts
                 ]
         # ── End media expansion ─────────────────────────────────────────────────
-        output = self._react_agent.run_sync(prompt, deps=self, output_type=StructuredOutput)
+        output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 
         return cast(T, output)
 

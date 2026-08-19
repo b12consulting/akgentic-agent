@@ -234,12 +234,15 @@ for future interactions.
 
 ### Static Schema + Prompt-Carried Reply Protocol
 
-`act()` reasons against the **static** `StructuredOutput` type directly — there is no
+`act()` forwards the `output_type` it was handed straight to the REACT loop — there is no
 per-call subclass and no `type()` metaprogramming on the hot path:
 
 ```python
-output = self._react_agent.run_sync(prompt, deps=self, output_type=StructuredOutput)
+output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 ```
+
+`process_message()` calls `act(message_content, StructuredOutput)`, so the team delegation
+path reasons against the **static** `StructuredOutput` type.
 
 `Request.recipient` is a **plain string** with no `enum` constraint. Recipient validity is
 enforced at **routing time** in `process_message()`, not in the schema:
