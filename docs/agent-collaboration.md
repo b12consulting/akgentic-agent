@@ -543,12 +543,15 @@ two-branch lookup with no error recovery needed.
 
 ### 2. Static Structured Output + Prompt-Carried Reply Protocol
 
-`act()` reasons against the **static** `StructuredOutput` type — no per-call subclass and
-no `type()` metaprogramming on the hot path:
+`act()` forwards the `output_type` it was handed to the REACT loop — no per-call subclass
+and no `type()` metaprogramming on the hot path:
 
 ```python
-output = self._react_agent.run_sync(prompt, deps=self, output_type=StructuredOutput)
+output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 ```
+
+`process_message()` passes `StructuredOutput`, so the delegation path above reasons
+against the **static** schema.
 
 The reply-protocol guidance is carried in the **prompt**, not the output schema. On
 receipt, `receiveMsg_AgentMessage()` prepends the matching `REPLY_PROTOCOLS` line to the
@@ -1095,8 +1098,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     Key methods:
 
     act(user_content, output_type) -> T
-        Execute one LLM REACT loop against the static StructuredOutput schema,
-        delegating to ReactAgent.run_sync(output_type=StructuredOutput).
+        Execute one LLM REACT loop against the caller's output_type, delegating
+        to ReactAgent.run_sync(output_type=output_type). process_message() passes
+        StructuredOutput, which is why the delegation path is schema-driven.
 
     process_message(message_content, sender) -> None
         Core routing engine. Calls act(), resolves each Request.recipient, and

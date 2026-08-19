@@ -262,15 +262,15 @@ class TestBaseAgentMediaExpansion:
 
 
 # =============================================================================
-# AC-1/AC-2: act() reasons against the static StructuredOutput type
+# AC-1/AC-2: act() passes the caller's output_type straight to the REACT loop
 # =============================================================================
 
 
-class TestActUsesStaticStructuredOutput:
-    """Story 5-5: act() uses the static StructuredOutput schema, no per-call subclass."""
+class TestActPassesOutputTypeThrough:
+    """act() hands run_sync the type it was given; no per-call subclass is built."""
 
-    def test_act_calls_run_sync_with_static_structured_output(self) -> None:
-        """AC-1: act() passes output_type=StructuredOutput to run_sync."""
+    def test_act_calls_run_sync_with_the_output_type_it_was_given(self) -> None:
+        """AC-1: act(..., StructuredOutput) passes output_type=StructuredOutput to run_sync."""
         agent = _make_minimal_agent(name="@Manager")
 
         captured_kwargs: dict[str, Any] = {}
