@@ -282,11 +282,11 @@ prompt = f"You received a request from @Manager. {reply_protocol}\n\n{message.co
 
 A usage-limit breach is handled by **tier**. A run-tier breach — this turn ran out of its own
 budget — first gets one tool-free conclusion attempt, whose answer is delivered through this
-same `_route_output()` path, which is why a concluded answer reaches the requester like any
-other message. An agent-tier breach (the agent's lifetime budget is spent), or a conclusion
-that delivers nothing, escalates via `notify_human()` to the team's user-proxy member — found
-structurally through `ActorAddress.is_user_proxy`, so any role string works; when the team has
-none, the notice is logged and dropped. See
+same `_route_output()` path, which is why a concluded answer is routed exactly like any other
+message. An agent-tier breach (the agent's lifetime budget is spent), or a conclusion attempt
+that produces no answer, escalates via `notify_human()` to the team's user-proxy member —
+found structurally through `ActorAddress.is_user_proxy`, so any role string works; when the
+team has none, the notice is logged and dropped. See
 [What happens when a limit is hit](#what-happens-when-a-limit-is-hit).
 
 ### HumanProxy
@@ -481,7 +481,7 @@ never parsed.
 
 | tier | class raised | reaction | human notified? |
 |---|---|---|---|
-| run | `RunUsageLimitError` | one **tool-free conclusion** attempt — the agent is asked to answer the requester with what it has already gathered, delivered through the ordinary routing path | no, when the attempt delivers something |
+| run | `RunUsageLimitError` | one **tool-free conclusion** attempt — the agent is asked to answer the requester with what it has already gathered, delivered through the ordinary routing path | no, when the attempt produces an answer |
 | agent | `AgentUsageLimitError` | terminal and unchanged: `notify_human()`, then `WarningError` | yes |
 
 A run-tier breach means *this turn* ran out of requests, tool calls or tokens. The agent
@@ -497,13 +497,18 @@ That attempt is exactly one attempt, and it can fail. It is skipped altogether w
 incoming message carried no sender — there is nobody to answer — and it falls through to the
 escalation above when the call raises (including on a second breach) or returns no message at
 all. In each of those cases the human is notified and `WarningError` is raised, reporting the
-**original** run-tier breach rather than any secondary failure. So a run-tier breach *attempts*
-a conclusion; it does not guarantee a reply — a `@recipient` the model names but the team does
-not have is skipped at routing time, as always. **The human is therefore notified only when
-the lifetime budget is spent, or when the conclusion attempt failed.** There is no retry
-counter and none is needed: the agent tier is consumed before every call, the conclusion call
-included, so an agent that keeps breaching the run tier walks into its terminal tier by
-construction.
+**original** run-tier breach rather than any secondary failure. So a run-tier breach
+*attempts* a conclusion; it does not guarantee a reply — a `@recipient` the model names but
+the team does not have is skipped at routing time, as always, and an answer addressed that way
+still counts as a conclusion, so no one is notified about it either. **The human is therefore
+notified only when the lifetime budget is spent, or when the conclusion attempt failed.**
+
+There is no retry counter, and none is needed *where a lifetime budget is set*: the agent tier
+is consumed before every call, the conclusion call included, so an agent that keeps breaching
+the run tier walks into its terminal tier by construction. That bound is only as real as the
+budget behind it — the default `AgentUsageLimits()` is all-`None` and never blocks, so an agent
+left on the defaults breaches, concludes and breaches again with nothing to stop it and no one
+told. Set `agent_usage_limits` if you want that backstop.
 
 **Who owns what.** `UsageLimitError`, `RunUsageLimitError`, `AgentUsageLimitError` and the
 conclusion mechanism (`ReactAgent.conclude_without_tools()` and its `_sync` bridge) belong to

@@ -714,7 +714,9 @@ expected to be incomplete and to admit it.
 There is deliberately **no retry and no counter**. `akgentic-llm` consumes agent-tier budget
 before every call, the conclusion call included, so repeated run-tier breaches walk the agent
 into its terminal tier by construction; a counter would only duplicate a bound that already
-exists.
+exists. That bound is only as real as the budget behind it: the default `AgentUsageLimits()`
+is all-`None` and never blocks, so an agent left on the defaults breaches, concludes and
+breaches again indefinitely — see ❌ DON'T #3.
 
 The attempt returns `False` — nothing sent, nothing recorded, escalate — in three cases:
 
@@ -737,7 +739,10 @@ command here.
 Invalid `@member` recipients are handled gracefully at routing time: `get_team_member()`
 returns `None` and delivery is skipped rather than raising. That applies to a conclusion as
 much as to a normal turn, which is why the code and this document say the agent **attempts**
-a conclusion — never that the requester is guaranteed a reply.
+a conclusion — never that the requester is guaranteed a reply. Note what that means for the
+escalation: success is measured on the `Request` the model produced, not on the send. A
+conclusion addressed to a name the team does not have counts as delivered, routes nothing,
+and notifies nobody.
 
 ---
 
@@ -1198,7 +1203,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         context as an early conclusion; it raises nothing when that succeeds. An
         agent-tier breach (AgentUsageLimitError — the lifetime budget is spent) is
         terminal: no attempt, notify_human(), then WarningError. A conclusion that
-        delivers nothing falls through to the same escalation, reporting the
+        produces no Request falls through to the same escalation, reporting the
         original breach. Usage-limit errors are the only ones caught here.
 
     hire_member(role) -> ActorAddress
