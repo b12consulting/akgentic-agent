@@ -14,6 +14,7 @@ agent-tier test still passes. ``TestClauseOrderIsLoadBearing`` below is the test
 that goes red for it; its docstring records the mutation that was run.
 """
 
+import inspect
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -77,6 +78,7 @@ class _GuardedAgent(_FakeAgent):
     def __init__(self, name: str = "@Guarded") -> None:
         super().__init__(name)
         self.turns: list[str] = []
+        self.senders: list[Any] = []
         self.routed: list[Answer] = []
         self.turn_raises: Exception | None = None
         self.delivers = True
@@ -92,6 +94,7 @@ class _GuardedAgent(_FakeAgent):
     ) -> None:
         """One turn of work, and no error handling of its own."""
         self.turns.append(note)
+        self.senders.append(sender)
         if self.turn_raises is not None:
             raise self.turn_raises
 
@@ -195,17 +198,46 @@ class TestGuardLeavesTheHandlerAlone:
         assert agent.notified == []
 
     def test_positional_and_keyword_arguments_reach_the_handler(self) -> None:
-        """The wrapper forwards everything after the message untouched."""
-        agent = _GuardedAgent()
+        """The wrapper forwards everything after the message untouched.
 
-        agent.receiveMsg_Ask(_message(), _address("@Someone"), note="kw")
+        Both halves are asserted: the ``sender`` the wrapper passes on positionally
+        through ``*args``, and the keyword-only ``note`` through ``**kwargs``. The
+        handler has to record the sender for that first half to be provable —
+        asserting only on ``note`` would leave the positional path untested while
+        reading as though it were covered.
+        """
+        agent = _GuardedAgent()
+        sender = _address("@Someone")
+
+        agent.receiveMsg_Ask(_message(), sender, note="kw")
 
         assert agent.turns == ["kw"]
+        assert agent.senders == [sender]
 
     def test_the_handler_keeps_its_identity(self) -> None:
         """``@wraps`` — dispatch finds handlers by name, so the name must survive."""
         assert _GuardedAgent.receiveMsg_Ask.__name__ == "receiveMsg_Ask"
         assert _GuardedAgent.receiveMsg_Ask.__doc__ is not None
+
+    def test_the_signature_actor_dispatch_reads_is_the_handlers_own(self) -> None:
+        """``sender`` must stay visible through the wrapper, or it stops arriving.
+
+        ``Akgent._receiveMessage`` decides how to call a handler by inspecting its
+        signature: ``"sender" in inspect.signature(method).parameters`` selects
+        ``method(self, message, sender)`` over ``method(self, message)``. The
+        wrapper declares ``(self, message, /, *args, **kwargs)`` and has no
+        ``sender`` of its own — dispatch keeps working only because ``@wraps`` sets
+        ``__wrapped__`` and ``inspect.signature`` follows it.
+
+        Swap ``@wraps`` for a hand-assigned ``__name__`` and every other test in
+        this file stays green while every decorated handler in the package loses
+        its sender argument the first time a live actor delivers a message. Same
+        shape of failure as the clause order, so it is pinned the same way.
+        """
+        parameters = inspect.signature(_GuardedAgent.receiveMsg_Ask).parameters
+
+        assert "message" in parameters
+        assert "sender" in parameters
 
     def test_a_non_usage_error_propagates_untouched(self) -> None:
         """Usage-limit errors are the only ones the guard is for."""

@@ -96,6 +96,23 @@ class TestCustomAgentNormalTurn:
         assert isinstance(sent, AgentMessage)
         assert sent.content == "Free 20GB on node 3"
 
+    def test_a_handoff_to_a_name_the_team_does_not_have_is_skipped(self) -> None:
+        """An ``@name`` matching nobody costs a delivery, not an exception.
+
+        The rule ``_route_output`` applies, applied by ``_route_triage`` — and the
+        reason it returns a bool at all: with its only handoff skipped, the turn
+        delivered nothing, which is what the guard would have to escalate on had
+        this been a breached turn.
+        """
+        agent = _make_custom_agent()
+        agent.act = MagicMock(return_value=_triage(recipient="@Ghost"))  # type: ignore[method-assign]
+
+        agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
+
+        agent.get_team_member.assert_called_once_with("@Ghost")  # type: ignore[attr-defined]
+        agent.send.assert_not_called()  # type: ignore[attr-defined]
+        agent.hire_member.assert_not_called()  # type: ignore[attr-defined]
+
 
 class TestCustomAgentRunTierBreach:
     """AC-5: a run-tier breach concludes in TriageOutput, routed by _route_triage."""

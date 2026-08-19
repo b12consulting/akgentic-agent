@@ -67,11 +67,27 @@ def _make_address(name: str = "@Human") -> MagicMock:
 
 
 def _stub(agent: object, attribute: str, **kwargs: Any) -> MagicMock:
-    """Replace *attribute* on *agent* with a MagicMock and hand it back.
+    """Replace a *method* of *agent* with a MagicMock and hand it back.
 
     Going through ``setattr`` keeps the call sites free of ``method-assign``
     suppressions and gives each test a properly typed handle to assert on.
+
+    The class-level check is not defensive noise — it closes the way four tests in
+    this file went vacuous. ``setattr`` happily invents a name that does not exist,
+    so when a method was renamed out of ``BaseAgent`` every ``_stub(agent, "<old
+    name>")`` kept working and every ``assert_not_called()`` on it passed
+    trivially: green tests asserting nothing about the code that actually runs.
+    Renaming a method now breaks its tests loudly, at the stub.
+
+    Deliberately checks the **class**, not the instance: a name only ``on_start``
+    installs would pass an instance check for the wrong reason once some earlier
+    line had set it. Runtime attributes are assigned directly instead.
     """
+    if not hasattr(type(agent), attribute):
+        raise AttributeError(
+            f"{type(agent).__name__} defines no {attribute!r} to stub — stubbing a "
+            "name the class does not have makes every assertion on it vacuous"
+        )
     stub = MagicMock(**kwargs)
     setattr(agent, attribute, stub)
     return stub
@@ -92,7 +108,9 @@ def _make_agent(
     ``CommandNotRecognized`` fallback are all exercised for real.
     """
     agent: BaseAgent = object.__new__(BaseAgent)
-    _stub(agent, "_react_agent")
+    # Installed, not stubbed: on_start creates this one, so there is no class-level
+    # name for _stub to check against.
+    agent._react_agent = MagicMock()  # type: ignore[assignment]
     agent._current_message = None
     agent.team_id = uuid.uuid4()
 
