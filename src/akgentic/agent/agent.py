@@ -450,7 +450,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         )
 
         # Computed before the try so the usage-limit handlers can name the requester.
-        sender_name = message.sender.name if message.sender else "unknown"
+        # A message may legitimately carry no sender (Message.sender is optional), in
+        # which case there is no requester to answer — kept as None rather than the
+        # "unknown" placeholder, which is prose here but would become a routing target
+        # in the tool-free conclusion.
+        requester = message.sender.name if message.sender else None
+        sender_name = requester or "unknown"
 
         try:
             sleep(random.uniform(0.25, 0.5))  # Simulate processing delay
@@ -475,7 +480,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             # Recoverable: the turn is out of budget, the agent may not be. One
             # tool-free conclusion; if it delivers nothing, fall through to the
             # escalation below — reporting THIS error, not any secondary one.
-            if not self._try_conclude_without_tools(e, sender_name):
+            if not self._try_conclude_without_tools(e, requester):
                 self._escalate_usage_limit(e)
 
         except AgentUsageLimitError as e:
@@ -509,7 +514,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         )
         raise WarningError(f"LLM usage limit exceeded: {error}")
 
-    def _try_conclude_without_tools(self, error: RunUsageLimitError, sender_name: str) -> bool:
+    def _try_conclude_without_tools(
+        self, error: RunUsageLimitError, requester: str | None
+    ) -> bool:
         """Turn a run-tier breach into one delivered answer, or report failure.
 
         Runs exactly one tool-free conclusion through the ReactAgent sync bridge —
@@ -528,23 +535,41 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         the requester received nothing, exactly as if the call had raised. It is
         reported as such before anything is routed or recorded.
 
+        A turn with no identifiable requester is not attempted at all. The reason has
+        nobody to name, and a placeholder such as "unknown" would not stay prose: the
+        model would echo it as the Request's recipient, and ``_route_output`` treats
+        any recipient without a leading ``@`` as a role to **hire** — so the teardown
+        of a breached turn would spin up a member called "unknown", or raise
+        ``ModelRetry`` out of the actor's message handler. Escalation is the honest
+        outcome when there is no one to answer.
+
         Args:
             error: The run-tier breach that interrupted the turn.
-            sender_name: Name of the requester whose message was being answered.
+            requester: Name of the requester whose message was being answered, or
+                ``None`` when the incoming message carried no sender.
 
         Returns:
             ``True`` when at least one Request was routed and the early conclusion
-            was recorded in the agent's context; ``False`` when the attempt raised
-            or produced nothing — in which case nothing was sent and nothing was
-            recorded, and the caller escalates.
+            was recorded in the agent's context; ``False`` when there was no
+            requester to answer, or the attempt raised or produced nothing — in
+            which case nothing was sent and nothing was recorded, and the caller
+            escalates.
         """
+        if requester is None:
+            logger.warning(
+                "[%s] run-tier usage breach on a message with no sender; "
+                "there is no requester to conclude to, escalating instead",
+                self.config.name,
+            )
+            return False
+
         reason = (
             f"This turn has run out of its tool-call budget ({error}), so you cannot "
             "call any further tool and this is your last chance to answer.\n"
-            f"Answer {sender_name} now with what you have already gathered. State your "
+            f"Answer {requester} now with what you have already gathered. State your "
             "conclusion plainly, say explicitly which parts you could not check or "
             "finish, and do not promise follow-up work — the turn ends with this answer.\n"
-            f"Address the answer to {sender_name}."
+            f"Address the answer to {requester}."
         )
         try:
             output = self._react_agent.conclude_without_tools_sync(
@@ -567,7 +592,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         self._route_output(output)
         self._record_operator_action(
             f"[System action] This turn hit its per-run usage limit ({error}) and was "
-            f"concluded early, without further tool calls. What you sent {sender_name} "
+            f"concluded early, without further tool calls. What you sent {requester} "
             "is all that was delivered; anything you had not finished is still unfinished."
         )
         return True

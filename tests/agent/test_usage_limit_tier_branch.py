@@ -91,12 +91,21 @@ def _make_message() -> AgentMessage:
 def _breaching_agent(error: Exception) -> tuple[BaseAgent, MagicMock]:
     """An agent whose turn raises ``error``, plus the requester's address.
 
-    ``get_team_member`` resolves the requester so a conclusion addressed to them
-    is actually delivered — the routing, not the mock, decides that.
+    ``get_team_member`` is keyed **by name**: it resolves the requester and nobody
+    else. A blanket ``return_value`` would hand the requester's address back for
+    whatever name the model happened to choose, so "the requester received the
+    conclusion" would hold even for an answer addressed to a third agent — the
+    exact failure this suite exists to catch. ``hire_member`` is stubbed to fail
+    loudly, because a conclusion should never hire anyone.
     """
     agent = _make_agent()
     requester = _make_address(REQUESTER)
-    agent.get_team_member = MagicMock(return_value=requester)  # type: ignore[method-assign]
+    agent.get_team_member = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda name: requester if name == REQUESTER else None
+    )
+    agent.hire_member = MagicMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("a tool-free conclusion must not hire anyone")
+    )
     agent.process_message = MagicMock(side_effect=error)  # type: ignore[method-assign]
     return agent, requester
 
@@ -130,7 +139,9 @@ class TestRunTierConcludes:
 
         agent.receiveMsg_AgentMessage(_make_message(), _make_address(REQUESTER))
 
-        # The requester got a real AgentMessage at their own address.
+        # The requester got a real AgentMessage at their own address — and the
+        # address was reached by looking THEM up, not whoever the model named.
+        agent.get_team_member.assert_called_once_with(REQUESTER)  # type: ignore[attr-defined]
         agent.send.assert_called_once()  # type: ignore[attr-defined]
         target, sent = agent.send.call_args[0]  # type: ignore[attr-defined]
         assert target is requester
@@ -154,7 +165,11 @@ class TestRunTierConcludes:
 
         record = agent._react_agent.context.record_operator_action  # type: ignore[attr-defined]
         record.assert_called_once()
-        assert "concluded early" in record.call_args[0][0]
+        entry = record.call_args[0][0]
+        assert "concluded early" in entry
+        # The slash-command entry is human-attributed by design; this one must not
+        # borrow that wording — no human did this, and the agent reads it next turn.
+        assert "The human ran" not in entry
 
     @patch("akgentic.agent.agent.sleep")
     def test_the_reason_prompt_names_the_requester(self, mock_sleep: MagicMock) -> None:
@@ -238,6 +253,31 @@ class TestRunTierFallsThrough:
         assert agent._react_agent.conclude_without_tools_sync.call_count == 1  # type: ignore[attr-defined]
         assert "original run breach" in str(excinfo.value)
         agent.send.assert_not_called()  # type: ignore[attr-defined]
+
+    @patch("akgentic.agent.agent.sleep")
+    def test_a_message_with_no_sender_is_not_concluded_to_at_all(
+        self, mock_sleep: MagicMock
+    ) -> None:
+        """AC5: ``Message.sender`` is optional, and "unknown" is not a recipient.
+
+        Naming a placeholder in the reason would get it echoed back as the Request's
+        recipient, and a recipient without a leading ``@`` is a *role to hire* — so
+        the teardown of a breached turn would hire a member called "unknown". With no
+        requester there is nobody to answer, so the attempt is skipped entirely.
+        """
+        agent, _ = _breaching_agent(RunUsageLimitError("original run breach"))
+        senderless = AgentMessage(content="what is the status?", type="request")
+        assert senderless.sender is None
+
+        with pytest.raises(WarningError) as excinfo:
+            agent.receiveMsg_AgentMessage(senderless, _make_address(REQUESTER))
+
+        assert "original run breach" in str(excinfo.value)
+        agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
+        agent.hire_member.assert_not_called()  # type: ignore[attr-defined]
+        agent.send.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent.notify_human.assert_called_once()  # type: ignore[attr-defined]
 
     @patch("akgentic.agent.agent.sleep")
     def test_an_unexpected_failure_of_the_attempt_still_escalates(
