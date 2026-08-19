@@ -472,18 +472,28 @@ sequenceDiagram
     deactivate NewActor
 ```
 
-### 4. process_message() Decision Tree
+### 4. _route_output() Decision Tree
+
+The routing loop is `_route_output()`'s body. Two callers reach it: a normal turn through
+`process_message()`, and the tool-free conclusion of a turn cut short by a run-tier usage
+limit. Both deliver through exactly the same code, which is why a concluded answer arrives
+at the requester like any other message.
 
 ```mermaid
 flowchart TD
     S[process_message called] --> A[act user_content StructuredOutput]
-    A --> B[For each Request in output.messages]
+    A --> R[_route_output output]
+    C[run-tier breach → one tool-free conclusion] --> R
+    R --> B[For each Request in output.messages]
     B --> E{starts with '@'?}
     E -->|yes| F[get_team_member recipient]
-    F --> H[send AgentMessage to member]
+    F --> G{resolved?}
+    G -->|yes| H[send AgentMessage to member]
+    G -->|no| K[skip this Request]
     E -->|no| L[hire_member role → auto-hire]
     L --> H
     H --> P[done]
+    K --> P
 ```
 
 > **Note:** Recipients are validated at routing time (`@name` → `get_team_member`,
@@ -511,12 +521,16 @@ agent, so this notification does not currently fire for messages arriving mid-ru
 
 ## Key Implementation
 
-### 1. Message Delivery (process_message)
+### 1. Message Delivery (process_message → _route_output)
 
 ```python
 def process_message(self, message_content: str, sender: ActorAddress) -> None:
     output = self.act(message_content, StructuredOutput)
 
+    self._route_output(output)
+
+
+def _route_output(self, output: StructuredOutput) -> None:
     for request in output.messages:
         recipient = request.recipient
 
@@ -540,6 +554,11 @@ The sender delivers the **raw** `request.message`; the reply-protocol prefix is 
 the *receiving* agent's `receiveMsg_AgentMessage()` (see below), keyed to the intent that
 agent received. Recipients are resolved at routing time, so the dispatch is a simple
 two-branch lookup with no error recovery needed.
+
+`_route_output()` is the class's single routed send path. `process_message()` uses it for a
+normal turn, and the tool-free conclusion of a turn cut short by a run-tier usage limit
+(see [Usage Limit Protection](#5-usage-limit-protection)) uses the very same helper — so a
+concluded answer is delivered exactly like any other message.
 
 ### 2. Static Structured Output + Prompt-Carried Reply Protocol
 
@@ -657,21 +676,68 @@ human_addr.send(manager_addr, AgentMessage(content="/hire_member DevOpsEngineer"
 
 ### 5. Usage Limit Protection
 
-`receiveMsg_AgentMessage` catches `LLMUsageLimitError` and escalates via
-`notify_human()` to the team's first user-proxy member — found structurally through
-`ActorAddress.is_user_proxy`, so any role string works; when the team has none, the
-notice is logged and dropped:
+`receiveMsg_AgentMessage` branches on the **tier** of the breach. The two tiers are two
+distinct exception classes — `RunUsageLimitError` and `AgentUsageLimitError`, both
+`akgentic-llm`'s and both subclasses of `UsageLimitError` — and they are told apart by
+class, never by reading the message text:
 
 ```python
+except RunUsageLimitError as e:
+    if not self._try_conclude_without_tools(e, requester):
+        self._escalate_usage_limit(e)
+
+except AgentUsageLimitError as e:
+    self._escalate_usage_limit(e)
+
 except LLMUsageLimitError as e:
-    self.notify_human(
-        f"The agent {self.config.name} has exceeded its usage limits ({e})."
-    )
-    raise WarningError(f"LLM usage limit exceeded: {e}")
+    self._escalate_usage_limit(e)
 ```
 
+**The clause order carries the behaviour.** Both tiers subclass the base
+(`LLMUsageLimitError` is this module's alias for `akgentic.llm.UsageLimitError`), so a base
+clause written first would catch them both and the branch would never run — with every test
+still green if the tests only raise the base. The subclasses come first and the base stays
+last as a backstop, for an `akgentic-llm` that raises it directly.
+
+`_escalate_usage_limit()` is the unchanged escalation: `notify_human()` to the team's first
+user-proxy member — found structurally through `ActorAddress.is_user_proxy`, so any role
+string works; when the team has none, the notice is logged and dropped — then
+`raise WarningError(f"LLM usage limit exceeded: {error}")`.
+
+`_try_conclude_without_tools()` runs **one** tool-free conclusion through
+`ReactAgent.conclude_without_tools_sync()`, on the actor's own thread like every other LLM
+call in this class, asks for a `StructuredOutput`, and delivers it through `_route_output()`.
+The prompt names the requester, tells the model it has no tools left, and asks it to say
+explicitly which parts it could not check or finish — so an answer produced this way is
+expected to be incomplete and to admit it.
+
+There is deliberately **no retry and no counter**. `akgentic-llm` consumes agent-tier budget
+before every call, the conclusion call included, so repeated run-tier breaches walk the agent
+into its terminal tier by construction; a counter would only duplicate a bound that already
+exists.
+
+The attempt returns `False` — nothing sent, nothing recorded, escalate — in three cases:
+
+- **the message carried no sender**, so there is no requester to name. The attempt is not
+  made at all: a placeholder such as `"unknown"` would not stay prose, because the model
+  would echo it as the `Request.recipient` and `_route_output()` treats any recipient without
+  a leading `@` as a role to **hire**;
+- **the call raised** — an `AgentUsageLimitError` from the conclusion's own pre-flight, a
+  second `RunUsageLimitError`, or anything else;
+- **`StructuredOutput.messages` came back empty.** A successful call that produces no
+  `Request` leaves the requester with nothing, which is the same outcome as an exception and
+  is treated as one.
+
+On success, one entry is written to the agent's own context through
+`_record_operator_action()`, stating that the turn hit its per-run limit and was concluded
+early — so the next turn is not blind to the fact that work was left unfinished. It is
+deliberately *not* the human-attributed wording used for slash commands: nobody ran a
+command here.
+
 Invalid `@member` recipients are handled gracefully at routing time: `get_team_member()`
-returns `None` and delivery is skipped rather than raising.
+returns `None` and delivery is skipped rather than raising. That applies to a conclusion as
+much as to a normal turn, which is why the code and this document say the agent **attempts**
+a conclusion — never that the requester is guaranteed a reply.
 
 ---
 
@@ -907,9 +973,14 @@ StructuredOutput(messages=[
 
 5. **Always include a `HumanProxy` in the team**
 
-   `notify_human()` sends the usage-limit escalation — currently its only caller — to the
-   team's first user-proxy member, found structurally through `ActorAddress.is_user_proxy`, so
-   any role string works. Without one, the notice is logged and dropped.
+   `notify_human()` sends the usage-limit escalation — reached through
+   `_escalate_usage_limit()`, currently its only caller — to the team's first user-proxy
+   member, found structurally through `ActorAddress.is_user_proxy`, so any role string works.
+   Without one, the notice is logged and dropped.
+
+   It fires on the **agent** tier (the lifetime budget is spent), and on a run-tier breach
+   only when the tool-free conclusion delivered nothing. A run-tier breach that concluded
+   successfully notifies nobody — see [Usage Limit Protection](#5-usage-limit-protection).
 
 ### ❌ DON'T
 
@@ -935,7 +1006,13 @@ StructuredOutput(messages=[
 
    If agent A always messages agent B who always messages agent A, the agents
    will consume usage limits rapidly. Design prompts with clear termination
-   conditions. Usage limit protection will eventually escalate to the human.
+   conditions.
+
+   Do not count on usage-limit protection to page you. A run-tier breach is answered by a
+   tool-free conclusion, not by a notification, so a loop can burn through run after run in
+   silence; the human is told only once an agent's **lifetime** budget is spent and the
+   agent tier escalates. Set `agent_usage_limits` if you want that backstop to arrive before
+   the bill does.
 
 4. **Don't skip the `PlanningTool` for multi-step work**
 
@@ -1103,14 +1180,26 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         StructuredOutput, which is why the delegation path is schema-driven.
 
     process_message(message_content, sender) -> None
-        Core routing engine. Calls act(), resolves each Request.recipient, and
-        sends the RAW request.message as an AgentMessage carrying request.message_type.
-        It does not enrich the content — the receiver adds the reply protocol.
+        Core routing engine. Runs one act() turn and delivers the resulting
+        StructuredOutput: one AgentMessage per Request, carrying the RAW
+        request.message and request.message_type. A recipient starting with "@"
+        resolves to an existing member and one that does not is hired by role;
+        a recipient that resolves to nothing is skipped. It does not enrich the
+        content — the receiver adds the reply protocol.
 
     receiveMsg_AgentMessage(message, sender) -> None
         Pykka message handler. Entry point for all incoming messages. Intercepts
         "/"-prefixed content as a command; otherwise prepends the REPLY_PROTOCOLS
         line for message.type and calls process_message().
+        A usage-limit breach is handled by tier, told apart by exception class and
+        never by message text. A run-tier breach (RunUsageLimitError — this turn ran
+        out of its own budget) first attempts one tool-free conclusion, delivered to
+        the requester through the same routing and recorded in the agent's own
+        context as an early conclusion; it raises nothing when that succeeds. An
+        agent-tier breach (AgentUsageLimitError — the lifetime budget is spent) is
+        terminal: no attempt, notify_human(), then WarningError. A conclusion that
+        delivers nothing falls through to the same escalation, reporting the
+        original breach. Usage-limit errors are the only ones caught here.
 
     hire_member(role) -> ActorAddress
         Hire by role through the registry's typed hire_member command.

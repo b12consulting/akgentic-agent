@@ -245,7 +245,8 @@ output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 path reasons against the **static** `StructuredOutput` type.
 
 `Request.recipient` is a **plain string** with no `enum` constraint. Recipient validity is
-enforced at **routing time** in `process_message()`, not in the schema:
+enforced at **routing time** in `_route_output()` — the helper `process_message()` calls —
+not in the schema:
 
 | Recipient format | Resolution |
 |---|---|
@@ -268,8 +269,9 @@ You received a request from @Human. A reply is expected: respond to @Human with 
 
 ### Routing and Delivery
 
-`process_message()` resolves each `Request.recipient` (see the table above) and sends the
-**raw** `request.message` as an `AgentMessage`. The sender does not enrich the content —
+`process_message()` runs one LLM turn and hands the result to `_route_output()`, which
+resolves each `Request.recipient` (see the table above) and sends the **raw**
+`request.message` as an `AgentMessage`. The sender does not enrich the content —
 the reply-protocol prefix is added by the *receiving* agent's `receiveMsg_AgentMessage()`,
 so the guidance is always keyed to the intent that agent actually received:
 
@@ -278,9 +280,14 @@ so the guidance is always keyed to the intent that agent actually received:
 prompt = f"You received a request from @Manager. {reply_protocol}\n\n{message.content}"
 ```
 
-On `LLMUsageLimitError`, the agent escalates via `notify_human()` to the team's
-user-proxy member — found structurally through `ActorAddress.is_user_proxy`, so any
-role string works; when the team has none, the notice is logged and dropped.
+A usage-limit breach is handled by **tier**. A run-tier breach — this turn ran out of its own
+budget — first gets one tool-free conclusion attempt, whose answer is delivered through this
+same `_route_output()` path, which is why a concluded answer reaches the requester like any
+other message. An agent-tier breach (the agent's lifetime budget is spent), or a conclusion
+that delivers nothing, escalates via `notify_human()` to the team's user-proxy member — found
+structurally through `ActorAddress.is_user_proxy`, so any role string works; when the team has
+none, the notice is logged and dropped. See
+[What happens when a limit is hit](#what-happens-when-a-limit-is-hit).
 
 ### HumanProxy
 
@@ -460,8 +467,50 @@ routinely emit a `StructuredOutput` alongside a tool call, and tools raise `Mode
 design, that second turn is charged to *both* tiers — so an agent near either budget can
 trip a limit on a turn that previously completed. Budget for it when sizing tight limits.
 
-Both tiers raise the same `UsageLimitError`, so a caller that already catches it needs no
-change to handle the new tier.
+The two tiers raise **two distinct classes** — `RunUsageLimitError` for the run tier,
+`AgentUsageLimitError` for the agent tier — and both subclass the `UsageLimitError` that
+predates the split. A caller that already writes `except UsageLimitError` therefore still
+catches both and needs no change. Code that has to tell the tiers apart does so by **class**
+(`isinstance`, or the order of its `except` clauses), never by reading the message text. All
+three classes are `akgentic-llm`'s.
+
+##### What happens when a limit is hit
+
+`BaseAgent` reacts differently to each tier. The exception class decides; the message text is
+never parsed.
+
+| tier | class raised | reaction | human notified? |
+|---|---|---|---|
+| run | `RunUsageLimitError` | one **tool-free conclusion** attempt — the agent is asked to answer the requester with what it has already gathered, delivered through the ordinary routing path | no, when the attempt delivers something |
+| agent | `AgentUsageLimitError` | terminal and unchanged: `notify_human()`, then `WarningError` | yes |
+
+A run-tier breach means *this turn* ran out of requests, tool calls or tokens. The agent
+itself usually still has lifetime budget, and by that point usually has most of what it was
+asked for: it can no longer call a tool, but it can still answer — so it is asked to, once.
+The prompt for that final call tells the model it has no tools left, to answer the named
+requester now, and to **state explicitly which parts it could not check or finish**. An
+answer produced this way is expected to be incomplete and to say so; read it as a partial
+result, not a finished one. The turn is also recorded in the agent's own context as concluded
+early, so its next turn is not blind to what was left unfinished.
+
+That attempt is exactly one attempt, and it can fail. It is skipped altogether when the
+incoming message carried no sender — there is nobody to answer — and it falls through to the
+escalation above when the call raises (including on a second breach) or returns no message at
+all. In each of those cases the human is notified and `WarningError` is raised, reporting the
+**original** run-tier breach rather than any secondary failure. So a run-tier breach *attempts*
+a conclusion; it does not guarantee a reply — a `@recipient` the model names but the team does
+not have is skipped at routing time, as always. **The human is therefore notified only when
+the lifetime budget is spent, or when the conclusion attempt failed.** There is no retry
+counter and none is needed: the agent tier is consumed before every call, the conclusion call
+included, so an agent that keeps breaching the run tier walks into its terminal tier by
+construction.
+
+**Who owns what.** `UsageLimitError`, `RunUsageLimitError`, `AgentUsageLimitError` and the
+conclusion mechanism (`ReactAgent.conclude_without_tools()` and its `_sync` bridge) belong to
+**`akgentic-llm`** — this package imports them and never redefines them. *Which tier gets
+which reaction*, the fall-through cases and the routing of the answer belong to
+**`akgentic-agent`**, in `BaseAgent.receiveMsg_AgentMessage` and its private helpers. Change
+enforcement in `akgentic-llm`; change policy here.
 
 ##### Migrating from `usage_limits`
 
