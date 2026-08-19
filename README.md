@@ -254,8 +254,7 @@ The reply-protocol guidance lives where the LLM actually reads it — the **prom
 type via `REPLY_PROTOCOLS`) to the raw content before handing it to `process_message()`:
 
 ```
-You received a request from @Human. Carry out the task, then respond to @Human.
-You may also delegate to others.
+You received a request from @Human. A reply is expected: respond to @Human with the result.
 
 <raw message content>
 ```
@@ -308,11 +307,20 @@ received, the matching `REPLY_PROTOCOLS` instruction is prepended to the **user 
 
 | Intent | Receiver instruction (`REPLY_PROTOCOLS`) |
 |---|---|
-| `request` | "Carry out the task, then respond to {sender}. You may also delegate to others." |
-| `response` | "Analyse the response, then continue or end the exchange." |
-| `instruction` | "Carry out the task, then acknowledge to {sender} if requested." |
+| `request` | "A reply is expected: respond to {sender} with the result." |
+| `response` | "This is a reply to something you asked. Take it into account and continue." |
+| `instruction` | "Carry it out; acknowledge to {sender} only if asked to." |
 | `notification` | "Informational message. No reply is expected." |
-| `acknowledgment` | "No further action needed." |
+| `acknowledgment` | "Receipt confirmed. No further action needed." |
+
+**These lines state message mechanics only** — what kind of message arrived, and whether a
+reply is expected. They deliberately say nothing about *who* should do the work or whether
+to delegate, because they sit at the most salient position in every agent's prompt, in every
+team. Team policy that is stated there is stated to everyone at once: the earlier `request`
+text read "Carry out the task, then respond to {sender}. You may also delegate to others",
+and that single line is what made coordinators do their specialists' work. Wording it the
+other way round is the same mistake with the sign flipped — it makes specialists fan out to
+each other. Division of labour is per-role, so it belongs in the agents' own prompts.
 
 The protocol is **soft guidance**, not framework enforcement. The LLM is guided to send no
 further messages for `notification` and `acknowledgment`, but the framework processes

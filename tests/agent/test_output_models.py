@@ -13,6 +13,21 @@ from akgentic.agent.output_models import (
 )
 
 
+# Phrasings that assign work rather than describe a message. Both directions are
+# listed: telling every agent to delegate is the same defect as telling every agent
+# to carry the task itself, with the sign flipped.
+_DIVISION_OF_LABOUR_MARKERS: frozenset[str] = frozenset(
+    {
+        "delegate",
+        "carry out the task",
+        "do it yourself",
+        "hand off",
+        "assign",
+        "yourself",
+    }
+)
+
+
 class TestReplyProtocols:
     """Tests for REPLY_PROTOCOLS dict."""
 
@@ -31,10 +46,24 @@ class TestReplyProtocols:
             "acknowledgment",
         ]
 
-    def test_carry_out_then_form(self) -> None:
-        """AC-5: reply-directed entries use the 'carry out …, then …' phrasing."""
-        assert REPLY_PROTOCOLS["request"].startswith("Carry out the task, then ")
-        assert REPLY_PROTOCOLS["instruction"].startswith("Carry out the task, then ")
+    def test_no_entry_states_division_of_labour(self) -> None:
+        """These lines carry message mechanics; who does the work is per-role policy.
+
+        A protocol line is prepended to every inbound message, for every agent, in
+        every team — the most salient position in the prompt. Policy stated there is
+        stated to everyone at once, which no team actually wants. The `request` entry
+        once read "Carry out the task, then respond to {sender}. You may also delegate
+        to others", and that line is what made coordinators do their specialists' work;
+        wording it the other way round made specialists fan out to each other instead.
+        Division of labour belongs in the agents' own prompts, where it can differ.
+        """
+        for msg_type, protocol in REPLY_PROTOCOLS.items():
+            lowered = protocol.lower()
+            for marker in _DIVISION_OF_LABOUR_MARKERS:
+                assert marker not in lowered, (
+                    f"REPLY_PROTOCOLS[{msg_type!r}] states team policy ({marker!r}); "
+                    "it may describe only what arrived and whether a reply is expected"
+                )
 
     def test_sender_placeholder_in_reply_directed_values(self) -> None:
         """request and instruction reference the sender via {sender}; others do not."""
@@ -67,7 +96,7 @@ class TestPromptCarriedReplyProtocol:
         prefix = f"You received a request from {sender}. {protocol}"
         assert prefix == (
             "You received a request from @Manager. "
-            "Carry out the task, then respond to @Manager. You may also delegate to others."
+            "A reply is expected: respond to @Manager with the result."
         )
 
 

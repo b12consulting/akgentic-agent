@@ -15,7 +15,7 @@ import pytest
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
-from akgentic.agent.output_models import Request, StructuredOutput
+from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
 from akgentic.core import ActorAddress
 from akgentic.tool.errors import CommandNotRecognized
 from pydantic_ai import ModelRetry
@@ -220,7 +220,7 @@ class TestReceiveAgentMessage:
 
         expected = (
             "You received a request from @Alice. "
-            "Carry out the task, then respond to @Alice. You may also delegate to others."
+            f"{REPLY_PROTOCOLS['request'].format(sender='@Alice')}"
             "\n\nhello world"
         )
         agent.process_message.assert_called_once_with(expected, sender)
@@ -295,7 +295,7 @@ class TestReceiveAgentMessage:
 
         expected = (
             "You received a request from @Bob. "
-            "Carry out the task, then respond to @Bob. You may also delegate to others."
+            f"{REPLY_PROTOCOLS['request'].format(sender='@Bob')}"
             "\n\ndo this"
         )
         agent.process_message.assert_called_once_with(expected, sender)
@@ -313,7 +313,7 @@ class TestReceiveAgentMessage:
 
         called_content = agent.process_message.call_args[0][0]
         assert called_content.startswith(
-            "You received an acknowledgment from @Carol. No further action needed."
+            f"You received an acknowledgment from @Carol. {REPLY_PROTOCOLS['acknowledgment']}"
         )
         assert called_content.endswith("ack")
 
@@ -331,7 +331,7 @@ class TestReceiveAgentMessage:
         called_content = agent.process_message.call_args[0][0]
         assert called_content.startswith(
             "You received an instruction from @Manager. "
-            "Carry out the task, then acknowledge to @Manager if requested."
+            f"{REPLY_PROTOCOLS['instruction'].format(sender='@Manager')}"
         )
         assert called_content.endswith("step 1")
 

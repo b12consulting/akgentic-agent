@@ -266,14 +266,13 @@ class TestReplyProtocolsTable:
 
     def test_table_matches_the_documented_text_verbatim(self) -> None:
         assert REPLY_PROTOCOLS == {
-            "request": (
-                "Carry out the task, then respond to {sender}. "
-                "You may also delegate to others."
+            "request": "A reply is expected: respond to {sender} with the result.",
+            "response": (
+                "This is a reply to something you asked. Take it into account and continue."
             ),
-            "response": "Analyse the response, then continue or end the exchange.",
-            "instruction": "Carry out the task, then acknowledge to {sender} if requested.",
+            "instruction": "Carry it out; acknowledge to {sender} only if asked to.",
             "notification": "Informational message. No reply is expected.",
-            "acknowledgment": "No further action needed.",
+            "acknowledgment": "Receipt confirmed. No further action needed.",
         }
 
     def test_every_intent_a_request_can_carry_has_a_protocol_line(self) -> None:
@@ -399,8 +398,7 @@ class TestReceiverSidePrefixSnippet:
         prompt = process_message.call_args[0][0]
         assert prompt == (
             "You received a request from @Manager. "
-            "Carry out the task, then respond to @Manager. "
-            "You may also delegate to others."
+            "A reply is expected: respond to @Manager with the result."
             "\n\nEstimate feature X"
         )
 
