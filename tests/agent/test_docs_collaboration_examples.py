@@ -695,6 +695,21 @@ class TestActMediaExpansion:
             "the shot",
         ]
 
+
+# =============================================================================
+# act() — README `Static Schema + Prompt-Carried Reply Protocol`
+#         + collaboration doc §2 (the run_sync snippet both documents show)
+# =============================================================================
+
+
+class TestActOutputTypePassThrough:
+    """Both documents show `run_sync(..., output_type=output_type)`.
+
+    The snippet is only honest if the caller's type really reaches the loop, and the
+    delegation path is only schema-driven because ``process_message()`` names
+    ``StructuredOutput`` itself. One test per half of that claim.
+    """
+
     def test_the_callers_output_type_reaches_the_react_loop(self) -> None:
         """Documented: act() reasons against the type it is handed, not a hardcoded one."""
 
@@ -709,12 +724,17 @@ class TestActMediaExpansion:
         kwargs = _react_agent_of(agent).run_sync.call_args[1]
         assert kwargs["output_type"] is Summary
 
-    def test_process_message_still_asks_for_structured_output(self) -> None:
-        """The routing path names StructuredOutput itself — pass-through keeps it schema-driven."""
+    def test_process_message_asks_the_loop_for_structured_output(self) -> None:
+        """The routing path names StructuredOutput itself — pass-through keeps it schema-driven.
+
+        Driven through ``process_message()`` rather than ``act()`` directly: the claim is
+        about what the *routing* entry point asks for, so re-pointing it at another type
+        must turn this red.
+        """
         agent = _make_agent()
         _react_agent_of(agent).run_sync.return_value = StructuredOutput()
 
-        agent.act("anything", StructuredOutput)
+        agent.process_message("anything", _make_address("@Human"))
 
         kwargs = _react_agent_of(agent).run_sync.call_args[1]
         assert kwargs["output_type"] is StructuredOutput
