@@ -39,8 +39,8 @@ HumanProxy ──send()──► BaseAgent (Manager)
                              │
                     receiveMsg_AgentMessage()
                              │  prepend reply protocol to the prompt:
-                             │  "You received a request from @Human. Carry out the
-                             │   task, then respond to @Human. ..."
+                             │  "You received a request from @Human. A reply is
+                             │   expected: respond to @Human with the result."
                              │
                     process_message(prompt, sender)
                              │
