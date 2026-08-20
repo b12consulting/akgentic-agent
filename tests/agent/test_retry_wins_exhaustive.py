@@ -18,7 +18,7 @@ and the run ended on that turn. v2 moved this into ``pydantic_ai/_tool_execution
 
 Those module and symbol names are navigation aids for a human reader only — nothing here
 asserts on them. The test asserts observable behaviour: how many times the model was
-called, and which `StructuredOutput` reached `process_message`.
+called, and which `StructuredOutput` reached `_route_output`.
 
 Why this is `akgentic-agent`'s normal mode, not an edge case
 -----------------------------------------------------------
@@ -45,6 +45,7 @@ import pytest
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
+from akgentic.agent.output_models import StructuredOutput
 from akgentic.core import ActorAddress
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
 from pydantic_ai import ModelRetry
@@ -193,7 +194,10 @@ class TestRetryWinsUnderExhaustiveStrategy:
 
         try:
             with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
-                agent.process_message("route this", _make_mock_address("@Human"))
+                # One routed turn, as receiveMsg_AgentMessage runs it: act() into
+                # _route_output(). Driven directly so the run graph — not a message
+                # handler's prompt assembly — is the only thing under test.
+                agent._route_output(agent.act("route this", StructuredOutput))
         finally:
             # Close on the way out so no event loop or httpx pool leaks into later tests.
             react_agent.close()

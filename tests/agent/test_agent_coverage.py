@@ -1,9 +1,15 @@
 """Tests for BaseAgent methods not covered by test_agent.py or test_simple_team.py.
 
-Covers: process_message, receiveMsg_AgentMessage (incl. slash-command dispatch),
-notify_human, on_hire, on_fire, hire_member, and the on_start discovery event.
-All tests use _make_minimal_agent pattern — no live actors or LLM calls. The
-command surface is exercised through a mocked CommandRegistry.
+Covers: act/_route_output (the routed turn), receiveMsg_AgentMessage (incl.
+slash-command dispatch), notify_human, on_hire, on_fire, hire_member, and the
+on_start discovery event. All tests use _make_minimal_agent pattern — no live
+actors or LLM calls. The command surface is exercised through a mocked
+CommandRegistry.
+
+Where a test needs to observe what the handler asked the LLM for, it stubs
+``act`` — the handler's single LLM call. There is no intermediate seam to patch:
+``receiveMsg_AgentMessage`` calls ``act`` and hands the result to
+``_route_output`` itself.
 """
 
 import logging
@@ -12,13 +18,14 @@ from typing import Any, Callable
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
+from akgentic.core import ActorAddress
+from akgentic.tool.errors import CommandNotRecognized
+from pydantic_ai import ModelRetry
+
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
-from akgentic.core import ActorAddress
-from akgentic.tool.errors import CommandNotRecognized
-from pydantic_ai import ModelRetry
 
 # =============================================================================
 # HELPERS (same pattern as test_agent.py)
@@ -83,13 +90,24 @@ def _make_minimal_agent(
     return agent
 
 
+def _run_turn(agent: BaseAgent, content: str = "test content") -> bool:
+    """Drive one routed turn exactly as ``receiveMsg_AgentMessage`` does.
+
+    The handler runs ``act()`` against ``StructuredOutput`` and hands the result to
+    ``_route_output()``. There is no intermediate method between the two, so a test
+    about routing drives both calls rather than patching a seam that would only
+    prove the double was wired up.
+    """
+    return agent._route_output(agent.act(content, StructuredOutput))
+
+
 # =============================================================================
-# process_message
+# The routed turn — act() into _route_output()
 # =============================================================================
 
 
-class TestProcessMessage:
-    """Test process_message routing logic."""
+class TestRoutedTurn:
+    """Test the routing logic _route_output applies to one act() output."""
 
     def test_routes_to_existing_member_via_at_prefix(self) -> None:
         """recipient starting with '@' → get_team_member; content is raw (no prefix)."""
@@ -109,8 +127,7 @@ class TestProcessMessage:
         )
         agent._react_agent.run_sync.return_value = output  # type: ignore[attr-defined]
 
-        sender = _make_mock_sender("@Human")
-        agent.process_message("test content", sender)
+        assert _run_turn(agent) is True
 
         agent.get_team_member.assert_called_once_with("@Assistant")
         agent.send.assert_called_once()
@@ -136,8 +153,7 @@ class TestProcessMessage:
         )
         agent._react_agent.run_sync.return_value = output  # type: ignore[attr-defined]
 
-        sender = _make_mock_sender("@Human")
-        agent.process_message("test", sender)
+        assert _run_turn(agent, "test") is True
 
         hire_cmd.assert_called_once_with("Developer")
         agent.send.assert_called_once()
@@ -161,20 +177,20 @@ class TestProcessMessage:
         )
         agent._react_agent.run_sync.return_value = output  # type: ignore[attr-defined]
 
-        agent.process_message("test", _make_mock_sender())
+        assert _run_turn(agent, "test") is False
         agent.send.assert_not_called()
 
     def test_empty_messages_no_routing(self) -> None:
-        """No requests → no routing happens."""
+        """No requests → no routing happens, and the turn reports nothing delivered."""
         agent = _make_minimal_agent()
         output = StructuredOutput(messages=[])
         agent._react_agent.run_sync.return_value = output  # type: ignore[attr-defined]
 
-        agent.process_message("test", _make_mock_sender())
+        assert _run_turn(agent, "test") is False
         agent.send.assert_not_called()
 
     def test_sends_raw_content_without_prefix(self) -> None:
-        """process_message sends AgentMessage with raw content (no prefix baked in)."""
+        """_route_output sends AgentMessage with raw content (no prefix baked in)."""
         agent = _make_minimal_agent()
         member_addr = _make_mock_sender("@Assistant")
         agent.get_team_member = MagicMock(return_value=member_addr)  # type: ignore[method-assign]
@@ -190,7 +206,7 @@ class TestProcessMessage:
         )
         agent._react_agent.run_sync.return_value = output  # type: ignore[attr-defined]
 
-        agent.process_message("test", _make_mock_sender())
+        _run_turn(agent, "test")
         sent_msg = agent.send.call_args[0][1]
         assert sent_msg.content == "ack"
         assert "You received" not in sent_msg.content
@@ -201,14 +217,27 @@ class TestProcessMessage:
 # =============================================================================
 
 
+def _stub_act(agent: BaseAgent, **kwargs: Any) -> MagicMock:
+    """Stub ``act`` — the handler's only LLM call — and hand the double back.
+
+    Defaults to returning an empty ``StructuredOutput`` so ``_route_output`` runs
+    for real on it and routes nothing, leaving the test's own assertions as the
+    only thing under examination.
+    """
+    kwargs.setdefault("return_value", StructuredOutput())
+    stub = MagicMock(**kwargs)
+    agent.act = stub  # type: ignore[method-assign]
+    return stub
+
+
 class TestReceiveAgentMessage:
     """Test receiveMsg_AgentMessage handler."""
 
     @patch("akgentic.agent.agent.sleep")
-    def test_calls_process_message_with_reconstructed_prefix(self, mock_sleep: MagicMock) -> None:
+    def test_calls_act_with_reconstructed_prefix(self, mock_sleep: MagicMock) -> None:
         """AC-3: prompt carries the reply protocol inline with the raw content."""
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         msg_sender = _make_mock_sender("@Alice")
         message = AgentMessage(content="hello world", type="request")
@@ -218,12 +247,9 @@ class TestReceiveAgentMessage:
 
         agent.receiveMsg_AgentMessage(message, sender)
 
-        expected = (
-            "You received a request from @Alice. "
-            f"{REPLY_PROTOCOLS['request'].format(sender='@Alice')}"
-            "\n\nhello world"
-        )
-        agent.process_message.assert_called_once_with(expected, sender)
+        protocol = REPLY_PROTOCOLS["request"].format(sender="@Alice")
+        expected = f"You received a request from @Alice. {protocol}\n\nhello world"
+        act.assert_called_once_with(expected, StructuredOutput)
 
     @patch("akgentic.agent.agent.sleep")
     def test_usage_limit_error_notifies_human(self, mock_sleep: MagicMock) -> None:
@@ -232,9 +258,7 @@ class TestReceiveAgentMessage:
         from akgentic.llm import UsageLimitError as LLMUsageLimitError
 
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock(  # type: ignore[method-assign]
-            side_effect=LLMUsageLimitError("token limit")
-        )
+        _stub_act(agent, side_effect=LLMUsageLimitError("token limit"))
         agent.notify_human = MagicMock()  # type: ignore[method-assign]
 
         message = AgentMessage(content="do something")
@@ -264,9 +288,7 @@ class TestReceiveAgentMessage:
         suffix = " (see the usage-limits documentation for details)"
 
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock(  # type: ignore[method-assign]
-            side_effect=LLMUsageLimitError(base + suffix)
-        )
+        _stub_act(agent, side_effect=LLMUsageLimitError(base + suffix))
         agent.notify_human = MagicMock()  # type: ignore[method-assign]
 
         message = AgentMessage(content="do something")
@@ -285,7 +307,7 @@ class TestReceiveAgentMessage:
     def test_reconstructs_prefix_with_a_for_consonant_type(self, mock_sleep: MagicMock) -> None:
         """type='request' (consonant) → prefix uses 'a request' + reply protocol."""
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         message = AgentMessage(content="do this", type="request")
         message.sender = _make_mock_sender("@Bob")
@@ -293,62 +315,61 @@ class TestReceiveAgentMessage:
         sender = _make_mock_sender("@Bob")
         agent.receiveMsg_AgentMessage(message, sender)
 
-        expected = (
-            "You received a request from @Bob. "
-            f"{REPLY_PROTOCOLS['request'].format(sender='@Bob')}"
-            "\n\ndo this"
-        )
-        agent.process_message.assert_called_once_with(expected, sender)
+        protocol = REPLY_PROTOCOLS["request"].format(sender="@Bob")
+        expected = f"You received a request from @Bob. {protocol}\n\ndo this"
+        act.assert_called_once_with(expected, StructuredOutput)
 
     @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_an_for_acknowledgment(self, mock_sleep: MagicMock) -> None:
         """type='acknowledgment' (vowel) → prefix uses 'an acknowledgment'."""
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         message = AgentMessage(content="ack", type="acknowledgment")
         message.sender = _make_mock_sender("@Carol")
 
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Carol"))
 
-        called_content = agent.process_message.call_args[0][0]
-        assert called_content.startswith(
-            f"You received an acknowledgment from @Carol. {REPLY_PROTOCOLS['acknowledgment']}"
-        )
+        called_content = act.call_args[0][0]
+        protocol = REPLY_PROTOCOLS["acknowledgment"]
+        assert called_content.startswith(f"You received an acknowledgment from @Carol. {protocol}")
         assert called_content.endswith("ack")
 
     @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_an_for_instruction(self, mock_sleep: MagicMock) -> None:
         """type='instruction' (vowel) → prefix uses 'an instruction' + reply protocol."""
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         message = AgentMessage(content="step 1", type="instruction")
         message.sender = _make_mock_sender("@Manager")
 
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Manager"))
 
-        called_content = agent.process_message.call_args[0][0]
-        assert called_content.startswith(
-            "You received an instruction from @Manager. "
-            f"{REPLY_PROTOCOLS['instruction'].format(sender='@Manager')}"
-        )
+        called_content = act.call_args[0][0]
+        protocol = REPLY_PROTOCOLS["instruction"].format(sender="@Manager")
+        assert called_content.startswith(f"You received an instruction from @Manager. {protocol}")
         assert called_content.endswith("step 1")
 
     @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_unknown_when_sender_is_none(
         self, mock_sleep: MagicMock
     ) -> None:
-        """message.sender is None → fallback to 'unknown'."""
+        """message.sender is None → the PROMPT falls back to 'unknown'.
+
+        Only the prompt: the guard keeps its own requester as ``None``, because a
+        placeholder there would be echoed back as a Request recipient and hired as
+        a role. That half is pinned in test_usage_limit_tier_branch.py.
+        """
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         message = AgentMessage(content="hello", type="request")
         message.sender = None
 
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Somewhere"))
 
-        called_content = agent.process_message.call_args[0][0]
+        called_content = act.call_args[0][0]
         assert "from unknown. " in called_content
         assert called_content.endswith("hello")
 
@@ -467,9 +488,7 @@ class TestNotifyHuman:
         from akgentic.llm import UsageLimitError as LLMUsageLimitError
 
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock(  # type: ignore[method-assign]
-            side_effect=LLMUsageLimitError("token limit")
-        )
+        _stub_act(agent, side_effect=LLMUsageLimitError("token limit"))
 
         message = AgentMessage(content="do something")
 
@@ -542,7 +561,7 @@ class TestSlashCommandDispatch:
         """AC-3: known /command → dispatch result sent to sender, LLM not called."""
         agent = _make_minimal_agent()
         agent._command_registry.dispatch.return_value = "Member @Dev123 hired."  # type: ignore[attr-defined]
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         message = AgentMessage(content="/hire Developer", type="request")
         message.sender = _make_mock_sender("@Human")
@@ -551,7 +570,7 @@ class TestSlashCommandDispatch:
         agent.receiveMsg_AgentMessage(message, sender)
 
         agent._command_registry.dispatch.assert_called_once_with("/hire Developer")  # type: ignore[attr-defined]
-        agent.process_message.assert_not_called()
+        act.assert_not_called()
         agent.send.assert_called_once()
         sent_to, sent_msg = agent.send.call_args[0]
         assert sent_to is sender
@@ -564,7 +583,7 @@ class TestSlashCommandDispatch:
         """AC-4: CommandNotRecognized → original content goes to the LLM path."""
         agent = _make_minimal_agent()
         agent._command_registry.dispatch.side_effect = CommandNotRecognized("etc")  # type: ignore[attr-defined]
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         message = AgentMessage(content="/etc/passwd", type="request")
         message.sender = _make_mock_sender("@Human")
@@ -575,8 +594,8 @@ class TestSlashCommandDispatch:
         # No result string sent for the dispatch attempt
         agent.send.assert_not_called()
         # Fell back to the normal path with the prefixed ORIGINAL content
-        agent.process_message.assert_called_once()
-        prefixed = agent.process_message.call_args[0][0]
+        act.assert_called_once()
+        prefixed = act.call_args[0][0]
         assert prefixed.endswith("/etc/passwd")
         assert "You received a request from @Human. " in prefixed
 
@@ -587,7 +606,7 @@ class TestSlashCommandDispatch:
         agent._command_registry.dispatch.return_value = (  # type: ignore[attr-defined]
             "Command 'hire_member' failed: requires at least 1 argument(s), got 0"
         )
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         message = AgentMessage(content="/hire_member", type="request")
         message.sender = _make_mock_sender("@Human")
@@ -595,7 +614,7 @@ class TestSlashCommandDispatch:
 
         agent.receiveMsg_AgentMessage(message, sender)
 
-        agent.process_message.assert_not_called()
+        act.assert_not_called()
         agent.send.assert_called_once()
         sent_msg = agent.send.call_args[0][1]
         assert sent_msg.type == "notification"
@@ -605,7 +624,7 @@ class TestSlashCommandDispatch:
     def test_non_slash_content_never_dispatches(self, mock_sleep: MagicMock) -> None:
         """Plain (non-/) content bypasses dispatch entirely and goes to the LLM."""
         agent = _make_minimal_agent()
-        agent.process_message = MagicMock()  # type: ignore[method-assign]
+        act = _stub_act(agent)
 
         message = AgentMessage(content="hello there", type="request")
         message.sender = _make_mock_sender("@Human")
@@ -613,7 +632,7 @@ class TestSlashCommandDispatch:
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Human"))
 
         agent._command_registry.dispatch.assert_not_called()  # type: ignore[attr-defined]
-        agent.process_message.assert_called_once()
+        act.assert_called_once()
 
 
 # =============================================================================
@@ -731,27 +750,40 @@ class TestOperatorActionInjection:
     """AC1/AC5: the agent delegates each operator action to the LLM context.
 
     The agent no longer owns the buffer-vs-append decision or pydantic-ai's
-    first-run injection rule — it builds the canonical entry string and hands it
-    to ``context.record_operator_action``. The buffering itself is owned and
+    first-run injection rule — ``_dispatch_command`` builds the canonical entry
+    string and hands it to ``_record_operator_action``, which forwards it to
+    ``context.record_operator_action``. The buffering itself is owned and
     unit-tested in ``akgentic-llm``.
+
+    A slash command is now the *only* thing that writes such an entry: the
+    tool-free conclusion of a breached turn no longer records one, since the
+    reason it was given already carries the fact.
     """
 
-    def test_inject_helper_delegates_canonical_entry_to_context(self) -> None:
-        """AC1: _inject_operator_action builds the canonical human-attributed
-        entry and delegates it to context.record_operator_action — nothing else."""
+    def test_record_helper_forwards_the_entry_verbatim_to_the_context(self) -> None:
+        """AC1: the wording belongs to the caller; the helper adds nothing.
+
+        Composition is ``_dispatch_command``'s job precisely because the entries
+        are not interchangeable — a human's command and anything else the agent
+        might one day record must not be framed as the same event.
+        """
         agent = _make_minimal_agent()
 
-        agent._inject_operator_action("/hire Developer", "hired @Developer42")
+        agent._record_operator_action("[Operator action] anything at all")
 
         agent._react_agent.context.record_operator_action.assert_called_once_with(  # type: ignore[attr-defined]
-            '[Operator action] The human ran "/hire Developer". \nResult:\nhired @Developer42'
+            "[Operator action] anything at all"
         )
 
     def test_entry_is_human_subject_never_agent_first_person(self) -> None:
         """AC1: 'The human ran' phrasing; no agent first-person framing."""
         agent = _make_minimal_agent()
+        agent._command_registry.dispatch.return_value = "hired @Dev9"  # type: ignore[attr-defined]
 
-        agent._inject_operator_action("/hire Developer", "hired @Dev9")
+        message = AgentMessage(content="/hire Developer", type="request")
+        message.sender = _make_mock_sender("@Human")
+
+        agent._dispatch_command(message, _make_mock_sender("@Human"))
 
         entry = agent._react_agent.context.record_operator_action.call_args[0][0]  # type: ignore[attr-defined]
         assert "The human ran" in entry

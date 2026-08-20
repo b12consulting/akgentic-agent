@@ -37,12 +37,10 @@ Human
   ▼
 HumanProxy ──send()──► BaseAgent (Manager)
                              │
-                    receiveMsg_AgentMessage()
+                    receiveMsg_AgentMessage()   ← @guard_usage_limits(...)
                              │  prepend reply protocol to the prompt:
-                             │  "You received a request from @Human. Carry out the
-                             │   task, then respond to @Human. ..."
-                             │
-                    process_message(prompt, sender)
+                             │  "You received a request from @Human. A reply is
+                             │   expected: respond to @Human with the result."
                              │
                     act(prompt, StructuredOutput)
                       │
@@ -179,7 +177,7 @@ me", an `instruction` means "go do this on my behalf".
 
 Intent flows through the system in two complementary ways:
 
-1. **When sending** — The LLM chooses an intent for each outbound `Request`. `process_message()`
+1. **When sending** — The LLM chooses an intent for each outbound `Request`. `_route_output()`
    delivers the **raw** `request.message` as an `AgentMessage` whose `type` field carries that
    intent unchanged. The sender does not rewrite the content.
 
@@ -241,11 +239,11 @@ per-call subclass and no `type()` metaprogramming on the hot path:
 output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 ```
 
-`process_message()` calls `act(message_content, StructuredOutput)`, so the team delegation
-path reasons against the **static** `StructuredOutput` type.
+`receiveMsg_AgentMessage()` calls `act(prefixed_content, StructuredOutput)`, so the team
+delegation path reasons against the **static** `StructuredOutput` type.
 
 `Request.recipient` is a **plain string** with no `enum` constraint. Recipient validity is
-enforced at **routing time** in `process_message()`, not in the schema:
+enforced at **routing time** in `_route_output()`, not in the schema:
 
 | Recipient format | Resolution |
 |---|---|
@@ -254,7 +252,7 @@ enforced at **routing time** in `process_message()`, not in the schema:
 
 The reply-protocol guidance lives where the LLM actually reads it — the **prompt**.
 `receiveMsg_AgentMessage()` prepends a one-line protocol (keyed on the incoming message
-type via `REPLY_PROTOCOLS`) to the raw content before handing it to `process_message()`:
+type via `REPLY_PROTOCOLS`) to the raw content before handing it to the LLM:
 
 ```
 You received a request from @Human. A reply is expected: respond to @Human with the result.
@@ -268,19 +266,93 @@ You received a request from @Human. A reply is expected: respond to @Human with 
 
 ### Routing and Delivery
 
-`process_message()` resolves each `Request.recipient` (see the table above) and sends the
-**raw** `request.message` as an `AgentMessage`. The sender does not enrich the content —
+`receiveMsg_AgentMessage()` runs one LLM turn and hands the result to `_route_output()`,
+which resolves each `Request.recipient` (see the table above) and sends the **raw**
+`request.message` as an `AgentMessage`. The sender does not enrich the content —
 the reply-protocol prefix is added by the *receiving* agent's `receiveMsg_AgentMessage()`,
 so the guidance is always keyed to the intent that agent actually received:
 
 ```python
-# In the receiver's receiveMsg_AgentMessage(), before process_message():
+# In the receiver's receiveMsg_AgentMessage(), before the LLM turn:
 prompt = f"You received a request from @Manager. {reply_protocol}\n\n{message.content}"
 ```
 
-On `LLMUsageLimitError`, the agent escalates via `notify_human()` to the team's
-user-proxy member — found structurally through `ActorAddress.is_user_proxy`, so any
-role string works; when the team has none, the notice is logged and dropped.
+`_route_output()` returns **whether anything was actually delivered**. That is what lets the
+usage-limit guard tell a real conclusion from one that resolved no recipient and sent
+nothing — it cannot inspect the output itself, since the schema belongs to the caller.
+
+A usage-limit breach is handled by **tier**, by the `@guard_usage_limits` decorator on the
+handler rather than by any code inside it. A run-tier breach — this turn ran out of its own
+budget — first gets one tool-free conclusion attempt, whose answer is delivered through this
+same `_route_output()` path, which is why a concluded answer is routed exactly like any other
+message. An agent-tier breach (the agent's lifetime budget is spent), or a conclusion attempt
+that produces no answer, escalates via `notify_human()` to the team's user-proxy member —
+found structurally through `ActorAddress.is_user_proxy`, so any role string works; when the
+team has none, the notice is logged and dropped. See
+[What happens when a limit is hit](#what-happens-when-a-limit-is-hit) and
+[Writing a second agent class](#writing-a-second-agent-class).
+
+### Writing a second agent class
+
+`BaseAgent` handles one message type against one schema. A subclass that wants its own — its
+own structured output, its own `receiveMsg_*` — needs the usage-limit policy too, and must
+**not** copy it. The `except` ordering is load-bearing: `RunUsageLimitError` and
+`AgentUsageLimitError` both subclass `UsageLimitError`, so a base clause placed first catches
+both and the tier branch never runs. A wrong copy still compiles, still passes an ordinary
+test, and simply stops concluding on a run-tier breach.
+
+Two modules exist for exactly this, and neither imports `agent.py` — they are what a *new*
+agent class needs, so a dependency in that direction would make them unusable from the module
+that defines the base class. What each needs from an agent is stated as a `Protocol`:
+
+| module | holds |
+|---|---|
+| `usage_limits.py` | `AgentLike`, `guard_usage_limits`, `escalate_usage_limit`, `try_conclude_without_tools` |
+| `utils.py` | `TeamResolver`, `resolve_recipient` — the team addressing convention (`@member` vs role to hire) |
+
+Apply the decorator to every `receiveMsg_*` that can reach the LLM, handing it *your* schema
+and *your* router:
+
+```python
+from akgentic.agent.usage_limits import guard_usage_limits
+from akgentic.agent.utils import resolve_recipient
+
+
+class CustomAgent(BaseAgent):
+    def _route_triage(self, output: TriageOutput) -> bool:
+        """Deliver the output — and report whether anything actually went out."""
+        delivered = False
+        for handoff in output.handoffs:
+            member = resolve_recipient(self, handoff.recipient)
+            if member is None:
+                continue
+            self.send(
+                member,
+                AgentMessage(content=handoff.task, type="request", recipient=member),
+            )
+            delivered = True
+        return delivered
+
+    @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
+    def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
+        self._route_triage(self.act(prompt, TriageOutput))
+```
+
+Three things follow, and they are the whole point:
+
+- **The handler carries no error handling of its own.** It reads as just the work.
+- **A run-tier breach concludes in `TriageOutput`**, delivered by `_route_triage` — because
+  the schema and the routing are decorator *arguments*, not overrides. `CustomAgent` overrides
+  nothing.
+- **The router returns `bool`.** The guard is handed a schema it cannot inspect — `TriageOutput`
+  has no `.messages` — so "did anything actually go out?" is the router's answer to give, and
+  it is what separates a real conclusion from one that routed nothing.
+
+`_route_triage` is defined **before** the handler: the decorator names it as an argument, which
+is evaluated while the class body runs. The requester is lifted off the handler's own message
+argument, so nothing is threaded through the signature.
+
+The runnable version is `src/akgentic/agent/custom_agent.py`.
 
 ### HumanProxy
 
@@ -363,8 +435,8 @@ hire a role by name without knowing the class.
 
 ### Dynamic Hiring
 
-When `process_message()` sees `recipient="Developer"` (no `@` prefix), it calls
-`hire_member("Developer")`, which resolves the registry's typed `hire_member` command
+When `_route_output()` sees `recipient="Developer"` (no `@` prefix), `resolve_recipient()`
+calls `hire_member("Developer")`, which resolves the registry's typed `hire_member` command
 (`TeamTool`) and invokes it. That command:
 
 1. Looks up the `AgentCard` for `"Developer"` in the Orchestrator
@@ -460,8 +532,57 @@ routinely emit a `StructuredOutput` alongside a tool call, and tools raise `Mode
 design, that second turn is charged to *both* tiers — so an agent near either budget can
 trip a limit on a turn that previously completed. Budget for it when sizing tight limits.
 
-Both tiers raise the same `UsageLimitError`, so a caller that already catches it needs no
-change to handle the new tier.
+The two tiers raise **two distinct classes** — `RunUsageLimitError` for the run tier,
+`AgentUsageLimitError` for the agent tier — and both subclass the `UsageLimitError` that
+predates the split. A caller that already writes `except UsageLimitError` therefore still
+catches both and needs no change. Code that has to tell the tiers apart does so by **class**
+(`isinstance`, or the order of its `except` clauses), never by reading the message text. All
+three classes are `akgentic-llm`'s.
+
+##### What happens when a limit is hit
+
+The `@guard_usage_limits` decorator reacts differently to each tier, on behalf of whichever
+handler carries it. The exception class decides; the message text is never parsed.
+
+| tier | class raised | reaction | human notified? |
+|---|---|---|---|
+| run | `RunUsageLimitError` | one **tool-free conclusion** attempt — the agent is asked to answer the requester with what it has already gathered, delivered through the ordinary routing path | no, when the attempt produces an answer |
+| agent | `AgentUsageLimitError` | terminal and unchanged: `notify_human()`, then `WarningError` | yes |
+
+A run-tier breach means *this turn* ran out of requests, tool calls or tokens. The agent
+itself usually still has lifetime budget, and by that point usually has most of what it was
+asked for: it can no longer call a tool, but it can still answer — so it is asked to, once.
+The prompt for that final call tells the model it has no tools left, to answer the named
+requester now, and to **state explicitly which parts it could not check or finish**. An
+answer produced this way is expected to be incomplete and to say so; read it as a partial
+result, not a finished one. Nothing extra is written to the agent's own context: the
+conclusion's own exchange lands in the history like any other turn, and the prompt above
+already says the turn was cut short.
+
+That attempt is exactly one attempt, and it can fail. It is skipped altogether when the
+incoming message carried no sender — there is nobody to answer — and it falls through to the
+escalation above when the call raises (including on a second breach) or returns no message at
+all. In each of those cases the human is notified and `WarningError` is raised, reporting the
+**original** run-tier breach rather than any secondary failure. So a run-tier breach
+*attempts* a conclusion; it does not guarantee a reply — a `@recipient` the model names but
+the team does not have is skipped at routing time, as always, and an answer addressed that way
+still counts as a conclusion, so no one is notified about it either. **The human is therefore
+notified only when the lifetime budget is spent, or when the conclusion attempt failed.**
+
+There is no retry counter, and none is needed *where a lifetime budget is set*: the agent tier
+is consumed before every call, the conclusion call included, so an agent that keeps breaching
+the run tier walks into its terminal tier by construction. That bound is only as real as the
+budget behind it — the default `AgentUsageLimits()` is all-`None` and never blocks, so an agent
+left on the defaults breaches, concludes and breaches again with nothing to stop it and no one
+told. Set `agent_usage_limits` if you want that backstop.
+
+**Who owns what.** `UsageLimitError`, `RunUsageLimitError`, `AgentUsageLimitError` and the
+conclusion mechanism (`ReactAgent.conclude_without_tools()` and its `_sync` bridge) belong to
+**`akgentic-llm`** — this package imports them and never redefines them. *Which tier gets
+which reaction*, the fall-through cases and the routing of the answer belong to
+**`akgentic-agent`**, in `usage_limits.py` — not in any agent class. Change enforcement in
+`akgentic-llm`; change policy there. To apply that policy to a handler of your own, see
+[Writing a second agent class](#writing-a-second-agent-class).
 
 ##### Migrating from `usage_limits`
 
@@ -712,9 +833,12 @@ src/akgentic/agent/
     __init__.py          # Public API: BaseAgent, AgentConfig, HumanProxy, AgentMessage
     agent.py             # BaseAgent — actor + LLM + tool composition, routing logic
     config.py            # AgentConfig, AgentState
+    custom_agent.py      # Worked example: a second agent class with its own schema
     human_proxy.py       # HumanProxy — human-in-the-loop bridge
     messages.py          # AgentMessage with typed protocol
     output_models.py     # StructuredOutput, Request, REPLY_PROTOCOLS
+    usage_limits.py      # guard_usage_limits decorator + the tier policy (no agent.py import)
+    utils.py             # resolve_recipient — the team addressing convention
 examples/                # Runnable examples with README
 tests/                   # Tests organised by module
 docs/
