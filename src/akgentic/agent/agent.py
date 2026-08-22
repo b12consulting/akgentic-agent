@@ -5,11 +5,11 @@ with team-specific message handling and a static structured-output schema.
 Architecture:
 - Extends Akgent[AgentConfig, AgentState] from akgentic-core (pykka actor model)
 - Composes ReactAgent (akgentic-llm) for model, http client, context, usage limits
-- Composes ToolFactory (akgentic-tool) aggregating ToolCard[] into 3 channels:
+- Composes ToolFactory (akgentic-tool) aggregating ToolCard[] into 4 channels:
   · TOOL_CALL — LLM-callable tools (hire_members, fire_members, + config.tools)
-  · SYSTEM_PROMPT — dynamic prompts (TeamTool yields team_roster, role_profiles)
-  · COMMAND — programmatic commands exposed via a generic CommandRegistry
-    (built once in on_start; dispatched by name from /-prefixed messages)
+  · SYSTEM_PROMPT — static prompts rendered once into the frozen system block
+  · LLM_CONTEXT — volatile team state, one per-turn **Context update** block
+  · COMMAND — commands via a CommandRegistry, dispatched from /-prefixed messages
 - TeamTool auto-injected if not already in config.tools
 - ReactAgent.run_sync(output_type=...) — act() forwards the caller's type;
   receiveMsg_AgentMessage asks for StructuredOutput, so the team path stays
@@ -78,10 +78,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       context history, REACT loop. Reasoning turns go through run_sync();
       compact() and clear() bypass it — compact() is ReactAgent's own synchronous
       bridge onto the agent loop, clear() a plain wrapper over the context.
-    - ToolFactory (akgentic-tool): aggregates ToolCard[] into tools, system prompts,
-      and commands via 3-channel architecture (TOOL_CALL, SYSTEM_PROMPT, COMMAND).
+    - ToolFactory (akgentic-tool): aggregates ToolCard[] into tools, prompts, context
+      states and commands — TOOL_CALL, SYSTEM_PROMPT, LLM_CONTEXT, COMMAND.
     - TeamTool: auto-injected if absent from config.tools; provides hire/fire
-      capabilities and team awareness prompts.
+      capabilities and team-awareness context state.
 
     Observer Protocol:
     - Implements TeamManagementToolObserver (structural typing via @runtime_checkable)
@@ -123,9 +123,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     System Prompts (all registered in on_start; ReactAgent registers none):
     - agent_backstory (from AgentState.backstory)
     - current_date
-    - whatever ToolFactory.get_system_prompts() yields — from TeamTool, a team
-      roster and/or a role-profiles prompt, each only if SYSTEM_PROMPT is in that
-      capability's expose set
+    - whatever ToolFactory.get_system_prompts() yields — nothing on a default
+      card set: the roster, role profiles, planning and knowledge-graph
+      capabilities declare LLM_CONTEXT and arrive as context-update blocks
     - mailbox_notifications, only when the mailbox is non-empty at on_start
 
     Commands (programmatic, via CommandRegistry built in on_start):
@@ -154,9 +154,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Every dynamic system prompt is registered here, after construction, via
         @self._react_agent.system_prompt: agent_backstory, current_date, whatever
-        ToolFactory.get_system_prompts() yields (from TeamTool: a team roster
-        and/or a role-profiles prompt), and mailbox_notifications when the mailbox
-        is non-empty at start. ReactAgent contributes none of its own.
+        ToolFactory.get_system_prompts() yields (nothing on a default card set —
+        the volatile capabilities declare LLM_CONTEXT), and mailbox_notifications
+        when the mailbox is non-empty at start. ReactAgent registers none of its own.
 
         Tools (hire_members, fire_members) come from TeamTool.get_tools() as
         closures over the orchestrator proxy — not bound methods of this agent —
