@@ -12,6 +12,10 @@ Three outcomes, one per scenario the trust rules allow:
 - marker gone (compacted/cleared)  → a full snapshot, worded as current state
 - persisted counter behind the history → numbering catches up, baselines kept
 
+A fourth spec guards the property all three rest on: the slot is dereferenced on
+every call, never captured, so a delivery after ``init_state()`` follows the
+state that just arrived rather than the one it replaced.
+
 The agent under test is assembled the way ``test_context_self_healing.py``
 assembles one: no Pykka, a stubbed ``ReactAgent`` whose ``record_operator_action``
 appends a user-role message to a real history list, and a real ``ContextUpdater``
@@ -175,7 +179,7 @@ class TestRestoreWithEvictedMarker:
 
 
 # =============================================================================
-# AC 9 — a stale persisted counter catches up to the history
+# The slot is read live, never captured — the trap all of the above rests on
 # =============================================================================
 
 
@@ -209,6 +213,11 @@ class TestStateReplacedMidLife:
         ]
         assert blocks[1] == ("**Context update 1** — current state.\n\n**Team roster:**\n@Manager")
         assert agent.state.tool_state.context_update_seq == 1
+
+
+# =============================================================================
+# AC 9 — a stale persisted counter catches up to the history
+# =============================================================================
 
 
 class TestStalePersistedCounter:

@@ -30,6 +30,7 @@ from akgentic.llm import ContextManager, ReactAgent
 from akgentic.tool.core import ContextState, ContextUpdater
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig, AgentState
 
@@ -131,19 +132,38 @@ def _recorded_blocks(agent: BaseAgent) -> list[str]:
 
 class TestNoAgentSideBaselineState:
     def test_the_deleted_engine_members_are_gone(self) -> None:
-        """The agent keeps no baselines, no counter and no provider list."""
-        agent = _make_agent([_provider("team_roster_state", {"state": _RosterState()})])
+        """The deleted engine members, asserted where they would actually live.
 
+        The methods belong to the class and the marker pattern to the module,
+        so checking them there is what makes this spec falsifiable: restore the
+        engine and it goes red. The three deleted *instance* fields cannot be
+        checked on the bare fixture below — ``on_start`` is what used to create
+        them, and a fixture that never runs ``on_start`` would report them
+        absent either way. They are covered behaviourally instead: by the next
+        spec, and by the restore specs, which only pass while the counter lives
+        on the persisted slot.
+        """
         for gone in (
-            "_context_baselines",
-            "_context_update_seq",
-            "_context_state_providers",
             "_verify_context_baselines",
             "_iter_user_prompt_texts",
             "_render_context_section",
             "_compose_context_update",
         ):
-            assert not hasattr(agent, gone), f"BaseAgent still carries {gone}"
+            assert not hasattr(BaseAgent, gone), f"BaseAgent still carries {gone}"
+        assert not hasattr(agent_module, "_CONTEXT_UPDATE_MARKER"), (
+            "the marker pattern belongs to the engine's package now"
+        )
+
+    def test_delivery_caches_nothing_of_its_own_on_the_agent(self) -> None:
+        """A delivered turn leaves the updater as the agent's only context state."""
+        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
+        agent = _make_agent([_provider("team_roster_state", holder)])
+
+        agent._deliver_context_update()
+
+        assert {name for name in vars(agent) if name.startswith("_context")} == {
+            "_context_updater"
+        }
 
     def test_delivery_advances_the_persisted_slot_not_an_agent_field(self) -> None:
         """The counter and baselines advance on ``state.tool_state``."""

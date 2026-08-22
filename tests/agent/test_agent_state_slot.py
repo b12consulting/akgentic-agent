@@ -9,8 +9,9 @@ turn every restored delta into a full snapshot.
 
 from typing import Self
 
-from akgentic.agent.config import AgentState
 from akgentic.tool.core import ContextState, ToolState
+
+from akgentic.agent.config import AgentState
 
 
 class RosterState(ContextState):
