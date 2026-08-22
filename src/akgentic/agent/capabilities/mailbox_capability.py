@@ -29,6 +29,11 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.models import ModelRequestContext
 
 from akgentic.core.messages import CancelMessage, Message
+
+# The one symbol still taken from the tool package, and deliberately so: a
+# structural Protocol for the ``observer`` type hint, satisfied by core's own
+# ``Akgent.get_mailbox``. It carries no card dependency and does not weaken the
+# ownership above — the vocabulary below is defined here, not imported.
 from akgentic.tool.mailbox import MailboxToolObserver
 
 
