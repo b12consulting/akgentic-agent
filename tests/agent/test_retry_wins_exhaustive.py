@@ -42,7 +42,7 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
-from akgentic.agent.agent import BaseAgent
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -86,6 +86,9 @@ def _make_minimal_agent() -> BaseAgent:
     # context delivery, so a stub that composes nothing keeps act() alive.
     agent._context_updater = MagicMock()  # type: ignore[attr-defined]
     agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
+
+    # Mailbox capability normally built in _build_react_agent (Epic 20).
+    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"

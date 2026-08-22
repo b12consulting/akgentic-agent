@@ -18,7 +18,9 @@ import pytest
 from akgentic.core import ActorAddress
 from akgentic.core.agent import WarningError
 from akgentic.llm import AgentUsageLimitError, ReactAgent, RunUsageLimitError
+from pydantic import BaseModel
 
+from akgentic.agent.agent import RunInterruptedError
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.custom_agent import CustomAgent, Handoff, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
@@ -43,6 +45,12 @@ def _make_custom_agent() -> CustomAgent:
 
     agent._react_agent = MagicMock(spec=ReactAgent)  # type: ignore[attr-defined]
     agent._command_registry = MagicMock()  # type: ignore[attr-defined]
+    # Needed only by the specs that drive the REAL act(): a bare MagicMock
+    # answers has("_expand_media_refs") truthily, sending act() into media
+    # expansion over a MagicMock; and act()'s first statement resets the
+    # mailbox capability's run-local tracking.
+    agent._command_registry.has.return_value = False  # type: ignore[attr-defined]
+    agent._mailbox_capability = MagicMock()  # type: ignore[attr-defined]
     agent.team_id = uuid.uuid4()
 
     # The context updater normally built in on_start. These specs are not about
@@ -195,16 +203,79 @@ class TestCustomAgentRunTierBreach:
         agent.hire_member.assert_not_called()  # type: ignore[attr-defined]
 
 
+class TestCustomAgentRunInterruption:
+    """Epic 20 invariant 2 holds in the exemplar: no escape into the failure path.
+
+    The mailbox capability is built unconditionally by ``_build_react_agent``,
+    so every subclass run is interruptible — and the subclass supplies
+    **nothing** for it: ``act()`` absorbs the ``RunInterruptedError``, notifies
+    the human once and returns a default ``TriageOutput``.
+
+    Both specs drive the **real** ``act()``, with ``run_sync`` raising as the
+    mailbox capability would. Mocking ``act`` away would test the handler's own
+    catch, and there is none left to test.
+    """
+
+    def test_an_interrupted_run_notifies_and_routes_nothing(self) -> None:
+        agent = _make_custom_agent()
+        agent._react_agent.run_sync.side_effect = RunInterruptedError("cancelled")  # type: ignore[attr-defined]
+
+        agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
+
+        agent.notify_human.assert_called_once_with("Run interrupted.")  # type: ignore[attr-defined]
+        agent.send.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_act_hands_the_handler_a_default_triage_output(self) -> None:
+        """The caller is not told anything went wrong — it gets an empty triage.
+
+        ``TriageOutput`` constructs with no arguments because every field has a
+        default, which is exactly the condition ``act()`` relies on.
+        """
+        agent = _make_custom_agent()
+        agent._react_agent.run_sync.side_effect = RunInterruptedError("cancelled")  # type: ignore[attr-defined]
+
+        output = agent.act("assess this", TriageOutput)
+
+        assert isinstance(output, TriageOutput)
+        assert output.handoffs == []
+
+    def test_an_output_type_that_cannot_be_defaulted_re_raises_the_interruption(self) -> None:
+        """AC-2's honest bound: the caller sees the interruption, not a ValidationError."""
+
+        class _Mandatory(BaseModel):
+            verdict: str  # no default — TriageOutput's opposite
+
+        agent = _make_custom_agent()
+        interruption = RunInterruptedError("cancelled")
+        agent._react_agent.run_sync.side_effect = interruption  # type: ignore[attr-defined]
+
+        with pytest.raises(RunInterruptedError) as raised:
+            agent.act("assess this", _Mandatory)
+
+        assert raised.value is interruption
+        agent.notify_human.assert_called_once_with("Run interrupted.")  # type: ignore[attr-defined]
+
+
 class TestCustomAgentOverridesNothing:
     """The structural half of AC-5: the policy is applied, never re-implemented."""
 
-    def test_it_defines_only_its_own_router_and_handler(self) -> None:
+    def test_it_defines_only_its_own_router_handler_and_capability_hook(self) -> None:
+        """Its own work and one supported hook — no framework method re-implemented.
+
+        ``extra_capabilities`` is the third name because the exemplar contributes
+        a capability of its own; it is an *override point the framework offers*,
+        not a policy this class took over. The set stays exact rather than a
+        superset check, so a ``CustomAgent`` that started overriding ``act``,
+        ``_route_output`` or ``_build_react_agent`` still turns this red — which
+        is the whole claim.
+        """
         own = {
             name
             for name, value in vars(CustomAgent).items()
             if callable(value) and not name.startswith("__")
         }
-        assert own == {"_route_triage", "receiveMsg_TriageMessage"}
+        assert own == {"_route_triage", "receiveMsg_TriageMessage", "extra_capabilities"}
 
     def test_the_handler_itself_carries_no_error_handling(self) -> None:
         """Undecorated, the same breach escapes — so the guard is what catches it.

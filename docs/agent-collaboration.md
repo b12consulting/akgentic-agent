@@ -510,22 +510,41 @@ flowchart TD
 > the schema belongs to the caller. An output that resolved no recipient sent nothing, and a
 > conclusion that sent nothing is a failure, not a quiet success.
 
-### 5. Mailbox Notification
+### 5. Mailbox Visibility
 
-`on_start()` can register one more dynamic system prompt, `mailbox_notifications`, whose intent
-is to tell a busy agent that other team members are waiting:
+An agent sees its pending mail through two live surfaces (the former `mailbox_notifications`
+start-up system prompt is gone — the system block is frozen and carries no mailbox content).
+Mailbox awareness reaches the model through the mid-run arrival notice alone: `MailboxTool`
+serves no `LLM_CONTEXT`, a second card-side carrier having only narrated the same arrivals
+twice.
 
-```
-NOTICE: 2 new message(s) arrived in your mailbox from team member(s): @QA789, @Manager.
-Consider wrapping up the current thread to process them.
-```
+- **`read_mailbox` tool** (`TOOL_CALL` channel, provided by `MailboxTool`, auto-added beside
+  `TeamTool`) — a mid-run read of sender, type and full content of every pending message.
+  Reading **absorbs** them: everything it shows has been removed from the mailbox and is
+  **not** delivered again as its own turn, so the model must deal with it in that run.
+  Anything left unread stays queued and arrives as its own turn once the run ends. A pending
+  `/stop` or `CancelMessage` is never consumed by the read — the cancellation surface is left
+  intact for the hook below.
+- **The mid-run arrival notice** — mail arriving *while a run is in progress* is announced
+  once by `MailboxCapability.before_model_request`, through
+  `ctx.enqueue(notice, priority="asap")`. pydantic-ai's auto-injected drain capability
+  delivers the notice into the model request at the next step boundary and records it in the
+  durable history and the event store as its own user-role message — the transcript records
+  the ring, and that record is the audit trail. A notice enqueued at the run's last boundary
+  is not lost: the drain redirects through one final model request to deliver it.
 
-**Read the wiring before relying on it.** The prompt is registered only when
-`self.get_mailbox()` is non-empty *at `on_start()` time*, and the closure captures that call's
-**snapshot** — `get_mailbox()` builds a new list each time it is called, and it is called once.
-A message that arrives later does not change what the prompt reports, and on an agent whose
-mailbox was empty at start-up the prompt is never registered at all. In practice that is every
-agent, so this notification does not currently fire for messages arriving mid-run.
+The same hook enforces run cancellation: a pending `/stop` or `CancelMessage` is purged from
+the mailbox and then raises `RunInterruptedError` at the next step boundary, caught in `act()`
+— which notifies the human and returns a default output the router delivers as nothing, so no
+handler carries a catch.
+The run dies, the agent survives. The hook and the vocabulary it applies (`is_cancel`,
+`render_arrival_notice`) are both the agent's, defined in `akgentic.agent.capabilities` — not
+the card's. `BaseAgent` builds the capability unconditionally so an agent configured *without*
+`MailboxTool` is still interruptible, and such an agent has no card to borrow a predicate
+from. The card keeps its own surface: the consuming `read_mailbox` tool and the `/stop`
+registration whose string form `is_cancel` recognises without importing anything from
+the card. See the README's *Run Cancellation* section for the full flow and its stated
+limitations.
 
 ---
 
@@ -692,6 +711,10 @@ The fallback is what makes this safe to put in front of every message:
   original content. **No operator action is recorded** — the command never ran.
 - **Known command, bad arguments** (or the body raising) → caught *inside* `dispatch`, returned
   as a result string. Handled exactly like a success; never falls back to the LLM.
+- **A `None` result** → *handled, say nothing*. `_dispatch_command()` returns `True` at once:
+  no `notification` back to the sender and **no operator action recorded**. That is the
+  outcome for a command whose whole effect happens elsewhere, which an empty reply and a
+  second context entry would only double-report.
 
 ```python
 # From the human side — see examples/simple_team.py
@@ -707,7 +730,9 @@ subclasses of `UsageLimitError` — and they are told apart by class, never by r
 message text.
 
 **It is a decorator, not code inside the handler.** `receiveMsg_AgentMessage` carries no
-`try`/`except` of its own:
+`try`/`except` of its own at all — run cancellation is absorbed inside `act()` (see
+[Mailbox Visibility](#5-mailbox-visibility)), and the usage-limit ladder is entirely the
+decorator's:
 
 ```python
 @guard_usage_limits(output_type=StructuredOutput, route=_route_output)
@@ -836,16 +861,17 @@ class CustomAgent(BaseAgent):
 
     @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
-        """Handle one incident. No error handling of its own."""
-        self._route_triage(self.act(prompt, TriageOutput))
+        """Handle one incident. No try/except: act() owns the interruption."""
+        output = self.act(prompt, TriageOutput)
+        self._route_triage(output)
 ```
 
 What the subclass gets, and what it must supply:
 
 | | |
 |---|---|
-| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing; `@guard_usage_limits` — the tier policy; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
-| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output |
+| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing, and absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`), so no handler writes a catch; `@guard_usage_limits` — the tier policy; `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
+| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first |
 
 A run-tier breach in `CustomAgent` therefore concludes in **`TriageOutput`** and is delivered
 by **`_route_triage`**, with `CustomAgent` overriding nothing — because the schema and the
@@ -886,7 +912,7 @@ Do not finish your turn if the plan is stale."""
 )
 tools = [planning_tool]  # add search_tool, knowledge_graph, etc. as needed
 
-# TeamTool is NOT listed here — it is auto-injected by BaseAgent
+# TeamTool and MailboxTool are NOT listed here — both are auto-injected by BaseAgent
 
 # `role` is NOT an AgentCard constructor keyword — AgentCard.role is a read-only
 # property reading config.role. Passing role= here would be silently ignored.
@@ -1031,10 +1057,11 @@ StructuredOutput(messages=[
 
 2. **Let `TeamTool` handle team awareness — don't duplicate it in prompts**
 
-   `TeamTool` is auto-injected and provides `GetTeamRoster` and
-   `GetRoleProfiles` as dynamic system prompts, giving the LLM live team and
-   role visibility. Writing team member lists in prompts is redundant and will
-   drift out of date:
+   `TeamTool` is auto-injected — as is `MailboxTool` — and provides
+   `GetTeamRoster` and `GetRoleProfiles` on the `LLM_CONTEXT` channel, so they
+   arrive in the per-turn **Context update** block rather than in the frozen
+   system prompt, giving the LLM live team and role visibility. Writing team
+   member lists in prompts is redundant and will drift out of date:
 
    ```python
    # Wrong: hard-codes team members the LLM can already see
@@ -1136,13 +1163,16 @@ StructuredOutput(messages=[
 4. **Don't skip the `PlanningTool` for multi-step work**
 
    Without a shared plan, agents lack visibility into what others are doing.
-   The `SYSTEM_PROMPT` channel ensures every agent sees the current task
-   list — this is how agents coordinate implicitly without direct messaging.
+   The `LLM_CONTEXT` channel ensures every agent sees the current task list:
+   the planning summary arrives in the per-turn **Context update** block, not
+   in the frozen system prompt — this is how agents coordinate implicitly
+   without direct messaging.
 
 5. **Don't add `TeamTool` to `config.tools` manually (unless customizing it)**
 
-   `BaseAgent.on_start()` auto-injects `TeamTool` if absent. Adding it
-   explicitly is only needed when overriding defaults (e.g., disabling hire):
+   `BaseAgent.on_start()` auto-injects `TeamTool` if absent, and `MailboxTool`
+   the same way. Adding either explicitly is only needed when overriding
+   defaults (e.g., disabling hire):
 
    ```python
    # Only if you want to disable hiring:
@@ -1313,7 +1343,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Entry point for all incoming messages. Intercepts "/"-prefixed content as
         a command; otherwise prepends the REPLY_PROTOCOLS line for message.type,
         runs one act() turn and routes the result. It carries no try/except of
-        its own — the decorator owns the usage-limit policy.
+        its own: a queued /stop or CancelMessage is absorbed inside act(), which
+        notifies the human and returns an empty StructuredOutput, so the routing
+        delivers nothing and the handler returns normally. The decorator owns
+        the usage-limit policy.
         A breach is handled by tier, told apart by exception class and never by
         message text. A run-tier breach (RunUsageLimitError — this turn ran out of
         its own budget) first attempts one tool-free conclusion, delivered to the
@@ -1323,6 +1356,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         attempt, notify_human(), then WarningError. A conclusion that delivers
         nothing falls through to the same escalation, reporting the original
         breach. Usage-limit errors are the only ones the decorator catches.
+
+    receiveMsg_CancelMessage(message, sender) -> None
+        Acknowledge a CancelMessage dequeued while the agent is idle — a logged
+        no-op. Cancellation is enforced mid-run by the mailbox peek inside
+        MailboxCapability, not by this handler; by the time a cancel is
+        dequeued and lands here there is nothing to cancel.
 
     hire_member(role) -> ActorAddress
         Hire by role through the registry's typed hire_member command.

@@ -31,7 +31,7 @@ from akgentic.tool.core import ContextState, ContextUpdater
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import akgentic.agent.agent as agent_module
-from akgentic.agent.agent import BaseAgent
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig, AgentState
 
 # =============================================================================
@@ -117,6 +117,9 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     agent._context_updater = ContextUpdater(  # type: ignore[attr-defined]
         agent, providers or []
     )
+
+    # Mailbox capability normally built in _build_react_agent (Epic 20).
+    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
     return agent
 
 
