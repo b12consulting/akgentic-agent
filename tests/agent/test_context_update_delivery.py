@@ -108,9 +108,22 @@ def _raising_provider(name: str) -> Callable[[], Any]:
 
 
 def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
-    """Bare BaseAgent (no Pykka) with a stubbed ReactAgent and given providers."""
+    """Bare BaseAgent (no Pykka) with a stubbed ReactAgent and given providers.
+
+    The stubbed context carries a real ``messages`` list, and its
+    ``record_operator_action`` appends each delivered block as a user-role
+    message (the post-first-run shape) — so the 19-2 presence check finds the
+    marker on later turns exactly as it would against the real ContextManager.
+    """
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
     agent: BaseAgent = object.__new__(BaseAgent)
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
+    messages: list[Any] = []
+    agent._react_agent.context.messages = messages  # type: ignore[attr-defined]
+    agent._react_agent.context.record_operator_action.side_effect = (  # type: ignore[attr-defined]
+        lambda entry: messages.append(ModelRequest(parts=[UserPromptPart(content=entry)]))
+    )
 
     registry = MagicMock()
     registry.has.return_value = False
@@ -438,7 +451,9 @@ class TestOnStartCollection:
 
         class _CapturingReactAgent:
             def __init__(self, **kwargs: object) -> None:
-                self.context = SimpleNamespace(record_operator_action=recorded.append)
+                self.context = SimpleNamespace(
+                    record_operator_action=recorded.append, messages=[]
+                )
 
             def system_prompt(self, fn: object) -> object:
                 return fn

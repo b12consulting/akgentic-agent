@@ -29,12 +29,14 @@ Architecture:
 import logging  # noqa: I001
 import os
 import random
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from time import sleep
 from typing import Any, TypeVar, cast
 
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
@@ -61,6 +63,11 @@ logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
+
+# The Context update marker line (ADR-037 §6). The numbered pattern recovers the
+# block counter from a restored history; the presence check uses the exact
+# per-sequence substring instead.
+_CONTEXT_UPDATE_MARKER = re.compile(r"\*\*Context update (\d+)\*\*")
 
 
 class BaseAgent(Akgent[AgentConfig, AgentState]):
@@ -404,7 +411,17 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         appends nothing, so an unchanged turn stays byte-identical for the
         prompt cache. Context construction never raises (see
         ``_render_context_section`` for the per-provider degradation).
+
+        Before any provider is read, ``_verify_context_baselines`` checks that
+        the last delivered block is still visible to the model and drops the
+        baselines when it is not, so every eviction path (compaction, window
+        trimming, restore, out-of-band wipe) self-heals with a full snapshot.
+        ``full_snapshot`` is captured right after that check — a no-change
+        delta advances a baseline mid-loop, so the wording flag must be taken
+        before the providers are read.
         """
+        self._verify_context_baselines()
+        full_snapshot = not self._context_baselines
         sections: list[str] = []
         advanced: dict[str, ContextState] = {}
         for provider in self._context_state_providers:
@@ -416,10 +433,64 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             advanced[provider.__name__] = state
         if not sections:
             return
-        block = self._compose_context_update(sections)
+        block = self._compose_context_update(sections, full_snapshot)
         self._react_agent.context.record_operator_action(block)
         self._context_baselines.update(advanced)
         self._context_update_seq += 1
+
+    def _verify_context_baselines(self) -> None:
+        """Trust the baselines only while the last delivered marker is visible.
+
+        A delta is only correct relative to a baseline the model can still see
+        (ADR-037 §7). When a block has been delivered (``seq > 0``), its exact
+        marker substring must appear in the user-role prompt parts of the
+        context history; a miss — compaction (manual or automatic), sliding-
+        window trimming, any out-of-band wipe — drops **every** baseline so the
+        next block is a full snapshot. The counter is never reset on a miss:
+        ``N`` stays monotonic, because a partially trimmed history may still
+        show older numbers.
+
+        On a fresh life (``seq == 0`` — baselines are never persisted), the
+        counter is instead recovered as the highest marker number found in the
+        restored history, so the next block continues the sequence as ``N+1``
+        rather than re-emitting a number the model may already see. Baselines
+        stay empty either way — a restored agent re-delivers a full snapshot,
+        never silently adopts current state as a baseline (a lost baseline may
+        only cause a re-send, never a lost update).
+        """
+        if self._context_update_seq > 0:
+            marker = f"**Context update {self._context_update_seq}**"
+            if not any(marker in text for text in self._iter_user_prompt_texts()):
+                self._context_baselines.clear()
+            return
+        highest = 0
+        for text in self._iter_user_prompt_texts():
+            for match in _CONTEXT_UPDATE_MARKER.finditer(text):
+                highest = max(highest, int(match.group(1)))
+        self._context_update_seq = highest
+
+    def _iter_user_prompt_texts(self) -> Iterator[str]:
+        """Yield the user-prompt text of the context history, one lazy pass.
+
+        Scan scope is deliberately narrow: only ``UserPromptPart`` content on
+        ``ModelRequest`` messages — a ``str`` content directly, the ``str``
+        items of a multimodal ``list`` content otherwise. Tool returns,
+        retry prompts, system prompts and ``ModelResponse`` messages are never
+        inspected (a model echoing the marker must not count), and nothing is
+        concatenated. Never construct a ``ModelRequest`` here or anywhere
+        outside ``record_operator_action`` — appending one is the retired
+        ADR-007 defect; these imports exist for ``isinstance`` checks only.
+        """
+        for message in self._react_agent.context.messages:
+            if not isinstance(message, ModelRequest):
+                continue
+            for part in message.parts:
+                if not isinstance(part, UserPromptPart):
+                    continue
+                if isinstance(part.content, str):
+                    yield part.content
+                elif isinstance(part.content, list):
+                    yield from (item for item in part.content if isinstance(item, str))
 
     def _render_context_section(
         self, provider: Callable[[], ContextState | None]
@@ -467,21 +538,23 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             return None
         return rendering, state
 
-    def _compose_context_update(self, sections: list[str]) -> str:
+    def _compose_context_update(self, sections: list[str], full_snapshot: bool) -> str:
         """Compose one Context update block: marker line + verbatim sections.
 
         The marker is ``**Context update N**`` with a fixed suffix — worded as
-        current state for the first block of the agent's life (every section is
-        a full render then), as change otherwise. Nothing turn-varying beyond
-        ``N`` may appear: a timestamp or "as of" line would defeat the cache
-        property this epic exists for. Sections are joined to the marker and to
-        each other with blank lines, never re-wrapped — the renderers own their
-        internal join style.
+        current state when the baselines were empty as delivery began (first
+        block of a life, post-``/clear``, post-eviction, post-restore: every
+        section renders full then), as change only when the block was diffed
+        against surviving baselines. Both suffixes are fixed strings — nothing
+        turn-varying beyond ``N`` may appear: a timestamp or "as of" line would
+        defeat the cache property this epic exists for. Sections are joined to
+        the marker and to each other with blank lines, never re-wrapped — the
+        renderers own their internal join style.
         """
         number = self._context_update_seq + 1
         suffix = (
             "current state."
-            if self._context_update_seq == 0
+            if full_snapshot
             else "state has changed since the last update."
         )
         marker = f"**Context update {number}** — {suffix}"
@@ -704,5 +777,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         return self._react_agent.compact()
 
     def clear(self) -> str:
-        """Clear this agent's conversation; the system prompt regenerates on the next run."""
-        return self._react_agent.clear_context()
+        """Clear this agent's conversation; the system prompt regenerates on the next run.
+
+        Also drops the context-update baselines and resets the block counter:
+        the emptied history has no markers left to continue, so the next block
+        is ``**Context update 1**`` — a full snapshot of current state.
+        ``compact()`` deliberately gets no such reset — the presence check in
+        ``_verify_context_baselines`` catches a folded-away block, including
+        the automatic compaction a ``compact()`` hook would miss entirely.
+        """
+        result = self._react_agent.clear_context()
+        self._context_baselines.clear()
+        self._context_update_seq = 0
+        return result
