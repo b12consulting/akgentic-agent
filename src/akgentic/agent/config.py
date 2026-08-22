@@ -23,7 +23,7 @@ from akgentic.llm.config import (
     UsageLimits,
 )
 from akgentic.llm.prompts import PromptTemplate
-from akgentic.tool.core import ToolCard
+from akgentic.tool.core import ToolCard, ToolState
 
 _SHIM_REMOVAL_RELEASE = "akgentic-agent 2.0.0"
 
@@ -168,8 +168,23 @@ class AgentState(BaseState):
     Stores the agent's backstory (resolved from config prompt) and
     maintains state change notifications for observers.
 
+    Carrying ``tool_state`` is also what makes this model satisfy the tool
+    layer's ``ToolStateCarrier`` protocol — structurally, with no method, no
+    property and no import edge beyond the field's own type.
+
     Attributes:
         backstory: Resolved backstory/system prompt from config
+        tool_state: The tool layer's persistent per-agent slot — context-update
+            baselines and the block counter. It is a **cache, never a record**:
+            the message history is the record, so a lost or stale slot can only
+            cost a full-snapshot re-send, never a lost update. Mutated in place
+            by ``akgentic.tool.core.ContextUpdater``; the existing
+            ``notify_if_changed()`` checkpoints pick that up, because change
+            detection compares serializations rather than reading a dirty flag.
+            Never hold a reference to it across ``init_state()`` — restore
+            replaces the whole state object, so a cached handle goes silently
+            stale. Read it through ``self.state`` every time.
     """
 
     backstory: str
+    tool_state: ToolState = Field(default_factory=ToolState)

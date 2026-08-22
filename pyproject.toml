@@ -24,7 +24,7 @@ dependencies = [
     "pydantic-ai>=2,<3",
     "akgentic-core>=1.5.7",
     "akgentic-llm>=2.0.2",
-    "akgentic-tool>=1.6.4",
+    "akgentic-tool>=1.6.6",
 ]
 
 [project.optional-dependencies]

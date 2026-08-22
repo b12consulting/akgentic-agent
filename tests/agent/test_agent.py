@@ -70,10 +70,10 @@ def _make_minimal_agent(name: str = "@TestAgent", media_cmd: Any = None) -> Base
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
     agent._current_message = _make_mock_message()  # type: ignore[attr-defined]
 
-    # Context-state delivery attributes normally set by on_start (Epic 19).
-    agent._context_state_providers = []  # type: ignore[attr-defined]
-    agent._context_baselines = {}  # type: ignore[attr-defined]
-    agent._context_update_seq = 0  # type: ignore[attr-defined]
+    # The context updater normally built in on_start. These specs are not about
+    # context delivery, so a stub that composes nothing keeps act() alive.
+    agent._context_updater = MagicMock()  # type: ignore[attr-defined]
+    agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = name

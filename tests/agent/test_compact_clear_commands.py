@@ -24,8 +24,11 @@ def _bare_agent_with_stubbed_llm() -> BaseAgent:
     """Bare BaseAgent (no Pykka actor system) with a stubbed ReactAgent."""
     agent: BaseAgent = object.__new__(BaseAgent)
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
-    agent._context_baselines = {}  # type: ignore[attr-defined]
-    agent._context_update_seq = 0  # type: ignore[attr-defined]
+    # clear() resets through the updater; these specs assert delegation only —
+    # the reset's effect on state.tool_state is covered in
+    # test_context_self_healing.py::TestClearReset.
+    agent._context_updater = MagicMock()  # type: ignore[attr-defined]
+    agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
     return agent
 
 
