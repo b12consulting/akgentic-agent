@@ -5,11 +5,11 @@ with team-specific message handling and a static structured-output schema.
 Architecture:
 - Extends Akgent[AgentConfig, AgentState] from akgentic-core (pykka actor model)
 - Composes ReactAgent (akgentic-llm) for model, http client, context, usage limits
-- Composes ToolFactory (akgentic-tool) aggregating ToolCard[] into 3 channels:
+- Composes ToolFactory (akgentic-tool) aggregating ToolCard[] into 4 channels:
   · TOOL_CALL — LLM-callable tools (hire_members, fire_members, + config.tools)
-  · SYSTEM_PROMPT — dynamic prompts (TeamTool yields team_roster, role_profiles)
-  · COMMAND — programmatic commands exposed via a generic CommandRegistry
-    (built once in on_start; dispatched by name from /-prefixed messages)
+  · SYSTEM_PROMPT — static prompts rendered once into the frozen system block
+  · LLM_CONTEXT — volatile team state, one per-turn **Context update** block
+  · COMMAND — commands via a CommandRegistry, dispatched from /-prefixed messages
 - TeamTool auto-injected if not already in config.tools
 - ReactAgent.run_sync(output_type=...) — act() forwards the caller's type;
   receiveMsg_AgentMessage asks for StructuredOutput, so the team path stays
@@ -29,11 +29,14 @@ Architecture:
 import logging  # noqa: I001
 import os
 import random
+import re
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from time import sleep
 from typing import Any, TypeVar, cast
 
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
@@ -50,7 +53,7 @@ from akgentic.llm import (
     UserPrompt,
     aggregate_usage,
 )
-from akgentic.tool.core import CommandRegistry, ToolFactory
+from akgentic.tool.core import CommandRegistry, ContextState, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
 from akgentic.tool.team import TeamTool
@@ -61,6 +64,11 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# The Context update marker line (ADR-037 §6). The numbered pattern recovers the
+# block counter from a restored history; the presence check uses the exact
+# per-sequence substring instead.
+_CONTEXT_UPDATE_MARKER = re.compile(r"\*\*Context update (\d+)\*\*")
+
 
 class BaseAgent(Akgent[AgentConfig, AgentState]):
     """LLM-powered team agent with delegation and collaboration capabilities.
@@ -70,10 +78,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       context history, REACT loop. Reasoning turns go through run_sync();
       compact() and clear() bypass it — compact() is ReactAgent's own synchronous
       bridge onto the agent loop, clear() a plain wrapper over the context.
-    - ToolFactory (akgentic-tool): aggregates ToolCard[] into tools, system prompts,
-      and commands via 3-channel architecture (TOOL_CALL, SYSTEM_PROMPT, COMMAND).
+    - ToolFactory (akgentic-tool): aggregates ToolCard[] into tools, prompts, context
+      states and commands — TOOL_CALL, SYSTEM_PROMPT, LLM_CONTEXT, COMMAND.
     - TeamTool: auto-injected if absent from config.tools; provides hire/fire
-      capabilities and team awareness prompts.
+      capabilities and team-awareness context state.
 
     Observer Protocol:
     - Implements TeamManagementToolObserver (structural typing via @runtime_checkable)
@@ -115,9 +123,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     System Prompts (all registered in on_start; ReactAgent registers none):
     - agent_backstory (from AgentState.backstory)
     - current_date
-    - whatever ToolFactory.get_system_prompts() yields — from TeamTool, a team
-      roster and/or a role-profiles prompt, each only if SYSTEM_PROMPT is in that
-      capability's expose set
+    - whatever ToolFactory.get_system_prompts() yields — nothing on a default
+      card set: the roster, role profiles, planning and knowledge-graph
+      capabilities declare LLM_CONTEXT and arrive as context-update blocks
     - mailbox_notifications, only when the mailbox is non-empty at on_start
 
     Commands (programmatic, via CommandRegistry built in on_start):
@@ -146,9 +154,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Every dynamic system prompt is registered here, after construction, via
         @self._react_agent.system_prompt: agent_backstory, current_date, whatever
-        ToolFactory.get_system_prompts() yields (from TeamTool: a team roster
-        and/or a role-profiles prompt), and mailbox_notifications when the mailbox
-        is non-empty at start. ReactAgent contributes none of its own.
+        ToolFactory.get_system_prompts() yields (nothing on a default card set —
+        the volatile capabilities declare LLM_CONTEXT), and mailbox_notifications
+        when the mailbox is non-empty at start. ReactAgent registers none of its own.
 
         Tools (hire_members, fire_members) come from TeamTool.get_tools() as
         closures over the orchestrator proxy — not bound methods of this agent —
@@ -202,6 +210,17 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 commands=self._command_registry.descriptors(),
             )
         )
+
+        # ── Context-state providers (LLM_CONTEXT channel) ──────────────────────
+        # Collected once for the agent's lifetime, like the command registry.
+        # Baselines are an in-memory cache keyed by provider __name__ — never
+        # persisted: the message history is the record, and a lost baseline can
+        # only cause a full-snapshot re-send, never a lost update.
+        self._context_state_providers: list[Callable[[], ContextState | None]] = (
+            tool_factory.get_context_states()
+        )
+        self._context_baselines: dict[str, ContextState] = {}
+        self._context_update_seq: int = 0
 
         self._react_agent = self._build_react_agent(react_agent_config, tools, toolsets)
 
@@ -358,6 +377,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 this method neither notifies anyone nor wraps them, and it does
                 not tell the tiers apart — the decorator does all of it.
         """
+        self._deliver_context_update()
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
         prompt: UserPrompt = user_content
         if self._command_registry.has("_expand_media_refs"):
@@ -375,6 +395,170 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         return cast(T, output)
 
+    def _deliver_context_update(self) -> None:
+        """Append at most one **Context update** block for this turn.
+
+        The single delivery site (called at the top of ``act()``, before
+        ``run_sync``): reads every context-state provider in factory order,
+        diffs against the in-memory baselines, composes at most one block, and
+        appends it through ``ContextManager.record_operator_action`` — the
+        buffer-vs-append decision stays with the context, so on a fresh agent
+        the first block is folded into the first run's user prompt instead of
+        suppressing system-prompt injection.
+
+        The baselines of contributing providers and the block counter advance
+        only when a block is actually appended; a turn with nothing to say
+        appends nothing, so an unchanged turn stays byte-identical for the
+        prompt cache. Context construction never raises (see
+        ``_render_context_section`` for the per-provider degradation).
+
+        Before any provider is read, ``_verify_context_baselines`` checks that
+        the last delivered block is still visible to the model and drops the
+        baselines when it is not, so every eviction path (compaction, window
+        trimming, restore, out-of-band wipe) self-heals with a full snapshot.
+        ``full_snapshot`` is captured right after that check — a no-change
+        delta advances a baseline mid-loop, so the wording flag must be taken
+        before the providers are read.
+        """
+        self._verify_context_baselines()
+        full_snapshot = not self._context_baselines
+        sections: list[str] = []
+        advanced: dict[str, ContextState] = {}
+        for provider in self._context_state_providers:
+            contribution = self._render_context_section(provider)
+            if contribution is None:
+                continue
+            rendering, state = contribution
+            sections.append(rendering)
+            advanced[provider.__name__] = state
+        if not sections:
+            return
+        block = self._compose_context_update(sections, full_snapshot)
+        self._react_agent.context.record_operator_action(block)
+        self._context_baselines.update(advanced)
+        self._context_update_seq += 1
+
+    def _verify_context_baselines(self) -> None:
+        """Trust the baselines only while the last delivered marker is visible.
+
+        A delta is only correct relative to a baseline the model can still see
+        (ADR-037 §7). When a block has been delivered (``seq > 0``), its exact
+        marker substring must appear in the user-role prompt parts of the
+        context history; a miss — compaction (manual or automatic), sliding-
+        window trimming, any out-of-band wipe — drops **every** baseline so the
+        next block is a full snapshot. The counter is never reset on a miss:
+        ``N`` stays monotonic, because a partially trimmed history may still
+        show older numbers.
+
+        On a fresh life (``seq == 0`` — baselines are never persisted), the
+        counter is instead recovered as the highest marker number found in the
+        restored history, so the next block continues the sequence as ``N+1``
+        rather than re-emitting a number the model may already see. Baselines
+        stay empty either way — a restored agent re-delivers a full snapshot,
+        never silently adopts current state as a baseline (a lost baseline may
+        only cause a re-send, never a lost update).
+        """
+        if self._context_update_seq > 0:
+            marker = f"**Context update {self._context_update_seq}**"
+            if not any(marker in text for text in self._iter_user_prompt_texts()):
+                self._context_baselines.clear()
+            return
+        highest = 0
+        for text in self._iter_user_prompt_texts():
+            for match in _CONTEXT_UPDATE_MARKER.finditer(text):
+                highest = max(highest, int(match.group(1)))
+        self._context_update_seq = highest
+
+    def _iter_user_prompt_texts(self) -> Iterator[str]:
+        """Yield the user-prompt text of the context history, one lazy pass.
+
+        Scan scope is deliberately narrow: only ``UserPromptPart`` content on
+        ``ModelRequest`` messages — a ``str`` content directly, the ``str``
+        items of a multimodal ``list`` content otherwise. Tool returns,
+        retry prompts, system prompts and ``ModelResponse`` messages are never
+        inspected (a model echoing the marker must not count), and nothing is
+        concatenated. Never construct a ``ModelRequest`` here or anywhere
+        outside ``record_operator_action`` — appending one is the retired
+        ADR-007 defect; these imports exist for ``isinstance`` checks only.
+        """
+        for message in self._react_agent.context.messages:
+            if not isinstance(message, ModelRequest):
+                continue
+            for part in message.parts:
+                if not isinstance(part, UserPromptPart):
+                    continue
+                if isinstance(part.content, str):
+                    yield part.content
+                elif isinstance(part.content, list):
+                    yield from (item for item in part.content if isinstance(item, str))
+
+    def _render_context_section(
+        self, provider: Callable[[], ContextState | None]
+    ) -> tuple[str, ContextState] | None:
+        """Compute one provider's section for this turn, or ``None`` for no section.
+
+        First-seen states — and states whose concrete type differs from their
+        baseline's (a card reconfigured mid-life) — render ``render_full()``;
+        otherwise ``render_delta(baseline)``. The rendering is used verbatim.
+
+        Degradation, never failure: a provider or renderer that raises is
+        logged and skipped without advancing its baseline; a ``None`` state or
+        an empty full rendering contributes nothing. A ``None`` delta means no
+        change, so the baseline may advance to the current (equal) state even
+        though no section is produced.
+
+        Returns:
+            The ``(rendering, state)`` pair to contribute, or ``None``.
+        """
+        name = provider.__name__
+        try:
+            state = provider()
+        except Exception:
+            logger.exception(
+                "[%s] context-state provider '%s' raised; skipped", self.config.name, name
+            )
+            return None
+        if state is None:
+            return None
+        baseline = self._context_baselines.get(name)
+        try:
+            if baseline is None or type(state) is not type(baseline):
+                rendering: str | None = state.render_full()
+            else:
+                rendering = state.render_delta(baseline)
+        except Exception:
+            logger.exception(
+                "[%s] context-state renderer '%s' raised; skipped", self.config.name, name
+            )
+            return None
+        if rendering is None:
+            self._context_baselines[name] = state
+            return None
+        if not rendering:
+            return None
+        return rendering, state
+
+    def _compose_context_update(self, sections: list[str], full_snapshot: bool) -> str:
+        """Compose one Context update block: marker line + verbatim sections.
+
+        The marker is ``**Context update N**`` with a fixed suffix — worded as
+        current state when the baselines were empty as delivery began (first
+        block of a life, post-``/clear``, post-eviction, post-restore: every
+        section renders full then), as change only when the block was diffed
+        against surviving baselines. Both suffixes are fixed strings — nothing
+        turn-varying beyond ``N`` may appear: a timestamp or "as of" line would
+        defeat the cache property this epic exists for. Sections are joined to
+        the marker and to each other with blank lines, never re-wrapped — the
+        renderers own their internal join style.
+        """
+        number = self._context_update_seq + 1
+        suffix = (
+            "current state."
+            if full_snapshot
+            else "state has changed since the last update."
+        )
+        marker = f"**Context update {number}** — {suffix}"
+        return "\n\n".join([marker, *sections])
 
     def _route_output(self, output: StructuredOutput) -> bool:
         """Send one AgentMessage per Request — the class's single routed send path.
@@ -521,12 +705,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     def _record_operator_action(self, entry: str) -> None:
         """Hand one out-of-band, user-role entry to the LLM ContextManager.
 
-        The single point where this class writes something the agent did not say
-        itself into its own history. Its one caller today is
-        :meth:`_dispatch_command`, for a human's slash command. The wording of the
-        entry belongs to the caller, so a second kind of out-of-band event can
-        never be framed as the first; the buffer-vs-append decision belongs to the
-        context (ADR-007 §3) and is not reimplemented here.
+        One of two points where this class writes non-agent content into its own
+        history — the sibling is the context-update delivery at the top of
+        :meth:`act`, which calls the context primitive directly. Its one caller
+        today is :meth:`_dispatch_command`, for a human's slash command; the
+        wording of the entry belongs to the caller, and the buffer-vs-append
+        decision belongs to the context (ADR-007 §3), not reimplemented here.
 
         Args:
             entry: The pre-composed entry text.
@@ -593,5 +777,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         return self._react_agent.compact()
 
     def clear(self) -> str:
-        """Clear this agent's conversation; the system prompt regenerates on the next run."""
-        return self._react_agent.clear_context()
+        """Clear this agent's conversation; the system prompt regenerates on the next run.
+
+        Also drops the context-update baselines and resets the block counter:
+        the emptied history has no markers left to continue, so the next block
+        is ``**Context update 1**`` — a full snapshot of current state.
+        ``compact()`` deliberately gets no such reset — the presence check in
+        ``_verify_context_baselines`` catches a folded-away block, including
+        the automatic compaction a ``compact()`` hook would miss entirely.
+        """
+        result = self._react_agent.clear_context()
+        self._context_baselines.clear()
+        self._context_update_seq = 0
+        return result

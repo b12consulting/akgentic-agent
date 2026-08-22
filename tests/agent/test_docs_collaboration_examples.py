@@ -114,6 +114,11 @@ def _make_agent(
     agent._current_message = None
     agent.team_id = uuid.uuid4()
 
+    # Context-state delivery attributes normally set by on_start (Epic 19).
+    agent._context_state_providers = []
+    agent._context_baselines = {}
+    agent._context_update_seq = 0
+
     config = MagicMock(spec=AgentConfig)
     config.name = name
     setattr(agent, "config", config)

@@ -44,6 +44,7 @@ HumanProxy ──send()──► BaseAgent (Manager)
                              │
                     act(prompt, StructuredOutput)
                       │
+                      ├─ append **Context update N** block (if shared state changed)
                       ├─ expand !!glob_pattern refs (if WorkspaceTool present)
                       └─ ReactAgent.run_sync(prompt, output_type=StructuredOutput)
                              │
@@ -616,16 +617,51 @@ Runtime state extending `BaseState`:
 
 ## Tool Channels
 
-`ToolFactory` organises tool cards into three channels:
+`ToolFactory` organises tool cards into four channels:
 
 | Channel | Consumer | Examples |
 |---|---|---|
 | `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `web_search()`, `workspace_read()` |
-| `SYSTEM_PROMPT` | LLM system prompt (per call) | team roster, role profiles, backstory, mailbox notifications |
+| `SYSTEM_PROMPT` | LLM system prompt — rendered into the frozen system block | backstory, current date |
+| `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary |
 | `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary` |
 
 `TeamTool` is always prepended to `config.tools` if not already present, ensuring every
 `BaseAgent` can hire and fire members.
+
+### Context updates
+
+Volatile, team-shared state — the roster, role profiles, planning, the knowledge-graph summary —
+never enters the system prompt: the system block holds the backstory and the current date only, and
+stays byte-identical run to run so the prompt-cache prefix survives. Instead, before each run the
+agent appends **at most one block** at the tail of the conversation carrying what changed since the
+last block it delivered.
+
+The block opens with a marker line, `**Context update N**`, followed by one of two **fixed**
+suffixes:
+
+```
+**Context update N** — current state.
+**Context update N** — state has changed since the last update.
+```
+
+- `N` is monotonic per agent and advances only when a block is actually appended.
+- The *current state* wording is used when the agent holds no diff baselines as delivery begins —
+  the first block of an agent's life, and any block after `/clear`, a restore, or an eviction. Every
+  section in such a block is a full snapshot.
+- The *state has changed* wording is used when the block was diffed against surviving baselines:
+  its sections are deltas, plus a full rendering for any provider contributing for the first time.
+- **When nothing changed, nothing is appended** — an idle turn adds only the user's own message.
+
+The mechanism is self-healing. Before trusting its baselines the agent verifies that its last
+delivered marker is still visible in the history; when it is not — after a restore, `/clear`,
+compaction (manual or automatic), or sliding-window trimming — the next block is a fresh full
+snapshot. `clear()` additionally resets the baselines and the counter (the next block is
+`**Context update 1** — current state.`); `compact()` needs no reset of its own — the presence
+check catches a compacted-away block either way.
+
+In the transcript, context-update blocks appear as **user-role messages**, the same way operator
+actions do. The marker line is the stable handle for finding, collapsing, or styling them.
 
 ### The Command Registry
 
