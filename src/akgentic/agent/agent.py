@@ -18,9 +18,14 @@ Architecture:
   schema-driven
 - get_output_type() applied inside ReactAgent.run() — no leakage into BaseAgent
 - Implements TeamManagementToolObserver protocol (structural typing)
-- One message handler of its own, receiveMsg_AgentMessage: all team traffic is
-  AgentMessage, so there is no per-message-type handler set here. Akgent still
+- Two message handlers of its own: receiveMsg_AgentMessage carries all team
+  traffic (every message is an AgentMessage), and receiveMsg_CancelMessage
+  acknowledges a cancel that lands while the agent is idle. Akgent still
   contributes the lifecycle handler receiveMsg_StopRecursively
+- Run cancellation (ADR-040): MailboxCancelCapability peeks the mailbox before
+  every model request and raises RunInterruptedError on a pending /stop or
+  CancelMessage; receiveMsg_AgentMessage catches it around act(), notifies the
+  human and routes nothing — the run dies, the agent survives
 - The usage-limit tier policy is applied, not written here: the handler carries
   @guard_usage_limits(output_type=..., route=...) from usage_limits.py. See
   custom_agent.py for a second agent class doing the same with its own schema
@@ -31,11 +36,15 @@ Architecture:
 import logging  # noqa: I001
 import os
 import random
+import uuid
 from datetime import datetime, timezone
 from time import sleep
 from typing import Any, TypeVar, cast
 
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.models import ModelRequestContext
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
@@ -43,7 +52,7 @@ from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 from akgentic.core import ActorAddress, Akgent, Orchestrator
-from akgentic.core.messages import EventMessage
+from akgentic.core.messages import CancelMessage, EventMessage
 from akgentic.llm import (
     AgentUsageSummary,
     LlmUsageEvent,
@@ -55,7 +64,12 @@ from akgentic.llm import (
 from akgentic.tool.core import CommandRegistry, ContextUpdater, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
-from akgentic.tool.mailbox import MailboxTool
+from akgentic.tool.mailbox import (
+    MailboxTool,
+    MailboxToolObserver,
+    is_cancel,
+    render_arrival_notice,
+)
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace.readers import MediaContent
 
@@ -63,6 +77,82 @@ logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
+
+
+class RunInterruptedError(Exception):
+    """The current run was cancelled by a /stop or CancelMessage.
+
+    Raised by ``MailboxCancelCapability.before_model_request`` at the next step
+    boundary once a cancel is pending in the mailbox (ADR-040 §5). Carries a
+    message only. It must never escape a message handler: an escape ends the
+    turn through the actor failure path (``Akgent._handle_failure`` — an
+    ErrorMessage to the orchestrator; actor death under stock pykka) instead
+    of the designed clean end. ``receiveMsg_AgentMessage`` owns the catch
+    around ``act()`` so the *run* dies while the *agent* carries on cleanly.
+    """
+
+
+class MailboxCancelCapability(AbstractCapability[Any]):
+    """Mailbox-driven run cancellation and mid-run arrival notice (ADR-040 §5).
+
+    One instance per agent, built unconditionally by ``BaseAgent`` — never
+    contributed by a card, so cancellation cannot be de-configured by omitting
+    ``MailboxTool``. The card owns the *vocabulary* (``is_cancel``,
+    ``render_arrival_notice``); the agent owns the *enforcement*.
+
+    ``before_model_request`` fires before EVERY model request inside the REACT
+    loop, bracketing every tool call and reasoning step — exactly the
+    granularity cancellation needs. On each firing, in order:
+
+    1. Cancel check — any pending message matching ``is_cancel`` raises
+       ``RunInterruptedError``. The mailbox is the cancellation's single
+       source of truth: no flag, no consumed marker — recognising the cancel
+       and consuming it are the same dequeue, performed later by the actor
+       loop.
+    2. Arrival notice — pending messages not yet announced in this run are
+       announced by appending one fresh trailing
+       ``ModelRequest([UserPromptPart(...)])`` to the hook's ``messages``
+       list. That list is a shallow copy of the durable history, so the
+       append is ephemeral by construction: it reaches the provider and
+       nothing else. Existing messages are never mutated (their parts are
+       shared with durable history) and ``ctx.enqueue()`` is never used (the
+       drain capability would inject durably). The debug log line at
+       injection time is the only audit trail that the doorbell rang.
+
+    Announced-id tracking is run-local: the instance lives for the agent's
+    lifetime, so ``act()`` resets the set at each run start. A backlog
+    re-announced next run is acceptable; a leak of announced ids across runs
+    is not.
+    """
+
+    def __init__(self, observer: MailboxToolObserver) -> None:
+        self._observer = observer
+        self._announced_ids: set[uuid.UUID] = set()
+
+    def reset_run_tracking(self) -> None:
+        """Forget which arrivals this run announced (called at each run start)."""
+        self._announced_ids.clear()
+
+    async def before_model_request(
+        self, ctx: RunContext[Any], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        """Raise on a pending cancel, else announce mailbox growth ephemerally."""
+        pending = self._observer.get_mailbox()
+        if any(is_cancel(message) for message in pending):
+            raise RunInterruptedError(
+                "The current run was cancelled by a queued /stop or CancelMessage."
+            )
+        new_messages = [m for m in pending if m.id not in self._announced_ids]
+        if new_messages:
+            notice = render_arrival_notice(new_messages)
+            request_context.messages.append(ModelRequest(parts=[UserPromptPart(content=notice)]))
+            self._announced_ids.update(message.id for message in new_messages)
+            logger.debug(
+                "Mid-run arrival notice injected into the next model request "
+                "(%d new message(s); ephemeral — absent from durable history)",
+                len(new_messages),
+            )
+        return request_context
 
 
 class BaseAgent(Akgent[AgentConfig, AgentState]):
@@ -80,6 +170,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     - MailboxTool: auto-injected if absent from config.tools; provides mailbox
       status as LLM_CONTEXT state, the read_mailbox peek tool, and the /stop
       command. A card supplied in config.tools wins over the default.
+    - MailboxCancelCapability: built unconditionally in _build_react_agent (no
+      card involvement, no MailboxTool presence check) and handed to the
+      ReactAgent via capabilities= — the cancel check and the mid-run arrival
+      notice before every model request. act() resets its run-local tracking.
 
     Observer Protocol:
     - Implements TeamManagementToolObserver (structural typing via @runtime_checkable)
@@ -94,11 +188,20 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       team delegation path is schema-driven.
 
     Message Flow:
-    - receiveMsg_AgentMessage is the only handler this class defines (Akgent
-      contributes receiveMsg_StopRecursively). /-prefixed content is offered to
-      the CommandRegistry first; everything else — including a /-prefixed token
-      the registry does not recognise — is prefixed with the reply protocol for
-      its message type and run as one act() turn.
+    - This class defines two handlers: receiveMsg_AgentMessage for all team
+      traffic, and receiveMsg_CancelMessage acknowledging a cancel that lands
+      while idle (Akgent contributes receiveMsg_StopRecursively). /-prefixed
+      content is offered to the CommandRegistry first; everything else —
+      including a /-prefixed token the registry does not recognise — is
+      prefixed with the reply protocol for its message type and run as one
+      act() turn.
+    - A turn interrupted by a queued cancel (RunInterruptedError out of act())
+      is caught in receiveMsg_AgentMessage: notify_human("Run interrupted."),
+      nothing routed, normal return. The context arrives already healed —
+      akgentic-llm repairs dangling tool calls before re-raising — so the
+      handler performs no context surgery, and the agent survives to process
+      the next queued message (the dequeued /stop itself answers through
+      command dispatch).
     - That turn's StructuredOutput goes to _route_output(), which sends one
       AgentMessage per Request. A recipient starting with "@" resolves to an
       existing member; anything else is hired by role. A recipient that resolves
@@ -279,7 +382,17 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         token-free ``MockReactAgent`` for load testing; otherwise build the
         real ``ReactAgent``. The deferred import keeps the optional ``loadtest``
         extra off the normal runtime path.
+
+        Both branches receive exactly one capability, the
+        ``MailboxCancelCapability`` built here — unconditionally, on the agent
+        and never on a card, so cancellation works even when the config carries
+        no ``MailboxTool`` (ADR-040 §5). The mock accepts and ignores
+        ``capabilities=``; drop-in parity keeps this wiring identical.
         """
+        # Enforcement is agent-owned: held on self so act() can reset the
+        # run-local announced-id tracking at each run start.
+        self._cancel_capability = MailboxCancelCapability(observer=self)
+
         # Env var name mirrors akgentic.llm.loadtest.SCENARIO_ENV_VAR.
         scenario = os.environ.get("AKGENTIC_MOCK_SCENARIO")
         if scenario:
@@ -298,6 +411,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     tools=tools,
                     toolsets=toolsets,
                     observer=self,
+                    capabilities=[self._cancel_capability],
                 ),
             )
         return ReactAgent(
@@ -306,6 +420,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             tools=tools,
             toolsets=toolsets,
             observer=self,
+            capabilities=[self._cancel_capability],
         )
 
     def init_llm_context(self, context: list[EventMessage]) -> None:
@@ -374,6 +489,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             An instance of output_type, as produced by the REACT loop.
 
         Raises:
+            RunInterruptedError: A queued /stop or CancelMessage cancelled the
+                run at a step boundary. Propagates unchanged out of run_sync —
+                the context arrives already healed (akgentic-llm repairs
+                dangling tool calls before re-raising) — and is caught by the
+                calling handler. This method performs no context surgery.
             RunUsageLimitError: The turn exhausted its own budget. Recoverable —
                 the @guard_usage_limits decorator on the calling handler answers
                 it with a tool-free conclusion.
@@ -383,6 +503,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 this method neither notifies anyone nor wraps them, and it does
                 not tell the tiers apart — the decorator does all of it.
         """
+        # Run start: the cancel capability's announced-id tracking is run-local
+        # by contract, and the instance lives for the agent's lifetime — reset
+        # here, before run_sync, so no cross-run state survives.
+        self._cancel_capability.reset_run_tracking()
         self._deliver_context_update()
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
         prompt: UserPrompt = user_content
@@ -474,12 +598,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         (see REPLY_PROTOCOLS) and run as one act() turn, whose StructuredOutput
         goes to _route_output().
 
-        This body carries no ``try``/``except`` of its own. The usage-limit tier
-        policy is the decorator's (see ``usage_limits.guard_usage_limits``), which
-        is handed this handler's schema and routing so an interrupted turn is
-        concluded and delivered exactly as a normal one would be. Written once
-        there rather than copied here, because the ``except`` ordering it depends on
-        is load-bearing and a wrong copy fails silently.
+        The one ``try``/``except`` this body carries is the
+        ``RunInterruptedError`` catch around the ``act()`` call: a queued
+        ``/stop`` or ``CancelMessage`` cancelled the run at a step boundary, so
+        the human is notified ("Run interrupted."), nothing is routed, and the
+        handler returns normally — the run dies, the agent survives. The catch
+        must stay here and not move into the decorator: the usage-limit tier
+        policy is the decorator's (see ``usage_limits.guard_usage_limits``),
+        whose ``except`` ordering is load-bearing and owns usage-limit errors
+        only. No context surgery happens here — the context arrives already
+        healed (akgentic-llm repairs dangling tool calls before re-raising).
 
         Args:
             message: The AgentMessage instance containing the message content and recipient.
@@ -517,9 +645,38 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             f"{REPLY_PROTOCOLS.get(message.type, '').format(sender=sender_name)}"
             f"\n\n{message.content}"
         )
-        output = self.act(prefixed_content, StructuredOutput)
+        try:
+            output = self.act(prefixed_content, StructuredOutput)
+        except RunInterruptedError:
+            logger.info(
+                "[%s] run interrupted by a queued cancel; turn abandoned, nothing routed",
+                self.config.name,
+            )
+            self.notify_human("Run interrupted.")
+            return
 
         self._route_output(output)
+
+    def receiveMsg_CancelMessage(  # noqa: N802
+        self, message: CancelMessage, sender: ActorAddress
+    ) -> None:
+        """Acknowledge a CancelMessage delivered as its own turn — a logged no-op.
+
+        Cancellation is enforced by the mailbox peek inside the run (see
+        ``MailboxCancelCapability``), not by this handler: a cancel interrupts
+        a run while still *pending*. By the time one is dequeued and lands
+        here the agent is idle — there is nothing to cancel, no state to set,
+        and the next run is unaffected.
+
+        Args:
+            message: The CancelMessage being acknowledged.
+            sender: The ActorAddress of the sender of the message.
+        """
+        logger.info(
+            "[%s] CancelMessage received while idle (reason: %r) — nothing to cancel",
+            self.config.name,
+            message.reason,
+        )
 
     def _dispatch_command(self, message: AgentMessage, sender: ActorAddress) -> bool:
         """Dispatch a ``/``-prefixed message through the command registry.

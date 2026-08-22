@@ -22,7 +22,7 @@ from akgentic.core import ActorAddress
 from akgentic.tool.errors import CommandNotRecognized
 from pydantic_ai import ModelRetry
 
-from akgentic.agent.agent import BaseAgent
+from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
@@ -83,6 +83,9 @@ def _make_minimal_agent(
     # context delivery, so a stub that composes nothing keeps act() alive.
     agent._context_updater = MagicMock()  # type: ignore[attr-defined]
     agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
+
+    # Cancel capability normally built in _build_react_agent (Epic 20).
+    agent._cancel_capability = MailboxCancelCapability(observer=agent)  # type: ignore[arg-type]
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = name

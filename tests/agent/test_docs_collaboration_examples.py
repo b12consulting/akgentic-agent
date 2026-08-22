@@ -49,7 +49,7 @@ from pydantic import BaseModel, ValidationError
 from pydantic_ai import ModelRetry
 
 import akgentic.agent.agent as agent_module
-from akgentic.agent.agent import BaseAgent
+from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
@@ -118,6 +118,9 @@ def _make_agent(
     # context delivery, so a stub that composes nothing keeps act() alive.
     agent._context_updater = MagicMock()
     agent._context_updater.compose_update.return_value = None
+
+    # Cancel capability normally built in _build_react_agent (Epic 20).
+    agent._cancel_capability = MailboxCancelCapability(observer=agent)  # type: ignore[arg-type]
 
     config = MagicMock(spec=AgentConfig)
     config.name = name
