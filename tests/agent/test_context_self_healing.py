@@ -348,6 +348,40 @@ class TestScanScope:
 # =============================================================================
 
 
+def _stub_model(messages: list[Any], info: AgentInfo) -> ModelResponse:
+    """Token-free FunctionModel target: a fixed one-part text response."""
+    return ModelResponse(parts=[TextPart(content="ok")])
+
+
+def _real_react_agent_pair() -> tuple[ReactAgent, BaseAgent, dict[str, ContextState | None]]:
+    """Bare BaseAgent over a REAL ReactAgent, with one roster provider.
+
+    The real agent keeps pydantic-ai's dynamic system-prompt re-evaluation
+    path intact — the property NFR1 guards, which the stubbed ``_make_agent``
+    cannot exercise. The caller registers any dynamic system prompts before
+    the first run and owns ``react_agent.close()``.
+    """
+    react_agent = ReactAgent(
+        config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
+        deps_type=BaseAgent,
+    )
+    holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
+    agent: BaseAgent = object.__new__(BaseAgent)
+    agent._react_agent = react_agent  # type: ignore[attr-defined]
+    registry = MagicMock()
+    registry.has.return_value = False
+    agent._command_registry = registry  # type: ignore[attr-defined]
+    mock_config = MagicMock(spec=AgentConfig)
+    mock_config.name = "@TestAgent"
+    agent.config = mock_config  # type: ignore[attr-defined]
+    agent._context_state_providers = [  # type: ignore[attr-defined]
+        _provider("team_roster_state", holder)
+    ]
+    agent._context_baselines = {}  # type: ignore[attr-defined]
+    agent._context_update_seq = 0  # type: ignore[attr-defined]
+    return react_agent, agent, holder
+
+
 class TestPrefixStability:
     def test_no_change_turns_leave_system_parts_byte_identical(self) -> None:
         """Two no-change turns: messages[0]'s system parts stay byte-identical
@@ -359,10 +393,7 @@ class TestPrefixStability:
         ``messages[0]`` in place — the spec proves the re-evaluated content is
         byte-identical because nothing volatile is registered any more.
         """
-        react_agent = ReactAgent(
-            config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
-            deps_type=BaseAgent,
-        )
+        react_agent, agent, holder = _real_react_agent_pair()
         try:
             @react_agent.system_prompt
             def agent_backstory(ctx: RunContext[BaseAgent]) -> str:
@@ -372,27 +403,7 @@ class TestPrefixStability:
             def current_date(ctx: RunContext[BaseAgent]) -> str:
                 return "The current date is 2026-08-22."
 
-            holder: dict[str, ContextState | None] = {
-                "state": _RosterState(members=("@Manager",))
-            }
-            agent: BaseAgent = object.__new__(BaseAgent)
-            agent._react_agent = react_agent  # type: ignore[attr-defined]
-            registry = MagicMock()
-            registry.has.return_value = False
-            agent._command_registry = registry  # type: ignore[attr-defined]
-            mock_config = MagicMock(spec=AgentConfig)
-            mock_config.name = "@TestAgent"
-            agent.config = mock_config  # type: ignore[attr-defined]
-            agent._context_state_providers = [  # type: ignore[attr-defined]
-                _provider("team_roster_state", holder)
-            ]
-            agent._context_baselines = {}  # type: ignore[attr-defined]
-            agent._context_update_seq = 0  # type: ignore[attr-defined]
-
-            def stub_model(messages: list[Any], info: AgentInfo) -> ModelResponse:
-                return ModelResponse(parts=[TextPart(content="ok")])
-
-            with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            with react_agent.pydantic_agent.override(model=FunctionModel(_stub_model)):
                 agent.act("turn one", output_type=str)
                 first_system = [
                     p.content
@@ -423,32 +434,9 @@ class TestPrefixStability:
     def test_first_turn_block_is_folded_and_marker_found_next_turn(self) -> None:
         """The fresh-agent fold lands the marker in a UserPromptPart; the scan
         finds it there with no fold-specific branch (ADR-037 §7)."""
-        react_agent = ReactAgent(
-            config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
-            deps_type=BaseAgent,
-        )
+        react_agent, agent, holder = _real_react_agent_pair()
         try:
-            holder: dict[str, ContextState | None] = {
-                "state": _RosterState(members=("@Manager",))
-            }
-            agent: BaseAgent = object.__new__(BaseAgent)
-            agent._react_agent = react_agent  # type: ignore[attr-defined]
-            registry = MagicMock()
-            registry.has.return_value = False
-            agent._command_registry = registry  # type: ignore[attr-defined]
-            mock_config = MagicMock(spec=AgentConfig)
-            mock_config.name = "@TestAgent"
-            agent.config = mock_config  # type: ignore[attr-defined]
-            agent._context_state_providers = [  # type: ignore[attr-defined]
-                _provider("team_roster_state", holder)
-            ]
-            agent._context_baselines = {}  # type: ignore[attr-defined]
-            agent._context_update_seq = 0  # type: ignore[attr-defined]
-
-            def stub_model(messages: list[Any], info: AgentInfo) -> ModelResponse:
-                return ModelResponse(parts=[TextPart(content="ok")])
-
-            with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+            with react_agent.pydantic_agent.override(model=FunctionModel(_stub_model)):
                 agent.act("turn one", output_type=str)
                 # The block was folded into turn one's user prompt.
                 user_texts = [

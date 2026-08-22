@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 from akgentic.llm import ContextManager, ReactAgent
 from akgentic.tool.core import ContextState
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig
@@ -115,8 +116,6 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     message (the post-first-run shape) — so the 19-2 presence check finds the
     marker on later turns exactly as it would against the real ContextManager.
     """
-    from pydantic_ai.messages import ModelRequest, UserPromptPart
-
     agent: BaseAgent = object.__new__(BaseAgent)
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
     messages: list[Any] = []
