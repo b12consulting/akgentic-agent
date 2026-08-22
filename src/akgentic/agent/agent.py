@@ -12,15 +12,30 @@ Architecture:
     composed by akgentic-tool's ContextUpdater against baselines persisted on
     AgentState.tool_state; this class only decides when to deliver and how to append
   · COMMAND — commands via a CommandRegistry, dispatched from /-prefixed messages
-- TeamTool auto-injected if not already in config.tools
+- TeamTool and MailboxTool auto-injected if not already in config.tools
 - ReactAgent.run_sync(output_type=...) — act() forwards the caller's type;
   receiveMsg_AgentMessage asks for StructuredOutput, so the team path stays
   schema-driven
 - get_output_type() applied inside ReactAgent.run() — no leakage into BaseAgent
 - Implements TeamManagementToolObserver protocol (structural typing)
-- One message handler of its own, receiveMsg_AgentMessage: all team traffic is
-  AgentMessage, so there is no per-message-type handler set here. Akgent still
+- Two message handlers of its own: receiveMsg_AgentMessage carries all team
+  traffic (every message is an AgentMessage), and receiveMsg_CancelMessage
+  acknowledges a cancel that lands while the agent is idle. Akgent still
   contributes the lifecycle handler receiveMsg_StopRecursively
+- Mailbox-driven run control (ADR-040): MailboxCapability, from
+  akgentic.agent.capabilities, peeks the mailbox before every model request and
+  does two things with what it finds — it purges a pending /stop or
+  CancelMessage and raises RunInterruptedError on it, and it renders the mid-run
+  arrival notice for mail not yet announced this run and enqueues it for the
+  next request. act() absorbs the interruption, notifies the human and returns a
+  default output_type() — an empty StructuredOutput on the team path, which
+  routes nothing, so no handler carries a catch. The run dies, the agent
+  survives. The agent owns both the cancel vocabulary and its enforcement: the
+  capability is built unconditionally, so it must work on an agent configured
+  without MailboxTool
+- Custom capabilities: extra_capabilities() is the subclass override. The
+  framework prepends its own capability, so self._capabilities is always
+  [mailbox, *extra_capabilities()] and cancellation cannot be de-configured
 - The usage-limit tier policy is applied, not written here: the handler carries
   @guard_usage_limits(output_type=..., route=...) from usage_limits.py. See
   custom_agent.py for a second agent class doing the same with its own schema
@@ -35,15 +50,16 @@ from datetime import datetime, timezone
 from time import sleep
 from typing import Any, TypeVar, cast
 
-from pydantic_ai import BinaryContent, ModelRetry, RunContext
+from pydantic_ai import AgentCapability, BinaryContent, ModelRetry, RunContext
 
+from akgentic.agent.capabilities import MailboxCapability, RunInterruptedError
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 from akgentic.core import ActorAddress, Akgent, Orchestrator
-from akgentic.core.messages import EventMessage
+from akgentic.core.messages import CancelMessage, EventMessage
 from akgentic.llm import (
     AgentUsageSummary,
     LlmUsageEvent,
@@ -55,6 +71,7 @@ from akgentic.llm import (
 from akgentic.tool.core import CommandRegistry, ContextUpdater, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
+from akgentic.tool.mailbox import MailboxTool
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace.readers import MediaContent
 
@@ -76,6 +93,20 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       states and commands — TOOL_CALL, SYSTEM_PROMPT, LLM_CONTEXT, COMMAND.
     - TeamTool: auto-injected if absent from config.tools; provides hire/fire
       capabilities and team-awareness context state.
+    - MailboxTool: auto-injected if absent from config.tools; a two-channel
+      card serving read_mailbox on TOOL_CALL and /stop on COMMAND, and no
+      LLM_CONTEXT at all. The read *consumes*: it absorbs the mail it shows,
+      which is therefore not delivered again as its own turn, while anything
+      left unread stays queued and arrives as its own turn after the run. A
+      pending cancel is never consumed by it. A card supplied in config.tools
+      wins over the default.
+    - MailboxCapability: built unconditionally in _build_react_agent (no
+      card involvement, no MailboxTool presence check) and handed to the
+      ReactAgent via capabilities= — the cancel check and the mid-run arrival
+      notice before every model request. act() resets its run-local tracking.
+    - extra_capabilities(): the subclass override for pydantic-ai capabilities
+      of your own. The framework prepends its own, so the list handed to the
+      ReactAgent is always [mailbox, *extra_capabilities()].
 
     Observer Protocol:
     - Implements TeamManagementToolObserver (structural typing via @runtime_checkable)
@@ -90,11 +121,22 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       team delegation path is schema-driven.
 
     Message Flow:
-    - receiveMsg_AgentMessage is the only handler this class defines (Akgent
-      contributes receiveMsg_StopRecursively). /-prefixed content is offered to
-      the CommandRegistry first; everything else — including a /-prefixed token
-      the registry does not recognise — is prefixed with the reply protocol for
-      its message type and run as one act() turn.
+    - This class defines two handlers: receiveMsg_AgentMessage for all team
+      traffic, and receiveMsg_CancelMessage acknowledging a cancel that lands
+      while idle (Akgent contributes receiveMsg_StopRecursively). /-prefixed
+      content is offered to the CommandRegistry first; everything else —
+      including a /-prefixed token the registry does not recognise — is
+      prefixed with the reply protocol for its message type and run as one
+      act() turn.
+    - A turn interrupted by a queued cancel never reaches a handler:
+      act() absorbs the RunInterruptedError itself, calls
+      notify_human("Run interrupted.") once and returns an empty
+      StructuredOutput, which _route_output delivers as nothing. No
+      receiveMsg_* — here or in a subclass — writes a catch. The context
+      arrives already healed (akgentic-llm repairs dangling tool calls before
+      re-raising), so nobody performs context surgery, and the agent survives
+      to process the next queued message — which is ordinary mail, the cancel
+      itself having been purged at recognition rather than left to dequeue.
     - That turn's StructuredOutput goes to _route_output(), which sends one
       AgentMessage per Request. A recipient starting with "@" resolves to an
       existing member; anything else is hired by role. A recipient that resolves
@@ -119,8 +161,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     - current_date
     - whatever ToolFactory.get_system_prompts() yields — nothing on a default
       card set: the roster, role profiles, planning and knowledge-graph
-      capabilities declare LLM_CONTEXT and arrive as context-update blocks
-    - mailbox_notifications, only when the mailbox is non-empty at on_start
+      capabilities declare LLM_CONTEXT and arrive as context-update blocks.
+      MailboxTool declares no LLM_CONTEXT at all; mailbox awareness reaches
+      the model through the mid-run arrival notice alone
 
     Commands (programmatic, via CommandRegistry built in on_start):
     - A single generic CommandRegistry holds every COMMAND-channel callable keyed
@@ -157,10 +200,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         - Usage limits conversion
 
         Every dynamic system prompt is registered here, after construction, via
-        @self._react_agent.system_prompt: agent_backstory, current_date, whatever
-        ToolFactory.get_system_prompts() yields (nothing on a default card set —
-        the volatile capabilities declare LLM_CONTEXT), and mailbox_notifications
-        when the mailbox is non-empty at start. ReactAgent registers none of its own.
+        @self._react_agent.system_prompt: agent_backstory, current_date, and
+        whatever ToolFactory.get_system_prompts() yields (nothing on a default
+        card set — the volatile capabilities declare LLM_CONTEXT). ReactAgent
+        registers none of its own.
 
         Tools (hire_members, fire_members) come from TeamTool.get_tools() as
         closures over the orchestrator proxy — not bound methods of this agent —
@@ -181,10 +224,14 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # ── State ───────────────────────────────────────────────────────────────
         self.state = AgentState(backstory=self.config.prompt.render()).observer(self)
 
-        # ── Add TeamTool automatically (without mutating config) ──────────────
-        # TeamTool is hardcoded in akgentic-agent package
-        has_team_tool = any(isinstance(t, TeamTool) for t in self.config.tools)
-        tool_cards = self.config.tools if has_team_tool else [TeamTool(), *self.config.tools]
+        # ── Add TeamTool and MailboxTool automatically (without mutating config) ──
+        # Both intrinsic cards are hardcoded in akgentic-agent package; a card
+        # already present in config.tools wins over the prepended default.
+        tool_cards = list(self.config.tools)
+        if not any(isinstance(t, MailboxTool) for t in tool_cards):
+            tool_cards.insert(0, MailboxTool())
+        if not any(isinstance(t, TeamTool) for t in tool_cards):
+            tool_cards.insert(0, TeamTool())
 
         # ── ReactAgent: wraps model, http client, context, usage limits ──────
         # Tools come from ToolFactory (includes TeamTool hire/fire via factory pattern)
@@ -248,16 +295,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         for system_prompt in tool_factory.get_system_prompts():
             self._react_agent.system_prompt(system_prompt)
 
-        if inbox := self.get_mailbox():
-            @self._react_agent.system_prompt
-            def mailbox_notifications(ctx: RunContext[BaseAgent]) -> str | None:
-                    senders = {msg.sender.name for msg in inbox if msg.sender}
-                    return (
-                        f"NOTICE: {len(inbox)} new message(s) arrived in your mailbox "
-                        f"from team member(s): {', '.join(senders)}."
-                        "\nConsider wrapping up the current thread to process them."
-                    )
-
     def on_stop(self) -> None:
         """Release LLM resources on stop, then run the base teardown.
 
@@ -272,6 +309,35 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             logger.exception("[%s] ReactAgent.close() failed on stop", self.config.name)
         super().on_stop()
 
+    def extra_capabilities(self) -> list[AgentCapability[Any]]:
+        """Contribute pydantic-ai capabilities of your own. Override point.
+
+        Returns an empty list here. A subclass returning capabilities gets them
+        appended to the framework's, in the order returned, at both build sites:
+        ``self._capabilities = [self._mailbox_capability, *self.extra_capabilities()]``.
+
+        **Never return the mailbox capability from this hook.** The framework
+        prepends it, for two reasons that are the whole point of the split:
+
+        - Cancellation is unconditional (ADR-040 §5). A subclass that forgot to
+          call ``super()`` would otherwise silently lose the ability to be
+          stopped.
+        - The cancel check runs before any custom capability's work. Hook order
+          is registration order, so a run that is about to be cancelled does not
+          first pay for a third party's ``before_model_request``.
+
+        Called from ``_build_react_agent``, which runs during ``on_start``
+        before ``self._react_agent`` exists. ``self.config`` is assigned before
+        ``on_start`` and is safe to read; an override must not touch the
+        ReactAgent, and must not assume anything built later in ``on_start``.
+
+        Returns:
+            Capabilities to append after the framework's own. Both an
+            ``AbstractCapability`` instance and a plain capability function are
+            accepted — ``AgentCapability`` is the union of the two.
+        """
+        return []
+
     def _build_react_agent(
         self, config: ReactAgentConfig, tools: list[Any], toolsets: list[Any]
     ) -> ReactAgent:
@@ -281,7 +347,34 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         token-free ``MockReactAgent`` for load testing; otherwise build the
         real ``ReactAgent``. The deferred import keeps the optional ``loadtest``
         extra off the normal runtime path.
+
+        Both branches receive the same list, ``self._capabilities``: the
+        framework's own ``MailboxCapability`` built here first, then whatever
+        ``extra_capabilities()`` contributes. The framework's own is built
+        unconditionally, on the agent and never on a card, so cancellation works
+        even when the config carries no ``MailboxTool`` (ADR-040 §5), and it is
+        first because hook order is registration order — a run about to be
+        cancelled should not first pay for a third party's
+        ``before_model_request``. The mock accepts and ignores
+        ``capabilities=``; drop-in parity keeps this wiring identical.
+
+        Each branch is handed a **copy** of that list. pydantic-ai happens to
+        copy before injecting its own auto-capabilities today, but that is
+        undocumented upstream behaviour; copying here makes ``_capabilities``
+        an agent-side guarantee rather than an assumption to re-verify on every
+        bump.
         """
+        # Enforcement is agent-owned: held on self so act() can reset the
+        # run-local announced-id tracking at each run start.
+        self._mailbox_capability = MailboxCapability(observer=self)
+        # The annotation is required: without it the list infers as
+        # list[MailboxCapability] from its first element and the splat below
+        # does not fit.
+        self._capabilities: list[AgentCapability[Any]] = [
+            self._mailbox_capability,
+            *self.extra_capabilities(),
+        ]
+
         # Env var name mirrors akgentic.llm.loadtest.SCENARIO_ENV_VAR.
         scenario = os.environ.get("AKGENTIC_MOCK_SCENARIO")
         if scenario:
@@ -300,6 +393,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     tools=tools,
                     toolsets=toolsets,
                     observer=self,
+                    capabilities=list(self._capabilities),
                 ),
             )
         return ReactAgent(
@@ -308,6 +402,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             tools=tools,
             toolsets=toolsets,
             observer=self,
+            capabilities=list(self._capabilities),
         )
 
     def init_llm_context(self, context: list[EventMessage]) -> None:
@@ -376,6 +471,18 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             An instance of output_type, as produced by the REACT loop.
 
         Raises:
+            RunInterruptedError: **Absorbed here, not propagated** — a queued
+                /stop or CancelMessage cancelled the run at a step boundary, so
+                this method logs it, notifies the human once, and returns a
+                default ``output_type()`` instead. Callers therefore need no
+                try/except: a StructuredOutput with an empty request list routes
+                nothing and the handler completes normally. The context arrives
+                already healed (akgentic-llm repairs dangling tool calls before
+                re-raising), so this method performs no context surgery.
+                The one case a caller can still see it: an ``output_type`` that
+                cannot be default-constructed — a model with at least one
+                required field. The original interruption is then re-raised
+                unchanged, never a ValidationError and never a wrapped exception.
             RunUsageLimitError: The turn exhausted its own budget. Recoverable —
                 the @guard_usage_limits decorator on the calling handler answers
                 it with a tool-free conclusion.
@@ -385,6 +492,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 this method neither notifies anyone nor wraps them, and it does
                 not tell the tiers apart — the decorator does all of it.
         """
+        # Run start: the mailbox capability's announced-id tracking is run-local
+        # by contract, and the instance lives for the agent's lifetime — reset
+        # here, before run_sync, so no cross-run state survives. The framework's
+        # own capability is reset by name; there is no per-capability lifecycle
+        # protocol and self._capabilities is not iterated here.
+        self._mailbox_capability.reset_run_tracking()
         self._deliver_context_update()
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
         prompt: UserPrompt = user_content
@@ -399,7 +512,23 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     for p in parts
                 ]
         # ── End media expansion ─────────────────────────────────────────────────
-        output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
+        try:
+            output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
+        except RunInterruptedError as interruption:
+            logger.info(
+                "[%s] run interrupted by a queued cancel; turn abandoned, routing nothing",
+                self.config.name,
+            )
+            self.notify_human("Run interrupted.")
+            # A default instance is only available when every field of the
+            # caller's type has a default. When it is not, the caller sees the
+            # interruption itself — never the construction error behind it, so
+            # the exception is named rather than bare-re-raised.
+            try:
+                default = output_type()
+            except Exception:
+                raise interruption from None
+            return default
 
         return cast(T, output)
 
@@ -476,12 +605,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         (see REPLY_PROTOCOLS) and run as one act() turn, whose StructuredOutput
         goes to _route_output().
 
-        This body carries no ``try``/``except`` of its own. The usage-limit tier
-        policy is the decorator's (see ``usage_limits.guard_usage_limits``), which
-        is handed this handler's schema and routing so an interrupted turn is
-        concluded and delivered exactly as a normal one would be. Written once
-        there rather than copied here, because the ``except`` ordering it depends on
-        is load-bearing and a wrong copy fails silently.
+        This body carries no ``try``/``except`` at all. A queued ``/stop`` or
+        ``CancelMessage`` is absorbed inside ``act()``, which notifies the human
+        and returns an empty ``StructuredOutput``; ``_route_output`` then
+        delivers nothing and the handler returns normally — the run dies, the
+        agent survives. The usage-limit tier policy is likewise the decorator's
+        (see ``usage_limits.guard_usage_limits``), whose ``except`` ordering is
+        load-bearing and owns usage-limit errors only.
 
         Args:
             message: The AgentMessage instance containing the message content and recipient.
@@ -523,39 +653,79 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         self._route_output(output)
 
+    def receiveMsg_CancelMessage(  # noqa: N802
+        self, message: CancelMessage, sender: ActorAddress
+    ) -> None:
+        """Acknowledge a CancelMessage delivered as its own turn — a logged no-op.
+
+        This is the **idle** cancel handler, and by construction the only one it
+        could be. Cancellation is enforced by the mailbox peek inside the run
+        (see ``MailboxCapability``), which purges what it recognises at the
+        moment it recognises it — so a cancel that arrived mid-run is gone from
+        the mailbox before the actor could ever dequeue it, and can never reach
+        here. Arriving here therefore *is* the proof that nothing was running:
+        there is nothing to cancel, no state to set, no run-state check to make,
+        and the next run is unaffected.
+
+        Args:
+            message: The CancelMessage being acknowledged.
+            sender: The ActorAddress of the sender of the message.
+        """
+        logger.info(
+            "[%s] CancelMessage received while idle (reason: %r) — nothing to cancel",
+            self.config.name,
+            message.reason,
+        )
+
     def _dispatch_command(self, message: AgentMessage, sender: ActorAddress) -> bool:
         """Dispatch a ``/``-prefixed message through the command registry.
 
-        Sends the dispatch result back to ``sender`` as a ``notification`` (a
-        non-``request`` type, so it does not trigger a reply loop) and returns
-        ``True`` to signal the message was handled as a command.
+        A dispatch has three outcomes:
 
-        When the leading token is not a registered command, ``dispatch`` raises
-        :class:`CommandNotRecognized`; this method swallows that and returns
-        ``False`` so the caller falls back to the normal LLM path with the
-        original content. Post-identification failures (bad/missing args) are
-        caught inside ``dispatch`` and returned as a result string — they are
-        handled here exactly like a success and never fall back to the LLM.
+        - **A string result** — sent back to ``sender`` as a ``notification`` (a
+          non-``request`` type, so it does not trigger a reply loop), recorded as
+          one operator action, and reported as ``True``.
+        - **``None``** — the command handled itself and has decided it has
+          nothing to report. Returns ``True`` at once: no notification, no
+          operator-action entry. A command whose whole effect is elsewhere —
+          it writes a file, or sends a message of its own — would otherwise be
+          double-reported, once by its own effect and once by an empty reply.
+          This is a general primitive, not a carve-out for any one command.
+        - **:class:`CommandNotRecognized`** — the leading token is not a
+          registered command. Swallowed; returns ``False`` so the caller falls
+          back to the normal LLM path with the original content, and nothing is
+          recorded because the command never ran.
 
-        On any dispatched (non-``CommandNotRecognized``) outcome, exactly one
-        synthetic, human-attributed operator-action entry is composed here and
-        appended to the ReactAgent context via :meth:`_record_operator_action`, so
-        the agent reasons about the human's action (and its result) on its next
-        turn without mistaking it for its own tool call. The fallback branch
-        records nothing — the command never ran.
+        Post-identification failures (bad/missing args) are caught inside
+        ``dispatch`` and returned as a result string — handled here exactly like
+        a success, never falling back to the LLM.
+
+        The operator-action entry is synthetic and human-attributed: it is
+        composed here and appended to the ReactAgent context via
+        :meth:`_record_operator_action`, so the agent reasons about the human's
+        action (and its result) on its next turn without mistaking it for its
+        own tool call.
 
         Args:
             message: The incoming AgentMessage whose raw content starts with ``/``.
             sender: The ActorAddress to send the command result back to.
 
         Returns:
-            ``True`` if the content was dispatched as a command (result sent),
+            ``True`` if the content was dispatched as a command — whether the
+            result was sent back (string) or deliberately silent (``None``);
             ``False`` if the leading token was not a known command.
         """
+        # ``CommandRegistry.dispatch`` is declared ``-> str | None``: a command
+        # may have nothing to say, and the None branch below is the general
+        # answer to that, not a special case for any one command.
+        result: str | None
         try:
             result = self._command_registry.dispatch(message.content)
         except CommandNotRecognized:
             return False
+
+        if result is None:
+            return True
 
         self.send(
             sender,
@@ -587,7 +757,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         human = next((member for member in self.get_team() if member.is_user_proxy), None)
         if human is None:
             logger.warning(
-                "No user-proxy team member found; usage-limit notice not delivered: %s",
+                "No user-proxy team member found; notice not delivered: %s",
                 message,
             )
             return

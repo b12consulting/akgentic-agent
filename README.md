@@ -19,6 +19,7 @@ to each other via structured LLM output.
 - [Team Composition](#team-composition)
 - [Configuration](#configuration)
 - [Tool Channels](#tool-channels)
+- [Run Cancellation](#run-cancellation)
 - [Examples](#examples)
 - [Documentation](#documentation)
 - [Development](#development)
@@ -47,6 +48,8 @@ HumanProxy ──send()──► BaseAgent (Manager)
                       ├─ append **Context update N** block (if shared state changed)
                       ├─ expand !!glob_pattern refs (if WorkspaceTool present)
                       └─ ReactAgent.run_sync(prompt, output_type=StructuredOutput)
+                           (a queued /stop or CancelMessage cancels the run at the
+                            next step boundary — see Run Cancellation)
                              │
                     StructuredOutput.messages = [
                         Request(recipient="@Assistant", message_type="instruction", message="..."),
@@ -336,18 +339,26 @@ class CustomAgent(BaseAgent):
 
     @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
-        self._route_triage(self.act(prompt, TriageOutput))
+        output = self.act(prompt, TriageOutput)
+        self._route_triage(output)
 ```
 
-Three things follow, and they are the whole point:
+Four things follow, and they are the whole point:
 
-- **The handler carries no error handling of its own.** It reads as just the work.
+- **The handler carries no usage-limit handling of its own.** The tier policy is entirely the
+  decorator's; the body reads as just the work.
 - **A run-tier breach concludes in `TriageOutput`**, delivered by `_route_triage` — because
   the schema and the routing are decorator *arguments*, not overrides. `CustomAgent` overrides
   nothing.
 - **The router returns `bool`.** The guard is handed a schema it cannot inspect — `TriageOutput`
   has no `.messages` — so "did anything actually go out?" is the router's answer to give, and
   it is what separates a real conclusion from one that routed nothing.
+- **The handler carries no `except` at all — not even for cancellation.** The cancel
+  capability is unconditional on every `BaseAgent` subclass, so every run is interruptible,
+  but the interruption never reaches the handler: `act()` absorbs `RunInterruptedError`
+  itself, notifies the human once, and returns a default `TriageOutput()`. `_route_triage`
+  then delivers nothing and the handler returns normally (see
+  [Run Cancellation](#run-cancellation)).
 
 `_route_triage` is defined **before** the handler: the decorator names it as an argument, which
 is evaluated while the class body runs. The requester is lifted off the handler's own message
@@ -484,7 +495,7 @@ Extends `BaseConfig` from `akgentic-core`:
 | `run_usage_limits` | `RunUsageLimits` | `RunUsageLimits()` | Budget for **one** `run()` — token and request caps that reset every run |
 | `agent_usage_limits` | `AgentUsageLimits` | `AgentUsageLimits()` | Budget for the agent's **whole lifetime** — runs and tokens, accumulated across every run |
 | `compaction_cfg` | `CompactionConfig` | `CompactionConfig()` | Context-compaction strategy and auto-trigger (opt-in; off unless `model_cfg.context_length` is set) |
-| `tools` | `list[ToolCard]` | `[]` | Tool cards; `TeamTool` is always prepended automatically |
+| `tools` | `list[ToolCard]` | `[]` | Tool cards; `TeamTool` and `MailboxTool` are always prepended automatically |
 
 #### Usage limits: two tiers
 
@@ -622,18 +633,91 @@ Runtime state extending `BaseState`:
 
 | Channel | Consumer | Examples |
 |---|---|---|
-| `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `web_search()`, `workspace_read()` |
+| `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `read_mailbox()`, `web_search()`, `workspace_read()` |
 | `SYSTEM_PROMPT` | LLM system prompt — rendered into the frozen system block | backstory, current date |
 | `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary |
-| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary` |
+| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`, `stop` |
 
-`TeamTool` is always prepended to `config.tools` if not already present, ensuring every
-`BaseAgent` can hire and fire members.
+`TeamTool` **and** `MailboxTool` are always prepended to `config.tools` if not already
+present, so every `BaseAgent` can hire and fire members (`TeamTool`) and carries the two
+mailbox surfaces — the **consuming** `read_mailbox` tool, which absorbs the mail it shows so
+that mail is not delivered again as its own turn, and `/stop` (`MailboxTool`). A cancel is
+never consumed by the read. A card already supplied in `config.tools` wins over the prepended
+default, and `config.tools` itself is never mutated — `on_start()` copies the list.
+
+### Assembly: what `on_start` collects
+
+`on_start()` walks the card set once through the `ToolFactory` and consumes each channel
+exactly once:
+
+| Channel | Collected in `on_start` via | Consumed |
+|---|---|---|
+| `TOOL_CALL` | `tool_factory.get_tools()` / `get_toolsets()` | handed to the `ReactAgent` at build |
+| `SYSTEM_PROMPT` | `tool_factory.get_system_prompts()` | registered once into the frozen system block |
+| `LLM_CONTEXT` | `tool_factory.get_context_states()` | providers held for the agent's lifetime; diffed and delivered per turn by `_deliver_context_update` |
+| `COMMAND` | `tool_factory.get_command_registry(extra_commands=[compact, clear])` | one `CommandRegistry`, announced once via `CommandsAnnouncedEvent` |
+
+**`BaseAgent` grows behaviour by hosting cards, not by accreting methods.** `MailboxTool`
+is the worked example: two capabilities, each riding its own channel — `read_mailbox` on
+`TOOL_CALL`, `/stop` on `COMMAND` — and the agent gained both without a single new method.
+The card serves no `LLM_CONTEXT` at all: mailbox awareness reaches the model through the
+agent's mid-run arrival notice alone, a second card-side carrier having only narrated the
+same arrivals twice. When the next feature is a capability the LLM, the
+operator, or the context should see, write it as a card and let the table above route each
+piece to the hook that serves it. The card-author side of this contract is the
+`akgentic-tool` README's *Building a feature as a card* authoring guide.
+
+### Adding a capability of your own
+
+A card is the right shape for anything the LLM, the operator or the context should see. A
+**pydantic-ai capability** is the right shape for something that has to run *around every
+model request* — an observability wrapper, a domain guard, a tenant-resolution hook. Those
+have no channel to ride, so `BaseAgent` offers a hook instead:
+
+```python
+from typing import Any
+
+from pydantic_ai import AgentCapability
+
+from akgentic.agent.agent import BaseAgent
+
+
+class AuditedAgent(BaseAgent):
+    def extra_capabilities(self) -> list[AgentCapability[Any]]:
+        return [AuditCapability(self.config.name)]
+```
+
+`AuditCapability` is yours to write — any `pydantic_ai.capabilities.AbstractCapability`
+subclass, or a plain capability function.
+
+`_build_react_agent` assembles the list once and hands the same object to both build sites:
+
+```python
+self._capabilities = [self._mailbox_capability, *self.extra_capabilities()]
+```
+
+Two things follow, and both are deliberate:
+
+- **The framework's own capability is prepended, never returned by the hook.** Cancellation
+  is unconditional — a subclass that forgot to call `super()` would otherwise silently lose
+  the ability to be stopped. Do not return `MailboxCapability` from `extra_capabilities()`;
+  you would get two of it.
+- **Mailbox-first is an ordering guarantee, not an accident.** Hook order is registration
+  order, so the cancel check runs before any custom capability's work: a run that is about
+  to be cancelled does not first pay for a third party's `before_model_request`.
+
+`extra_capabilities()` is called from `_build_react_agent`, during `on_start` and *before*
+`self._react_agent` exists — so an override may read `self.config`, but must not touch the
+ReactAgent or anything built later in `on_start`. `AgentCapability` is the union of
+`AbstractCapability` and a plain capability function, so either shape is accepted. There is
+no per-capability lifecycle: the framework resets its own capability by name at each run
+start and never iterates the list. `CustomAgent` in `custom_agent.py` carries a runnable
+version of the above.
 
 ### Context updates
 
-Volatile, team-shared state — the roster, role profiles, planning, the knowledge-graph summary —
-never enters the system prompt: the system block holds the backstory and the current date only, and
+Volatile, team-shared state — the roster, role profiles, planning, the knowledge-graph summary
+— never enters the system prompt: the system block holds the backstory and the current date only, and
 stays byte-identical run to run so the prompt-cache prefix survives. Instead, before each run the
 agent appends **at most one block** at the tail of the conversation carrying what changed since the
 last block it delivered.
@@ -764,6 +848,11 @@ happens to start with a slash is never lost, and nothing is injected into the co
 raising) are caught inside `dispatch()` and returned as a result string; those never fall back to
 the LLM.
 
+A dispatched command may also return `None`, meaning *handled, say nothing*: the message counts
+as handled — it never reaches the LLM — but there is no reply to the sender and no operator
+action recorded. That is the outcome for a command whose whole effect happens elsewhere, which
+an empty reply would only double-report.
+
 Arguments are `shlex`-split and coerced against the command's signature. A token is treated as a
 keyword only when the text before its first `=` names a real parameter, so
 `/hire_member Developer name=@Ada` binds both, while a positional value containing `=` is left
@@ -782,6 +871,7 @@ The registry contents follow from the tool cards attached to the agent:
 | `planning_summary()` | `PlanningTool` | Full team planning text |
 | `get_planning_task(task_id)` | `PlanningTool` | Single planning task by ID |
 | `search_planning(...)` | `PlanningTool` | Search the shared task board |
+| `stop()` | `MailboxTool` | Cancel the current run; the mid-run effect is the cancel hook's (see [Run Cancellation](#run-cancellation)) |
 | `compact()` / `clear()` | `BaseAgent` built-ins | Compact or clear the conversation context |
 
 Do not hand-transcribe this table into your own code: read the set from
@@ -814,6 +904,97 @@ Expansion happens in `act()` before `run_sync()`, and only when the expansion ac
 something: if the command returns the prompt unchanged, the plain string is sent as-is. Errors and
 document hints are forwarded to the LLM rather than silently dropped. Agents whose registry has no
 `_expand_media_refs` are unaffected — the block is a no-op.
+
+## Run Cancellation
+
+A running turn can be interrupted. The design is **two surfaces, one predicate, one hook**:
+
+- **Two surfaces.** `/stop` is a `MailboxTool` command, announced to every frontend through
+  the same `CommandsAnnouncedEvent` as any other command; `CancelMessage`
+  (`akgentic.core.messages`) is the typed carrier for programmatic senders. Both land in the
+  agent's mailbox like any other message.
+- **One predicate.** `is_cancel`, defined once in `akgentic.agent.capabilities`, recognises
+  both forms — nothing else in the system parses cancel vocabulary.
+- **One hook.** `MailboxCapability.before_model_request` (same module), built
+  **unconditionally** by `BaseAgent` — never contributed by a card, so cancellation works even
+  on an agent configured without `MailboxTool`. The agent owns *both* the vocabulary and the
+  enforcement, and the first is a consequence of the second: a card-less agent has no card to
+  borrow a predicate from, so a predicate that shipped with the card could not make that agent
+  interruptible. What the card still owns is its own surface — the consuming `read_mailbox`
+  tool and the `/stop` command registration whose string form `is_cancel` recognises without
+  importing anything from the card.
+
+A cancel arrives in one of two situations, and they are handled in completely different
+places:
+
+| | **Mid-run** — it arrives while a message is being processed | **Idle** — it arrives with nothing running |
+|---|---|---|
+| Who sees it | the hook, at the next step boundary | nobody, until the actor dequeues it normally |
+| Mailbox | **purged at recognition** — never dequeued, never dispatched | dequeued in the ordinary way |
+| Effect | `RunInterruptedError`; the run dies; `act()` tells the human | there is no run to cancel |
+| What the human sees | the interruption notification — which is why nothing else speaks | an explicit answer that there is no run to cancel |
+
+**Mid-run.** While a run is in progress, the hook peeks the mailbox before every model
+request. Once a cancel is pending, it purges *every* pending cancel from the mailbox through
+`consume_mailbox` — one `HandledMessage` per removal, emitted by that primitive rather than
+by the hook — and only then raises `RunInterruptedError`. `act()` absorbs it: the human is
+notified ("Run interrupted.") and `act()` returns a default instance of the output type the
+caller named — an empty `StructuredOutput` on the team path, which `_route_output` delivers
+as nothing. **No handler writes a catch**, in this package or in yours, and the handler
+returns normally — **the run dies, the agent survives**. The one case a caller still sees the
+error is an output type that cannot be default-constructed (a model with a required field);
+`act()` then re-raises the original interruption unchanged. Because the cancel was purged, it
+never gets a turn of its own: the next message the actor dequeues is ordinary mail, and the
+human is told once, by the interruption.
+
+**Idle.** A cancel that arrives with nothing running is seen by no hook, and is dequeued like
+any other message. A `CancelMessage` lands on `receiveMsg_CancelMessage`, an
+acknowledge-and-log no-op; a `/stop` answers through ordinary command dispatch, with an
+explicit answer that there is no run to cancel. Neither needs to check whether a run is in
+flight — after the purge, *reaching* either of them is the proof that none is.
+
+**The mailbox is the cancellation's single source of truth.** There is no cancel flag and no
+clear step: recognising the cancel and consuming it are one atomic act, performed by the hook
+at recognition, so a cancel can never go stale and cancel the next run.
+
+### The mid-run arrival notice
+
+The same hook, after the cancel check, announces mail that arrived during the run: new
+pending messages are announced **once**, by a **durable** notice (rendered by
+`render_arrival_notice`) delivered through `ctx.enqueue(notice, priority="asap")` —
+pydantic-ai's supported injection path. The auto-injected drain capability delivers it into
+the model request at the next step boundary and records it in the agent's history and the
+event store as its own user-role message — that record **is** the audit trail that the
+doorbell rang. When the run would otherwise end at that boundary, pydantic-ai's drain
+redirects through one final model request so an already-enqueued notice is delivered rather
+than lost — an occasional extra model call, by design. Announced-id tracking is run-local:
+`act()` resets it at each run start, so it dies with the run. A durable record exists either
+way, but which one depends on what the model does: if it calls `read_mailbox`, the read
+**absorbs** those messages and the tool return is their record — they are not delivered again
+as their own turn. Whatever it leaves unread stays queued and arrives as its own turn once the
+run ends. A cancel is never consumed by the read.
+
+### Honest limitations
+
+- **An interruption is a clean end, not a failure.** It never routes through the failure
+  path: no `ErrorMessage` is emitted, and the handler returns normally. (An exception
+  escaping a handler would not stop the actor either — `Akgent._handle_failure` in
+  `akgentic-core` keeps the actor loop alive and emits an `ErrorMessage` to the
+  orchestrator; actor death on failure is stock-pykka behaviour only. The catch site's
+  invariant is stronger than survival: the failure path is never entered at all.)
+- **Granularity is the next step boundary, never mid-stream.** The hook fires before every
+  model request inside the REACT loop — bracketing every tool call and reasoning step — but
+  it does not abort an in-flight provider stream: a single very long model response is
+  uninterruptible from inside. A tool-free single completion has no step boundary at all, so
+  it can neither be cancelled nor see mid-run mail — accepted, since that run is ending
+  anyway.
+- **A cancel pending during a run-tier-breach conclusion escalates the breach.** When the
+  `@guard_usage_limits` tool-free conclusion is running (see
+  [What happens when a limit is hit](#what-happens-when-a-limit-is-hit)), a pending cancel
+  is caught by `try_conclude_without_tools`'s blanket `except` and **escalates the original
+  breach** rather than reading as an interruption — a safe, known, accepted outcome: the turn
+  ends either way. The cancel is still purged before the raise, whoever ends up catching it,
+  so it does not survive to be dispatched afterwards.
 
 ## Examples
 

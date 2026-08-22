@@ -16,6 +16,14 @@ Reused unchanged from BaseAgent:
   in THIS agent's schema with nothing overridden.
 - ``notify_human``, ``send``, ``get_team_member``, ``hire_member`` — no schema in
   their signatures.
+- ``MailboxCapability`` (``akgentic.agent.capabilities``) — built
+  unconditionally by ``_build_react_agent``, so every subclass gets all of its
+  duties without asking: a queued ``/stop`` or ``CancelMessage`` is purged from
+  the mailbox and interrupts the run, and mail that arrives mid-run is announced
+  to the model once. None of it depends on the config carrying a
+  ``MailboxTool``. The interruption is absorbed by ``act()`` itself, which
+  notifies the human once and returns a default instance of the output type you
+  named — so a subclass handler writes nothing for it.
 
 Supplied here:
 
@@ -23,12 +31,19 @@ Supplied here:
 - ``TriageMessage`` — the message type, with its own ``receiveMsg_`` handler.
 - ``_route_triage`` — how a TriageOutput is delivered. Passed to the decorator,
   so it serves the normal turn and the interrupted one alike.
+- ``extra_capabilities`` — one pydantic-ai capability of this agent's own,
+  ``TriageAuditCapability``. The framework prepends its own, so the list the
+  ReactAgent receives is ``[mailbox, audit]``: the cancel check still runs
+  first, and this agent never returns the mailbox capability itself.
 """
 
 import logging
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+from pydantic_ai import AgentCapability, RunContext
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.models import ModelRequestContext
 
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.messages import AgentMessage
@@ -83,12 +98,56 @@ class TriageMessage(Message):
 
 
 # ============================================================================
+# The agent's own capability
+# ============================================================================
+
+
+class TriageAuditCapability(AbstractCapability[Any]):
+    """Log one line before every model request — a capability of the agent's own.
+
+    Deliberately the smallest thing a capability can usefully be: it observes
+    and returns ``request_context`` unchanged. It constructs no message, mutates
+    no part (parts are shared with the durable history) and enqueues nothing, so
+    it cannot perturb the run it watches. An observability wrapper, a domain
+    guard or a tenant-resolution hook all start from this shape.
+    """
+
+    def __init__(self, agent_name: str) -> None:
+        self._agent_name = agent_name
+
+    async def before_model_request(
+        self, ctx: RunContext[Any], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        """Record that a model request is about to go out, then pass it through."""
+        logger.info("[%s] triage audit: model request about to be sent", self._agent_name)
+        return request_context
+
+
+# ============================================================================
 # The agent
 # ============================================================================
 
 
 class CustomAgent(BaseAgent):
     """A BaseAgent that triages incidents against its own schema."""
+
+    def extra_capabilities(self) -> list[AgentCapability[Any]]:
+        """Contribute this agent's audit capability to the ReactAgent.
+
+        The framework prepends ``MailboxCapability``, so the ReactAgent is
+        handed ``[mailbox, audit]`` — cancellation stays unconditional and its
+        check still runs first. This override deliberately does not call
+        ``super()`` and does not return the mailbox capability: doing either
+        would duplicate a capability the framework already supplies.
+
+        Runs from ``_build_react_agent`` during ``on_start``, before
+        ``self._react_agent`` exists, so it reads only ``self.config`` — which
+        is assigned before ``on_start`` — and nothing built later.
+
+        Returns:
+            One capability, appended after the framework's own.
+        """
+        return [TriageAuditCapability(agent_name=self.config.name)]
 
     def _route_triage(self, output: TriageOutput) -> bool:
         """Act on a TriageOutput: log the assessment, deliver the handoffs.
@@ -127,10 +186,13 @@ class CustomAgent(BaseAgent):
     ) -> None:
         """Handle one incident.
 
-        No error handling of its own: the decorator owns the usage-limit policy,
-        reads the requester off ``message``, and — because it was given this
-        agent's schema and routing — concludes an interrupted turn in TriageOutput
-        without this class overriding anything.
+        The decorator owns the usage-limit policy, reads the requester off
+        ``message``, and — because it was given this agent's schema and routing —
+        concludes a breached turn in TriageOutput without this class overriding
+        anything. This body carries no ``try``/``except``: a queued cancel is
+        absorbed by ``act()``, which tells the human and hands back an empty
+        ``TriageOutput``, so ``_route_triage`` delivers nothing and the handler
+        returns normally — exactly as ``receiveMsg_AgentMessage`` does.
 
         Args:
             message: The incident to triage.
@@ -141,4 +203,6 @@ class CustomAgent(BaseAgent):
             "Assess severity, summarise in one line, and hand off whatever you "
             "cannot resolve yourself."
         )
-        self._route_triage(self.act(prompt, TriageOutput))
+        output = self.act(prompt, TriageOutput)
+
+        self._route_triage(output)
