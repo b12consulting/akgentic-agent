@@ -28,7 +28,6 @@ from unittest.mock import MagicMock
 import pytest
 from akgentic.core import ActorAddress
 from akgentic.llm import LlmMessageEvent, ModelConfig, ReactAgent, ReactAgentConfig
-from akgentic.tool.mailbox import render_arrival_notice
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -39,6 +38,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.capabilities import render_arrival_notice
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput

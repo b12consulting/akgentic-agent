@@ -748,6 +748,65 @@ class TestDispatchCommandHelper:
         assert sent_msg.content == "ok"
         assert sent_msg.type == "notification"
 
+    def test_none_result_is_handled_silently(self) -> None:
+        """``None`` means *handled, say nothing*: True, no send, nothing recorded.
+
+        A command that returns ``None`` has decided it has nothing to report —
+        its whole effect is elsewhere. Reporting it again as an empty reply and
+        an operator action would double-report it.
+
+        ``CommandRegistry.dispatch`` is declared ``-> str`` in the workspace
+        today, so nothing shipped returns ``None`` yet; the registry double is
+        what exercises the branch, and it is installed here ahead of the tool
+        package widening the signature.
+        """
+        agent = _make_minimal_agent()
+        agent._command_registry.dispatch.return_value = None  # type: ignore[attr-defined]
+
+        message = AgentMessage(content="/stop", type="request")
+        message.sender = _make_mock_sender("@Human")
+
+        handled = agent._dispatch_command(message, _make_mock_sender("@Human"))
+
+        assert handled is True
+        agent.send.assert_not_called()
+        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+
+    @patch("akgentic.agent.agent.sleep")
+    def test_none_result_does_not_fall_through_to_the_llm(self, mock_sleep: MagicMock) -> None:
+        """The silent outcome is still *handled* — the handler must not call act().
+
+        The failure this pins is returning ``False`` for ``None``: the command
+        would run, say nothing, and then the raw ``/stop`` text would be handed
+        to the model as if it were a prompt.
+        """
+        agent = _make_minimal_agent()
+        agent._command_registry.dispatch.return_value = None  # type: ignore[attr-defined]
+        act = _stub_act(agent)
+
+        message = AgentMessage(content="/stop", type="request")
+        message.sender = _make_mock_sender("@Human")
+
+        agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Human"))
+
+        act.assert_not_called()
+        agent.send.assert_not_called()
+        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_unknown_token_is_unchanged_by_the_none_contract(self) -> None:
+        """CommandNotRecognized still means *not handled*, not *handled silently*."""
+        agent = _make_minimal_agent()
+        agent._command_registry.dispatch.side_effect = CommandNotRecognized("nope")  # type: ignore[attr-defined]
+
+        message = AgentMessage(content="/nope", type="request")
+        message.sender = _make_mock_sender("@Human")
+
+        handled = agent._dispatch_command(message, _make_mock_sender("@Human"))
+
+        assert handled is False
+        agent.send.assert_not_called()
+        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+
 
 # =============================================================================
 # Operator-action LLM-context delegation

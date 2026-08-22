@@ -30,14 +30,20 @@ from unittest.mock import MagicMock, patch
 import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.core.messages import CancelMessage
-from akgentic.llm import ModelConfig, PromptTemplate, ReactAgentConfig
-from akgentic.tool.mailbox import render_arrival_notice
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from akgentic.llm import ModelConfig, PromptTemplate, ReactAgent, ReactAgentConfig
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    UserPromptPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 import akgentic.agent
 import akgentic.agent.agent as agent_module
 from akgentic.agent import RunInterruptedError
 from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.capabilities import render_arrival_notice
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -479,3 +485,84 @@ class TestIdleCancel:
 
             assert _wait_until(lambda: _InterruptibleReactAgent.run_calls >= 1)
             assert _InterruptibleReactAgent.interrupts_remaining == 0
+
+
+# =============================================================================
+# FR8 — an agent with NO MailboxTool is still interruptible
+# =============================================================================
+
+
+def _make_cardless_agent(pending: list[Any]) -> BaseAgent:
+    """A BaseAgent assembled with no tool cards at all.
+
+    ``object.__new__`` means ``on_start`` never runs, so nothing is auto-added —
+    this really is an agent whose config carries no ``MailboxTool``. The cancel
+    capability observes the agent itself, exactly as ``_build_react_agent``
+    wires it in production; ``get_mailbox`` is core's own method, which is why
+    it survives the absence of the card. The pending list stands in for the
+    actor inbox, which ``object.__new__`` leaves unbuilt.
+    """
+    agent: BaseAgent = object.__new__(BaseAgent)
+
+    registry = MagicMock()
+    registry.has.return_value = False
+    agent._command_registry = registry  # type: ignore[attr-defined]
+    agent.team_id = uuid.uuid4()
+
+    agent._context_updater = MagicMock()  # type: ignore[attr-defined]
+    agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
+
+    mock_config = MagicMock(spec=AgentConfig)
+    mock_config.name = "@CardlessAgent"
+    # Explicit: a bare MagicMock(spec=AgentConfig) would answer *any* attribute,
+    # so the card-less precondition has to be set, not assumed.
+    mock_config.tools = []
+    agent.config = mock_config  # type: ignore[attr-defined]
+
+    agent.get_mailbox = MagicMock(return_value=pending)  # type: ignore[method-assign]
+    agent._cancel_capability = MailboxCancelCapability(observer=agent)
+
+    agent.get_team = MagicMock(return_value=[])  # type: ignore[method-assign]
+    agent.send = MagicMock()  # type: ignore[method-assign]
+    return agent
+
+
+class TestCardlessAgentStillCancels:
+    """The requirement that forced the vocabulary out of the card.
+
+    ``MailboxCancelCapability`` is built unconditionally so that an agent
+    configured without ``MailboxTool`` is still interruptible — and a
+    ``CancelMessage`` from the frontend to such an agent must still kill the
+    run. A predicate that shipped with the card could not serve this agent:
+    there is no card here to import one from.
+    """
+
+    def test_pending_cancel_kills_the_run_of_an_agent_with_no_mailbox_tool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+        agent = _make_cardless_agent([CancelMessage(reason="frontend Esc")])
+
+        # The card-less precondition, asserted rather than relied upon.
+        assert agent.config.tools == []
+        assert agent._command_registry.has("stop") is False
+
+        react_agent = ReactAgent(
+            config=ReactAgentConfig(
+                model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+            ),
+            deps_type=BaseAgent,
+            capabilities=[agent._cancel_capability],
+        )
+        agent._react_agent = react_agent  # type: ignore[attr-defined]
+
+        def stub_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            raise AssertionError("the model was reached: the cancel never fired")
+
+        try:
+            with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+                with pytest.raises(RunInterruptedError):
+                    agent.act("do the long thing", StructuredOutput)
+        finally:
+            react_agent.close()

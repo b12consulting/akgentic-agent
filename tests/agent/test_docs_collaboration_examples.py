@@ -627,6 +627,28 @@ class TestSlashDispatchFallback:
 
         act.assert_not_called()
 
+    def test_a_none_result_is_handled_with_no_reply_and_no_operator_action(self) -> None:
+        """The third fallback bullet: `None` means *handled, say nothing*.
+
+        Dispatch is stubbed rather than driven through a real command, and that
+        is not a shortcut: ``CommandRegistry._invoke`` currently returns
+        ``str(fn(...))``, so a ``None``-returning command reaches this method as
+        the string ``"None"``. The `None` outcome is a contract this agent
+        honours ahead of the tool package widening that signature — the double
+        is the only way to exercise it today.
+        """
+        agent = _make_agent(commands={"team_members": team_members})
+        setattr(agent._command_registry, "dispatch", MagicMock(return_value=None))
+
+        message = AgentMessage(content="/team_members", type="request")
+        message.sender = _make_address("@Human")
+
+        handled = agent._dispatch_command(message, _make_address("@Human"))
+
+        assert handled is True
+        cast(MagicMock, agent.send).assert_not_called()
+        _react_agent_of(agent).context.record_operator_action.assert_not_called()
+
 
 class TestHireMemberSnippet:
     """`Key Implementation §3`, corrected to the registry form."""

@@ -6,7 +6,8 @@ structured-output schema for routing messages between team members.
 
 from importlib import metadata as _metadata
 
-from akgentic.agent.agent import BaseAgent, RunInterruptedError
+from akgentic.agent.agent import BaseAgent
+from akgentic.agent.capabilities import RunInterruptedError
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.human_proxy import HumanProxy
 from akgentic.agent.messages import AgentMessage

@@ -16,9 +16,10 @@ Reused unchanged from BaseAgent:
   in THIS agent's schema with nothing overridden.
 - ``notify_human``, ``send``, ``get_team_member``, ``hire_member`` — no schema in
   their signatures.
-- ``MailboxCancelCapability`` — built unconditionally by ``_build_react_agent``,
-  so every subclass run is interruptible by a queued ``/stop`` or
-  ``CancelMessage``. What the subclass has to supply is the catch: every
+- ``MailboxCancelCapability`` (``akgentic.agent.capabilities``) — built
+  unconditionally by ``_build_react_agent``, so every subclass run is
+  interruptible by a queued ``/stop`` or ``CancelMessage``, whether or not the
+  config carries a ``MailboxTool``. What the subclass has to supply is the catch: every
   ``receiveMsg_*`` that calls ``act()`` must catch ``RunInterruptedError``
   around that call (notify the human, route nothing, return) — an escape ends
   the turn through the actor failure path instead of the designed clean end.
@@ -36,7 +37,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from akgentic.agent.agent import BaseAgent, RunInterruptedError
+from akgentic.agent.agent import BaseAgent
+from akgentic.agent.capabilities import RunInterruptedError
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient

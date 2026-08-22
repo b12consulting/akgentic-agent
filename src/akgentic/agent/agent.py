@@ -22,10 +22,13 @@ Architecture:
   traffic (every message is an AgentMessage), and receiveMsg_CancelMessage
   acknowledges a cancel that lands while the agent is idle. Akgent still
   contributes the lifecycle handler receiveMsg_StopRecursively
-- Run cancellation (ADR-040): MailboxCancelCapability peeks the mailbox before
-  every model request and raises RunInterruptedError on a pending /stop or
-  CancelMessage; receiveMsg_AgentMessage catches it around act(), notifies the
-  human and routes nothing — the run dies, the agent survives
+- Run cancellation (ADR-040): MailboxCancelCapability, from
+  akgentic.agent.capabilities, peeks the mailbox before every model request and
+  raises RunInterruptedError on a pending /stop or CancelMessage;
+  receiveMsg_AgentMessage catches it around act(), notifies the human and routes
+  nothing — the run dies, the agent survives. The agent owns both the cancel
+  vocabulary and its enforcement: the capability is built unconditionally, so it
+  must work on an agent configured without MailboxTool
 - The usage-limit tier policy is applied, not written here: the handler carries
   @guard_usage_limits(output_type=..., route=...) from usage_limits.py. See
   custom_agent.py for a second agent class doing the same with its own schema
@@ -36,15 +39,13 @@ Architecture:
 import logging  # noqa: I001
 import os
 import random
-import uuid
 from datetime import datetime, timezone
 from time import sleep
 from typing import Any, TypeVar, cast
 
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
-from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.models import ModelRequestContext
 
+from akgentic.agent.capabilities import MailboxCancelCapability, RunInterruptedError
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput
@@ -63,12 +64,7 @@ from akgentic.llm import (
 from akgentic.tool.core import CommandRegistry, ContextUpdater, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
-from akgentic.tool.mailbox import (
-    MailboxTool,
-    MailboxToolObserver,
-    is_cancel,
-    render_arrival_notice,
-)
+from akgentic.tool.mailbox import MailboxTool
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace.readers import MediaContent
 
@@ -76,78 +72,6 @@ logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
-
-
-class RunInterruptedError(Exception):
-    """The current run was cancelled by a /stop or CancelMessage.
-
-    Raised by ``MailboxCancelCapability.before_model_request`` at the next step
-    boundary once a cancel is pending in the mailbox (ADR-040 §5). Carries a
-    message only. It must never escape a message handler: an escape ends the
-    turn through the actor failure path (``Akgent._handle_failure`` — an
-    ErrorMessage to the orchestrator; actor death under stock pykka) instead
-    of the designed clean end. ``receiveMsg_AgentMessage`` owns the catch
-    around ``act()`` so the *run* dies while the *agent* carries on cleanly.
-    """
-
-
-class MailboxCancelCapability(AbstractCapability[Any]):
-    """Mailbox-driven run cancellation and mid-run arrival notice (ADR-040 §5).
-
-    One instance per agent, built unconditionally by ``BaseAgent`` — never
-    contributed by a card, so cancellation cannot be de-configured by omitting
-    ``MailboxTool``. The card owns the *vocabulary* (``is_cancel``,
-    ``render_arrival_notice``); the agent owns the *enforcement*.
-
-    ``before_model_request`` fires before EVERY model request inside the REACT
-    loop, bracketing every tool call and reasoning step — exactly the
-    granularity cancellation needs. On each firing, in order:
-
-    1. Cancel check — any pending message matching ``is_cancel`` raises
-       ``RunInterruptedError``. The mailbox is the cancellation's single
-       source of truth: no flag, no consumed marker — recognising the cancel
-       and consuming it are the same dequeue, performed later by the actor
-       loop.
-    2. Arrival notice — pending messages not yet announced in this run are
-       announced through one ``ctx.enqueue(notice, priority="asap")`` call,
-       pydantic-ai's supported injection path. The auto-injected, outermost
-       ``PendingMessageDrainCapability`` drains the queue at the *next* step
-       boundary: the notice lands in that model request, in the durable
-       history and in the ``LlmMessageEvent`` stream by design — the event
-       store is the audit trail that the doorbell rang. When the run would
-       otherwise end first, the drain redirects through one final model
-       request so an already-enqueued notice is delivered rather than lost.
-       The hook constructs no message of its own and never mutates an
-       existing message's parts (they are shared with durable history).
-
-    Announced-id tracking is run-local: the instance lives for the agent's
-    lifetime, so ``act()`` resets the set at each run start. A backlog
-    re-announced next run is acceptable; a leak of announced ids across runs
-    is not.
-    """
-
-    def __init__(self, observer: MailboxToolObserver) -> None:
-        self._observer = observer
-        self._announced_ids: set[uuid.UUID] = set()
-
-    def reset_run_tracking(self) -> None:
-        """Forget which arrivals this run announced (called at each run start)."""
-        self._announced_ids.clear()
-
-    async def before_model_request(
-        self, ctx: RunContext[Any], request_context: ModelRequestContext
-    ) -> ModelRequestContext:
-        """Raise on a pending cancel, else enqueue an arrival notice for new mail."""
-        pending = self._observer.get_mailbox()
-        if any(is_cancel(message) for message in pending):
-            raise RunInterruptedError(
-                "The current run was cancelled by a queued /stop or CancelMessage."
-            )
-        new_messages = [m for m in pending if m.id not in self._announced_ids]
-        if new_messages:
-            ctx.enqueue(render_arrival_notice(new_messages), priority="asap")
-            self._announced_ids.update(message.id for message in new_messages)
-        return request_context
 
 
 class BaseAgent(Akgent[AgentConfig, AgentState]):
@@ -676,36 +600,52 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     def _dispatch_command(self, message: AgentMessage, sender: ActorAddress) -> bool:
         """Dispatch a ``/``-prefixed message through the command registry.
 
-        Sends the dispatch result back to ``sender`` as a ``notification`` (a
-        non-``request`` type, so it does not trigger a reply loop) and returns
-        ``True`` to signal the message was handled as a command.
+        A dispatch has three outcomes:
 
-        When the leading token is not a registered command, ``dispatch`` raises
-        :class:`CommandNotRecognized`; this method swallows that and returns
-        ``False`` so the caller falls back to the normal LLM path with the
-        original content. Post-identification failures (bad/missing args) are
-        caught inside ``dispatch`` and returned as a result string — they are
-        handled here exactly like a success and never fall back to the LLM.
+        - **A string result** — sent back to ``sender`` as a ``notification`` (a
+          non-``request`` type, so it does not trigger a reply loop), recorded as
+          one operator action, and reported as ``True``.
+        - **``None``** — the command handled itself and has decided it has
+          nothing to report. Returns ``True`` at once: no notification, no
+          operator-action entry. A command whose whole effect is elsewhere (a
+          cancel that lands in the mailbox and is read by the run) would
+          otherwise be double-reported, once by its own effect and once by an
+          empty reply.
+        - **:class:`CommandNotRecognized`** — the leading token is not a
+          registered command. Swallowed; returns ``False`` so the caller falls
+          back to the normal LLM path with the original content, and nothing is
+          recorded because the command never ran.
 
-        On any dispatched (non-``CommandNotRecognized``) outcome, exactly one
-        synthetic, human-attributed operator-action entry is composed here and
-        appended to the ReactAgent context via :meth:`_record_operator_action`, so
-        the agent reasons about the human's action (and its result) on its next
-        turn without mistaking it for its own tool call. The fallback branch
-        records nothing — the command never ran.
+        Post-identification failures (bad/missing args) are caught inside
+        ``dispatch`` and returned as a result string — handled here exactly like
+        a success, never falling back to the LLM.
+
+        The operator-action entry is synthetic and human-attributed: it is
+        composed here and appended to the ReactAgent context via
+        :meth:`_record_operator_action`, so the agent reasons about the human's
+        action (and its result) on its next turn without mistaking it for its
+        own tool call.
 
         Args:
             message: The incoming AgentMessage whose raw content starts with ``/``.
             sender: The ActorAddress to send the command result back to.
 
         Returns:
-            ``True`` if the content was dispatched as a command (result sent),
+            ``True`` if the content was dispatched as a command — whether the
+            result was sent back (string) or deliberately silent (``None``);
             ``False`` if the leading token was not a known command.
         """
+        # ``CommandRegistry.dispatch`` is declared ``-> str`` in the workspace
+        # today and widens to ``str | None`` when the tool package catches up.
+        # The annotation makes this method correct under both.
+        result: str | None
         try:
             result = self._command_registry.dispatch(message.content)
         except CommandNotRecognized:
             return False
+
+        if result is None:
+            return True
 
         self.send(
             sender,

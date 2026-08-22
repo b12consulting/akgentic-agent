@@ -803,6 +803,11 @@ happens to start with a slash is never lost, and nothing is injected into the co
 raising) are caught inside `dispatch()` and returned as a result string; those never fall back to
 the LLM.
 
+A dispatched command may also return `None`, meaning *handled, say nothing*: the message counts
+as handled — it never reaches the LLM — but there is no reply to the sender and no operator
+action recorded. That is the outcome for a command whose whole effect happens elsewhere, which
+an empty reply would only double-report.
+
 Arguments are `shlex`-split and coerced against the command's signature. A token is treated as a
 keyword only when the text before its first `=` names a real parameter, so
 `/hire_member Developer name=@Ada` binds both, while a positional value containing `=` is left
@@ -821,7 +826,7 @@ The registry contents follow from the tool cards attached to the agent:
 | `planning_summary()` | `PlanningTool` | Full team planning text |
 | `get_planning_task(task_id)` | `PlanningTool` | Single planning task by ID |
 | `search_planning(...)` | `PlanningTool` | Search the shared task board |
-| `stop()` | `MailboxTool` | Cancel the current run; dispatched while idle it only replies that nothing is running — the mid-run effect is the cancel hook's (see [Run Cancellation](#run-cancellation)) |
+| `stop()` | `MailboxTool` | Cancel the current run; the mid-run effect is the cancel hook's (see [Run Cancellation](#run-cancellation)) |
 | `compact()` / `clear()` | `BaseAgent` built-ins | Compact or clear the conversation context |
 
 Do not hand-transcribe this table into your own code: read the set from
@@ -863,12 +868,16 @@ A running turn can be interrupted. The design is **two surfaces, one predicate, 
   the same `CommandsAnnouncedEvent` as any other command; `CancelMessage`
   (`akgentic.core.messages`) is the typed carrier for programmatic senders. Both land in the
   agent's mailbox like any other message.
-- **One predicate.** `is_cancel`, defined once in `akgentic.tool.mailbox`, recognises both
-  forms — nothing else in the system parses cancel vocabulary.
-- **One hook.** `MailboxCancelCapability.before_model_request`, built **unconditionally** by
-  `BaseAgent` — never contributed by a card, so cancellation works even on an agent
-  configured without `MailboxTool`. The card owns the *vocabulary*; the agent owns the
-  *enforcement*.
+- **One predicate.** `is_cancel`, defined once in `akgentic.agent.capabilities`, recognises
+  both forms — nothing else in the system parses cancel vocabulary.
+- **One hook.** `MailboxCancelCapability.before_model_request` (same module), built
+  **unconditionally** by `BaseAgent` — never contributed by a card, so cancellation works even
+  on an agent configured without `MailboxTool`. The agent owns *both* the vocabulary and the
+  enforcement, and the first is a consequence of the second: a card-less agent has no card to
+  borrow a predicate from, so a predicate that shipped with the card could not make that agent
+  interruptible. What the card still owns is its own surface — the `MailboxState` provider,
+  `read_mailbox`, and the `/stop` command registration whose string form `is_cancel`
+  recognises without importing anything from the card.
 
 The flow: while a run is in progress, the hook peeks the mailbox before every model request
 and raises `RunInterruptedError` at the next step boundary once a cancel is pending.

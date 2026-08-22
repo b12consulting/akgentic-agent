@@ -532,8 +532,14 @@ is gone — the system block is frozen and carries no mailbox content):
 
 The same hook enforces run cancellation: a pending `/stop` or `CancelMessage` raises
 `RunInterruptedError` at the next step boundary, caught in `receiveMsg_AgentMessage` — the
-run dies, the agent survives. See the README's *Run Cancellation* section for the full flow
-and its stated limitations.
+run dies, the agent survives. The hook and the vocabulary it applies (`is_cancel`,
+`render_arrival_notice`) are both the agent's, defined in `akgentic.agent.capabilities` — not
+the card's. `BaseAgent` builds the capability unconditionally so an agent configured *without*
+`MailboxTool` is still interruptible, and such an agent has no card to borrow a predicate
+from. The card keeps its own surface: the `MailboxState` provider, `read_mailbox`, and the
+`/stop` registration whose string form `is_cancel` recognises without importing anything from
+the card. See the README's *Run Cancellation* section for the full flow and its stated
+limitations.
 
 ---
 
@@ -700,6 +706,10 @@ The fallback is what makes this safe to put in front of every message:
   original content. **No operator action is recorded** — the command never ran.
 - **Known command, bad arguments** (or the body raising) → caught *inside* `dispatch`, returned
   as a result string. Handled exactly like a success; never falls back to the LLM.
+- **A `None` result** → *handled, say nothing*. `_dispatch_command()` returns `True` at once:
+  no `notification` back to the sender and **no operator action recorded**. That is the
+  outcome for a command whose whole effect happens elsewhere, which an empty reply and a
+  second context entry would only double-report.
 
 ```python
 # From the human side — see examples/simple_team.py
