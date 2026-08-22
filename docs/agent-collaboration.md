@@ -510,22 +510,27 @@ flowchart TD
 > the schema belongs to the caller. An output that resolved no recipient sent nothing, and a
 > conclusion that sent nothing is a failure, not a quiet success.
 
-### 5. Mailbox Notification
+### 5. Mailbox Visibility
 
-`on_start()` can register one more dynamic system prompt, `mailbox_notifications`, whose intent
-is to tell a busy agent that other team members are waiting:
+An agent sees its pending mail through three live surfaces, all provided by `MailboxTool`
+(auto-added beside `TeamTool`; the deprecated `mailbox_notifications` start-up system prompt
+is gone — the system block is frozen and carries no mailbox content):
 
-```
-NOTICE: 2 new message(s) arrived in your mailbox from team member(s): @QA789, @Manager.
-Consider wrapping up the current thread to process them.
-```
+- **Mailbox status as context state** (`MailboxState`, `LLM_CONTEXT` channel) — delivered
+  through the same per-turn **Context update** block as the roster and planning state, so
+  the count of waiting messages is current at the start of every turn.
+- **`read_mailbox` tool** (`TOOL_CALL` channel) — a mid-run peek at sender, type and full
+  content of every pending message. Reading does not consume them: each will still be
+  delivered as its own turn after the current run ends.
+- **The mid-run arrival notice** — mail arriving *while a run is in progress* is announced
+  once by `MailboxCancelCapability.before_model_request`, as an ephemeral notice appended to
+  the outgoing model request. It reaches the provider but never the durable history, so a
+  busy agent learns the doorbell rang without the transcript recording the ring.
 
-**Read the wiring before relying on it.** The prompt is registered only when
-`self.get_mailbox()` is non-empty *at `on_start()` time*, and the closure captures that call's
-**snapshot** — `get_mailbox()` builds a new list each time it is called, and it is called once.
-A message that arrives later does not change what the prompt reports, and on an agent whose
-mailbox was empty at start-up the prompt is never registered at all. In practice that is every
-agent, so this notification does not currently fire for messages arriving mid-run.
+The same hook enforces run cancellation: a pending `/stop` or `CancelMessage` raises
+`RunInterruptedError` at the next step boundary, caught in `receiveMsg_AgentMessage` — the
+run dies, the agent survives. See the README's *Run Cancellation* section for the full flow
+and its stated limitations.
 
 ---
 

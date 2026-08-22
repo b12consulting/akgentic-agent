@@ -19,6 +19,7 @@ to each other via structured LLM output.
 - [Team Composition](#team-composition)
 - [Configuration](#configuration)
 - [Tool Channels](#tool-channels)
+- [Run Cancellation](#run-cancellation)
 - [Examples](#examples)
 - [Documentation](#documentation)
 - [Development](#development)
@@ -47,6 +48,8 @@ HumanProxy ──send()──► BaseAgent (Manager)
                       ├─ append **Context update N** block (if shared state changed)
                       ├─ expand !!glob_pattern refs (if WorkspaceTool present)
                       └─ ReactAgent.run_sync(prompt, output_type=StructuredOutput)
+                           (a queued /stop or CancelMessage cancels the run at the
+                            next step boundary — see Run Cancellation)
                              │
                     StructuredOutput.messages = [
                         Request(recipient="@Assistant", message_type="instruction", message="..."),
@@ -315,6 +318,7 @@ Apply the decorator to every `receiveMsg_*` that can reach the LLM, handing it *
 and *your* router:
 
 ```python
+from akgentic.agent import RunInterruptedError
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 
@@ -336,18 +340,30 @@ class CustomAgent(BaseAgent):
 
     @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
-        self._route_triage(self.act(prompt, TriageOutput))
+        try:
+            output = self.act(prompt, TriageOutput)
+        except RunInterruptedError:
+            self.notify_human("Run interrupted.")
+            return
+        self._route_triage(output)
 ```
 
-Three things follow, and they are the whole point:
+Four things follow, and they are the whole point:
 
-- **The handler carries no error handling of its own.** It reads as just the work.
+- **The handler carries no usage-limit handling of its own.** The tier policy is entirely the
+  decorator's; the body reads as just the work.
 - **A run-tier breach concludes in `TriageOutput`**, delivered by `_route_triage` — because
   the schema and the routing are decorator *arguments*, not overrides. `CustomAgent` overrides
   nothing.
 - **The router returns `bool`.** The guard is handed a schema it cannot inspect — `TriageOutput`
   has no `.messages` — so "did anything actually go out?" is the router's answer to give, and
   it is what separates a real conclusion from one that routed nothing.
+- **The one `except` the handler does carry is the `RunInterruptedError` catch around
+  `act()`.** The cancel capability is unconditional on every `BaseAgent` subclass, so every
+  run is interruptible — but the catch is not inherited: every subclass handler that calls
+  `act()` must supply it itself, exactly as `receiveMsg_AgentMessage` does (notify the human,
+  route nothing, return). An escape ends the turn through the actor failure path instead of
+  the designed clean end (see [Run Cancellation](#run-cancellation)).
 
 `_route_triage` is defined **before** the handler: the decorator names it as an argument, which
 is evaluated while the class body runs. The requester is lifted off the handler's own message
@@ -484,7 +500,7 @@ Extends `BaseConfig` from `akgentic-core`:
 | `run_usage_limits` | `RunUsageLimits` | `RunUsageLimits()` | Budget for **one** `run()` — token and request caps that reset every run |
 | `agent_usage_limits` | `AgentUsageLimits` | `AgentUsageLimits()` | Budget for the agent's **whole lifetime** — runs and tokens, accumulated across every run |
 | `compaction_cfg` | `CompactionConfig` | `CompactionConfig()` | Context-compaction strategy and auto-trigger (opt-in; off unless `model_cfg.context_length` is set) |
-| `tools` | `list[ToolCard]` | `[]` | Tool cards; `TeamTool` is always prepended automatically |
+| `tools` | `list[ToolCard]` | `[]` | Tool cards; `TeamTool` and `MailboxTool` are always prepended automatically |
 
 #### Usage limits: two tiers
 
@@ -622,18 +638,41 @@ Runtime state extending `BaseState`:
 
 | Channel | Consumer | Examples |
 |---|---|---|
-| `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `web_search()`, `workspace_read()` |
+| `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `read_mailbox()`, `web_search()`, `workspace_read()` |
 | `SYSTEM_PROMPT` | LLM system prompt — rendered into the frozen system block | backstory, current date |
-| `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary |
-| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary` |
+| `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary, mailbox status |
+| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`, `stop` |
 
-`TeamTool` is always prepended to `config.tools` if not already present, ensuring every
-`BaseAgent` can hire and fire members.
+`TeamTool` **and** `MailboxTool` are always prepended to `config.tools` if not already
+present, so every `BaseAgent` can hire and fire members (`TeamTool`) and carries the
+mailbox surfaces — mailbox status as context state, the `read_mailbox` peek tool, and
+`/stop` (`MailboxTool`). A card already supplied in `config.tools` wins over the prepended
+default, and `config.tools` itself is never mutated — `on_start()` copies the list.
+
+### Assembly: what `on_start` collects
+
+`on_start()` walks the card set once through the `ToolFactory` and consumes each channel
+exactly once:
+
+| Channel | Collected in `on_start` via | Consumed |
+|---|---|---|
+| `TOOL_CALL` | `tool_factory.get_tools()` / `get_toolsets()` | handed to the `ReactAgent` at build |
+| `SYSTEM_PROMPT` | `tool_factory.get_system_prompts()` | registered once into the frozen system block |
+| `LLM_CONTEXT` | `tool_factory.get_context_states()` | providers held for the agent's lifetime; diffed and delivered per turn by `_deliver_context_update` |
+| `COMMAND` | `tool_factory.get_command_registry(extra_commands=[compact, clear])` | one `CommandRegistry`, announced once via `CommandsAnnouncedEvent` |
+
+**`BaseAgent` grows behaviour by hosting cards, not by accreting methods.** `MailboxTool`
+is the worked example: three capabilities, each riding its own channel — `MailboxState` on
+`LLM_CONTEXT`, `read_mailbox` on `TOOL_CALL`, `/stop` on `COMMAND` — and the agent gained
+all three without a single new method. When the next feature is a capability the LLM, the
+operator, or the context should see, write it as a card and let the table above route each
+piece to the hook that serves it. The card-author side of this contract is the
+`akgentic-tool` README's *Building a feature as a card* authoring guide.
 
 ### Context updates
 
-Volatile, team-shared state — the roster, role profiles, planning, the knowledge-graph summary —
-never enters the system prompt: the system block holds the backstory and the current date only, and
+Volatile, team-shared state — the roster, role profiles, planning, the knowledge-graph summary,
+the mailbox status — never enters the system prompt: the system block holds the backstory and the current date only, and
 stays byte-identical run to run so the prompt-cache prefix survives. Instead, before each run the
 agent appends **at most one block** at the tail of the conversation carrying what changed since the
 last block it delivered.
@@ -782,6 +821,7 @@ The registry contents follow from the tool cards attached to the agent:
 | `planning_summary()` | `PlanningTool` | Full team planning text |
 | `get_planning_task(task_id)` | `PlanningTool` | Single planning task by ID |
 | `search_planning(...)` | `PlanningTool` | Search the shared task board |
+| `stop()` | `MailboxTool` | Cancel the current run; dispatched while idle it only replies that nothing is running — the mid-run effect is the cancel hook's (see [Run Cancellation](#run-cancellation)) |
 | `compact()` / `clear()` | `BaseAgent` built-ins | Compact or clear the conversation context |
 
 Do not hand-transcribe this table into your own code: read the set from
@@ -814,6 +854,67 @@ Expansion happens in `act()` before `run_sync()`, and only when the expansion ac
 something: if the command returns the prompt unchanged, the plain string is sent as-is. Errors and
 document hints are forwarded to the LLM rather than silently dropped. Agents whose registry has no
 `_expand_media_refs` are unaffected — the block is a no-op.
+
+## Run Cancellation
+
+A running turn can be interrupted. The design is **two surfaces, one predicate, one hook**:
+
+- **Two surfaces.** `/stop` is a `MailboxTool` command, announced to every frontend through
+  the same `CommandsAnnouncedEvent` as any other command; `CancelMessage`
+  (`akgentic.core.messages`) is the typed carrier for programmatic senders. Both land in the
+  agent's mailbox like any other message.
+- **One predicate.** `is_cancel`, defined once in `akgentic.tool.mailbox`, recognises both
+  forms — nothing else in the system parses cancel vocabulary.
+- **One hook.** `MailboxCancelCapability.before_model_request`, built **unconditionally** by
+  `BaseAgent` — never contributed by a card, so cancellation works even on an agent
+  configured without `MailboxTool`. The card owns the *vocabulary*; the agent owns the
+  *enforcement*.
+
+The flow: while a run is in progress, the hook peeks the mailbox before every model request
+and raises `RunInterruptedError` at the next step boundary once a cancel is pending.
+`receiveMsg_AgentMessage` catches it around `act()`: the human is notified
+("Run interrupted."), nothing is routed, and the handler returns normally — **the run dies,
+the agent survives**. The actor loop then dequeues the `/stop` itself, which answers through
+ordinary command dispatch (its reply: nothing is running any more). A `CancelMessage`
+dequeued while the agent is idle lands on `receiveMsg_CancelMessage`, an
+acknowledge-and-log no-op — by that point there is nothing to cancel.
+
+**The mailbox is the cancellation's single source of truth.** There is no cancel flag and no
+clear step: recognising the cancel (the hook's peek) and consuming it (the actor loop's
+dequeue) are the same message leaving the same queue, so a cancel can never go stale and
+cancel the next run.
+
+### The mid-run arrival notice
+
+The same hook, after the cancel check, announces mail that arrived during the run: new
+pending messages are announced **once**, by an **ephemeral** notice appended to the outgoing
+model request (rendered by `render_arrival_notice`). The notice reaches the provider and
+never the durable history or the event store — the debug log line at injection time is the
+only audit trail that the doorbell rang. Announced-id tracking is run-local: `act()` resets
+it at each run start, so it dies with the run. The durable record exists regardless: the
+`read_mailbox` tool return if the model chooses to look, and the message's own turn either
+way — every pending message is still delivered as its own turn after the run ends.
+
+### Honest limitations
+
+- **An interruption is a clean end, not a failure.** It never routes through the failure
+  path: no `ErrorMessage` is emitted, and the handler returns normally. (An exception
+  escaping a handler would not stop the actor either — `Akgent._handle_failure` in
+  `akgentic-core` keeps the actor loop alive and emits an `ErrorMessage` to the
+  orchestrator; actor death on failure is stock-pykka behaviour only. The catch site's
+  invariant is stronger than survival: the failure path is never entered at all.)
+- **Granularity is the next step boundary, never mid-stream.** The hook fires before every
+  model request inside the REACT loop — bracketing every tool call and reasoning step — but
+  it does not abort an in-flight provider stream: a single very long model response is
+  uninterruptible from inside. A tool-free single completion has no step boundary at all, so
+  it can neither be cancelled nor see mid-run mail — accepted, since that run is ending
+  anyway.
+- **A cancel pending during a run-tier-breach conclusion escalates the breach.** When the
+  `@guard_usage_limits` tool-free conclusion is running (see
+  [What happens when a limit is hit](#what-happens-when-a-limit-is-hit)), a pending cancel
+  is caught by `try_conclude_without_tools`'s blanket `except` and **escalates the original
+  breach** rather than reading as an interruption — a safe, known, accepted outcome: the
+  turn ends either way, and the queued `/stop` still answers through dispatch.
 
 ## Examples
 
