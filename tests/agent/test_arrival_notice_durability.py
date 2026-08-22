@@ -90,9 +90,11 @@ def _make_minimal_agent(mailbox: _MailboxDouble) -> BaseAgent:
     agent._command_registry = registry  # type: ignore[attr-defined]
     agent.team_id = uuid.uuid4()
 
-    agent._context_state_providers = []  # type: ignore[attr-defined]
-    agent._context_baselines = {}  # type: ignore[attr-defined]
-    agent._context_update_seq = 0  # type: ignore[attr-defined]
+    # No context state to deliver: this test is about the arrival notice, and a
+    # Context update block would add a message the assertions would have to
+    # discount.
+    agent._context_updater = MagicMock()  # type: ignore[attr-defined]
+    agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
 
     agent._cancel_capability = MailboxCancelCapability(observer=mailbox)
 
