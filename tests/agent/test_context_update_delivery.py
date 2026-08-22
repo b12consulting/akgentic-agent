@@ -20,11 +20,11 @@ from typing import Any, Self
 from unittest.mock import MagicMock
 
 import pytest
+from akgentic.llm import ContextManager, ReactAgent
+from akgentic.tool.core import ContextState
+
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig
-from akgentic.llm import ContextManager, ReactAgent
-
-from akgentic.tool.core import ContextState
 
 # =============================================================================
 # HELPERS
@@ -223,6 +223,31 @@ class TestDeltaTurns:
             "New tasks: ID 2 [u]"
         )
 
+    def test_provider_first_seen_after_first_block_renders_full_in_delta_block(self) -> None:
+        """First-seen-is-never-a-delta, even inside a later, change-worded block.
+
+        A provider unavailable (None) on turn 1 that appears on turn 2 has no
+        baseline: it must render full. A delta against nothing would raise in
+        the renderer and degrade to no section, so the exact full rendering in
+        block 2 discriminates the two paths.
+        """
+        roster: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
+        planning: dict[str, ContextState | None] = {"state": None}
+        agent = _make_agent(
+            [_provider("team_roster_state", roster), _provider("planning_state", planning)]
+        )
+
+        agent._deliver_context_update()
+        planning["state"] = _PlanningState(tasks=("ID 1 [t]",))
+        agent._deliver_context_update()
+
+        blocks = _recorded_blocks(agent)
+        assert len(blocks) == 2
+        assert blocks[1] == (
+            "**Context update 2** — state has changed since the last update.\n\n"
+            "**Planning:** ID 1 [t]"
+        )
+
 
 # =============================================================================
 # AC 4 — same-type rule: a type change renders full, never a cross-type diff
@@ -391,13 +416,13 @@ class TestOnStartCollection:
     """
 
     def test_card_provider_is_collected_and_delivered_on_first_turn(self) -> None:
+        from akgentic.core import ActorSystem, BaseConfig, Orchestrator
+        from akgentic.llm import ModelConfig, PromptTemplate
+        from akgentic.tool.core import ToolCard
+
         import akgentic.agent.agent as agent_module
         from akgentic.agent.messages import AgentMessage
         from akgentic.agent.output_models import StructuredOutput
-        from akgentic.core import ActorSystem, BaseConfig, Orchestrator
-        from akgentic.llm import ModelConfig, PromptTemplate
-
-        from akgentic.tool.core import ToolCard
 
         class _StateCard(ToolCard):
             def get_tools(self) -> list[Callable[..., Any]]:
