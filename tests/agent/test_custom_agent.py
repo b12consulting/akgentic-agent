@@ -45,6 +45,11 @@ def _make_custom_agent() -> CustomAgent:
     agent._command_registry = MagicMock()  # type: ignore[attr-defined]
     agent.team_id = uuid.uuid4()
 
+    # Context-state delivery attributes normally set by on_start (Epic 19).
+    agent._context_state_providers = []  # type: ignore[attr-defined]
+    agent._context_baselines = {}  # type: ignore[attr-defined]
+    agent._context_update_seq = 0  # type: ignore[attr-defined]
+
     config = MagicMock(spec=AgentConfig)
     config.name = "@Triage"
     agent.config = config  # type: ignore[attr-defined]

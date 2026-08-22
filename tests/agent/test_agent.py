@@ -70,6 +70,11 @@ def _make_minimal_agent(name: str = "@TestAgent", media_cmd: Any = None) -> Base
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
     agent._current_message = _make_mock_message()  # type: ignore[attr-defined]
 
+    # Context-state delivery attributes normally set by on_start (Epic 19).
+    agent._context_state_providers = []  # type: ignore[attr-defined]
+    agent._context_baselines = {}  # type: ignore[attr-defined]
+    agent._context_update_seq = 0  # type: ignore[attr-defined]
+
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = name
     agent.config = mock_config  # type: ignore[attr-defined]

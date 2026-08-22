@@ -77,6 +77,11 @@ def _make_agent() -> BaseAgent:
     agent._react_agent = MagicMock(spec=ReactAgent)  # type: ignore[attr-defined]
     agent.team_id = uuid.uuid4()
 
+    # Context-state delivery attributes normally set by on_start (Epic 19).
+    agent._context_state_providers = []  # type: ignore[attr-defined]
+    agent._context_baselines = {}  # type: ignore[attr-defined]
+    agent._context_update_seq = 0  # type: ignore[attr-defined]
+
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"
     agent.config = mock_config  # type: ignore[attr-defined]

@@ -29,6 +29,7 @@ Architecture:
 import logging  # noqa: I001
 import os
 import random
+from collections.abc import Callable
 from datetime import datetime, timezone
 from time import sleep
 from typing import Any, TypeVar, cast
@@ -50,7 +51,7 @@ from akgentic.llm import (
     UserPrompt,
     aggregate_usage,
 )
-from akgentic.tool.core import CommandRegistry, ToolFactory
+from akgentic.tool.core import CommandRegistry, ContextState, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
 from akgentic.tool.team import TeamTool
@@ -202,6 +203,17 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 commands=self._command_registry.descriptors(),
             )
         )
+
+        # ── Context-state providers (LLM_CONTEXT channel) ──────────────────────
+        # Collected once for the agent's lifetime, like the command registry.
+        # Baselines are an in-memory cache keyed by provider __name__ — never
+        # persisted: the message history is the record, and a lost baseline can
+        # only cause a full-snapshot re-send, never a lost update.
+        self._context_state_providers: list[Callable[[], ContextState | None]] = (
+            tool_factory.get_context_states()
+        )
+        self._context_baselines: dict[str, ContextState] = {}
+        self._context_update_seq: int = 0
 
         self._react_agent = self._build_react_agent(react_agent_config, tools, toolsets)
 
@@ -358,6 +370,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 this method neither notifies anyone nor wraps them, and it does
                 not tell the tiers apart — the decorator does all of it.
         """
+        self._deliver_context_update()
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
         prompt: UserPrompt = user_content
         if self._command_registry.has("_expand_media_refs"):
@@ -375,6 +388,104 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         return cast(T, output)
 
+    def _deliver_context_update(self) -> None:
+        """Append at most one **Context update** block for this turn.
+
+        The single delivery site (called at the top of ``act()``, before
+        ``run_sync``): reads every context-state provider in factory order,
+        diffs against the in-memory baselines, composes at most one block, and
+        appends it through ``ContextManager.record_operator_action`` — the
+        buffer-vs-append decision stays with the context, so on a fresh agent
+        the first block is folded into the first run's user prompt instead of
+        suppressing system-prompt injection.
+
+        The baselines of contributing providers and the block counter advance
+        only when a block is actually appended; a turn with nothing to say
+        appends nothing, so an unchanged turn stays byte-identical for the
+        prompt cache. Context construction never raises (see
+        ``_render_context_section`` for the per-provider degradation).
+        """
+        sections: list[str] = []
+        advanced: dict[str, ContextState] = {}
+        for provider in self._context_state_providers:
+            contribution = self._render_context_section(provider)
+            if contribution is None:
+                continue
+            rendering, state = contribution
+            sections.append(rendering)
+            advanced[provider.__name__] = state
+        if not sections:
+            return
+        block = self._compose_context_update(sections)
+        self._react_agent.context.record_operator_action(block)
+        self._context_baselines.update(advanced)
+        self._context_update_seq += 1
+
+    def _render_context_section(
+        self, provider: Callable[[], ContextState | None]
+    ) -> tuple[str, ContextState] | None:
+        """Compute one provider's section for this turn, or ``None`` for no section.
+
+        First-seen states — and states whose concrete type differs from their
+        baseline's (a card reconfigured mid-life) — render ``render_full()``;
+        otherwise ``render_delta(baseline)``. The rendering is used verbatim.
+
+        Degradation, never failure: a provider or renderer that raises is
+        logged and skipped without advancing its baseline; a ``None`` state or
+        an empty full rendering contributes nothing. A ``None`` delta means no
+        change, so the baseline may advance to the current (equal) state even
+        though no section is produced.
+
+        Returns:
+            The ``(rendering, state)`` pair to contribute, or ``None``.
+        """
+        name = provider.__name__
+        try:
+            state = provider()
+        except Exception:
+            logger.exception(
+                "[%s] context-state provider '%s' raised; skipped", self.config.name, name
+            )
+            return None
+        if state is None:
+            return None
+        baseline = self._context_baselines.get(name)
+        try:
+            if baseline is None or type(state) is not type(baseline):
+                rendering: str | None = state.render_full()
+            else:
+                rendering = state.render_delta(baseline)
+        except Exception:
+            logger.exception(
+                "[%s] context-state renderer '%s' raised; skipped", self.config.name, name
+            )
+            return None
+        if rendering is None:
+            self._context_baselines[name] = state
+            return None
+        if not rendering:
+            return None
+        return rendering, state
+
+    def _compose_context_update(self, sections: list[str]) -> str:
+        """Compose one Context update block: marker line + verbatim sections.
+
+        The marker is ``**Context update N**`` with a fixed suffix — worded as
+        current state for the first block of the agent's life (every section is
+        a full render then), as change otherwise. Nothing turn-varying beyond
+        ``N`` may appear: a timestamp or "as of" line would defeat the cache
+        property this epic exists for. Sections are joined to the marker and to
+        each other with blank lines, never re-wrapped — the renderers own their
+        internal join style.
+        """
+        number = self._context_update_seq + 1
+        suffix = (
+            "current state."
+            if self._context_update_seq == 0
+            else "state has changed since the last update."
+        )
+        marker = f"**Context update {number}** — {suffix}"
+        return "\n\n".join([marker, *sections])
 
     def _route_output(self, output: StructuredOutput) -> bool:
         """Send one AgentMessage per Request — the class's single routed send path.
