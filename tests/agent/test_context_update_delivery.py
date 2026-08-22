@@ -394,8 +394,6 @@ class TestFirstRunFold:
         assert context.messages == []  # folding never materializes history
 
     def test_after_first_run_block_is_appended_as_user_role_message(self) -> None:
-        from pydantic_ai.messages import ModelRequest, UserPromptPart
-
         holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
         agent = _make_agent([_provider("team_roster_state", holder)])
         context = ContextManager()

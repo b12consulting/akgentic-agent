@@ -705,12 +705,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     def _record_operator_action(self, entry: str) -> None:
         """Hand one out-of-band, user-role entry to the LLM ContextManager.
 
-        The single point where this class writes something the agent did not say
-        itself into its own history. Its one caller today is
-        :meth:`_dispatch_command`, for a human's slash command. The wording of the
-        entry belongs to the caller, so a second kind of out-of-band event can
-        never be framed as the first; the buffer-vs-append decision belongs to the
-        context (ADR-007 §3) and is not reimplemented here.
+        One of two points where this class writes non-agent content into its own
+        history — the sibling is the context-update delivery at the top of
+        :meth:`act`, which calls the context primitive directly. Its one caller
+        today is :meth:`_dispatch_command`, for a human's slash command; the
+        wording of the entry belongs to the caller, and the buffer-vs-append
+        decision belongs to the context (ADR-007 §3), not reimplemented here.
 
         Args:
             entry: The pre-composed entry text.

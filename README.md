@@ -649,8 +649,8 @@ suffixes:
 - The *current state* wording is used when the agent holds no diff baselines as delivery begins —
   the first block of an agent's life, and any block after `/clear`, a restore, or an eviction. Every
   section in such a block is a full snapshot.
-- The *state has changed* wording is used when the block was diffed against state the model has
-  already seen: those blocks carry only the deltas.
+- The *state has changed* wording is used when the block was diffed against surviving baselines:
+  its sections are deltas, plus a full rendering for any provider contributing for the first time.
 - **When nothing changed, nothing is appended** — an idle turn adds only the user's own message.
 
 The mechanism is self-healing. Before trusting its baselines the agent verifies that its last
