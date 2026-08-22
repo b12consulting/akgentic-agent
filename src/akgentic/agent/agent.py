@@ -30,10 +30,9 @@ Architecture:
   next request. act() absorbs the interruption, notifies the human and returns a
   default output_type() — an empty StructuredOutput on the team path, which
   routes nothing, so no handler carries a catch. The run dies, the agent
-  survives. The
-  agent owns both the cancel vocabulary and its enforcement: the capability is
-  built unconditionally, so it must work on an agent configured without
-  MailboxTool
+  survives. The agent owns both the cancel vocabulary and its enforcement: the
+  capability is built unconditionally, so it must work on an agent configured
+  without MailboxTool
 - Custom capabilities: extra_capabilities() is the subclass override. The
   framework prepends its own capability, so self._capabilities is always
   [mailbox, *extra_capabilities()] and cancellation cannot be de-configured
