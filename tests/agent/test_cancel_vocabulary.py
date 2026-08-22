@@ -153,7 +153,7 @@ def test_arrival_notice_deduplicates_senders_in_first_seen_order() -> None:
 class TestVocabularyOwnership:
     """The predicate and the wording are defined here, not borrowed from a card.
 
-    ``MailboxCancelCapability`` is built unconditionally, so an agent carrying
+    ``MailboxCapability`` is built unconditionally, so an agent carrying
     no ``MailboxTool`` must still cancel — a vocabulary that shipped with the
     card could not serve that agent. ``__module__`` rather than an identity
     comparison against the tool's copy: the tool's copies are on their way out,

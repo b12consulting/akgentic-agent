@@ -664,6 +664,50 @@ operator, or the context should see, write it as a card and let the table above 
 piece to the hook that serves it. The card-author side of this contract is the
 `akgentic-tool` README's *Building a feature as a card* authoring guide.
 
+### Adding a capability of your own
+
+A card is the right shape for anything the LLM, the operator or the context should see. A
+**pydantic-ai capability** is the right shape for something that has to run *around every
+model request* — an observability wrapper, a domain guard, a tenant-resolution hook. Those
+have no channel to ride, so `BaseAgent` offers a hook instead:
+
+```python
+from typing import Any
+
+from pydantic_ai import AgentCapability
+
+from akgentic.agent.agent import BaseAgent
+
+
+class AuditedAgent(BaseAgent):
+    def extra_capabilities(self) -> list[AgentCapability[Any]]:
+        return [AuditCapability(self.config.name)]
+```
+
+`_build_react_agent` assembles the list once and hands the same object to both build sites:
+
+```python
+self._capabilities = [self._mailbox_capability, *self.extra_capabilities()]
+```
+
+Two things follow, and both are deliberate:
+
+- **The framework's own capability is prepended, never returned by the hook.** Cancellation
+  is unconditional — a subclass that forgot to call `super()` would otherwise silently lose
+  the ability to be stopped. Do not return `MailboxCapability` from `extra_capabilities()`;
+  you would get two of it.
+- **Mailbox-first is an ordering guarantee, not an accident.** Hook order is registration
+  order, so the cancel check runs before any custom capability's work: a run that is about
+  to be cancelled does not first pay for a third party's `before_model_request`.
+
+`extra_capabilities()` is called from `_build_react_agent`, during `on_start` and *before*
+`self._react_agent` exists — so an override may read `self.config`, but must not touch the
+ReactAgent or anything built later in `on_start`. `AgentCapability` is the union of
+`AbstractCapability` and a plain capability function, so either shape is accepted. There is
+no per-capability lifecycle: the framework resets its own capability by name at each run
+start and never iterates the list. `CustomAgent` in `custom_agent.py` carries a runnable
+version of the above.
+
 ### Context updates
 
 Volatile, team-shared state — the roster, role profiles, planning, the knowledge-graph summary,
@@ -865,7 +909,7 @@ A running turn can be interrupted. The design is **two surfaces, one predicate, 
   agent's mailbox like any other message.
 - **One predicate.** `is_cancel`, defined once in `akgentic.agent.capabilities`, recognises
   both forms — nothing else in the system parses cancel vocabulary.
-- **One hook.** `MailboxCancelCapability.before_model_request` (same module), built
+- **One hook.** `MailboxCapability.before_model_request` (same module), built
   **unconditionally** by `BaseAgent` — never contributed by a card, so cancellation works even
   on an agent configured without `MailboxTool`. The agent owns *both* the vocabulary and the
   enforcement, and the first is a consequence of the second: a card-less agent has no card to

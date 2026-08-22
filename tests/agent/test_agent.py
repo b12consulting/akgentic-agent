@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 from akgentic.tool.workspace.readers import MediaContent
 from pydantic_ai import BinaryContent
 
-from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -75,9 +75,9 @@ def _make_minimal_agent(name: str = "@TestAgent", media_cmd: Any = None) -> Base
     agent._context_updater = MagicMock()  # type: ignore[attr-defined]
     agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
 
-    # Cancel capability normally built in _build_react_agent (Epic 20) —
+    # Mailbox capability normally built in _build_react_agent (Epic 20) —
     # act() resets its run-local tracking at each run start.
-    agent._cancel_capability = MailboxCancelCapability(observer=agent)  # type: ignore[arg-type]
+    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = name

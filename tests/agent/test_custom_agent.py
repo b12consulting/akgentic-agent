@@ -48,9 +48,9 @@ def _make_custom_agent() -> CustomAgent:
     # Needed only by the specs that drive the REAL act(): a bare MagicMock
     # answers has("_expand_media_refs") truthily, sending act() into media
     # expansion over a MagicMock; and act()'s first statement resets the
-    # cancel capability's run-local tracking.
+    # mailbox capability's run-local tracking.
     agent._command_registry.has.return_value = False  # type: ignore[attr-defined]
-    agent._cancel_capability = MagicMock()  # type: ignore[attr-defined]
+    agent._mailbox_capability = MagicMock()  # type: ignore[attr-defined]
     agent.team_id = uuid.uuid4()
 
     # The context updater normally built in on_start. These specs are not about
@@ -206,13 +206,13 @@ class TestCustomAgentRunTierBreach:
 class TestCustomAgentRunInterruption:
     """Epic 20 invariant 2 holds in the exemplar: no escape into the failure path.
 
-    The cancel capability is built unconditionally by ``_build_react_agent``,
+    The mailbox capability is built unconditionally by ``_build_react_agent``,
     so every subclass run is interruptible — and the subclass supplies
     **nothing** for it: ``act()`` absorbs the ``RunInterruptedError``, notifies
     the human once and returns a neutral ``TriageOutput``.
 
     Both specs drive the **real** ``act()``, with ``run_sync`` raising as the
-    cancel capability would. Mocking ``act`` away would test the handler's own
+    mailbox capability would. Mocking ``act`` away would test the handler's own
     catch, and there is none left to test.
     """
 
@@ -260,13 +260,22 @@ class TestCustomAgentRunInterruption:
 class TestCustomAgentOverridesNothing:
     """The structural half of AC-5: the policy is applied, never re-implemented."""
 
-    def test_it_defines_only_its_own_router_and_handler(self) -> None:
+    def test_it_defines_only_its_own_router_handler_and_capability_hook(self) -> None:
+        """Its own work and one supported hook — no framework method re-implemented.
+
+        ``extra_capabilities`` is the third name because the exemplar contributes
+        a capability of its own; it is an *override point the framework offers*,
+        not a policy this class took over. The set stays exact rather than a
+        superset check, so a ``CustomAgent`` that started overriding ``act``,
+        ``_route_output`` or ``_build_react_agent`` still turns this red — which
+        is the whole claim.
+        """
         own = {
             name
             for name, value in vars(CustomAgent).items()
             if callable(value) and not name.startswith("__")
         }
-        assert own == {"_route_triage", "receiveMsg_TriageMessage"}
+        assert own == {"_route_triage", "receiveMsg_TriageMessage", "extra_capabilities"}
 
     def test_the_handler_itself_carries_no_error_handling(self) -> None:
         """Undecorated, the same breach escapes — so the guard is what catches it.

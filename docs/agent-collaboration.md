@@ -523,7 +523,7 @@ is gone — the system block is frozen and carries no mailbox content):
   content of every pending message. Reading does not consume them: each will still be
   delivered as its own turn after the current run ends.
 - **The mid-run arrival notice** — mail arriving *while a run is in progress* is announced
-  once by `MailboxCancelCapability.before_model_request`, through
+  once by `MailboxCapability.before_model_request`, through
   `ctx.enqueue(notice, priority="asap")`. pydantic-ai's auto-injected drain capability
   delivers the notice into the model request at the next step boundary and records it in the
   durable history and the event store as its own user-role message — the transcript records
@@ -866,8 +866,8 @@ What the subclass gets, and what it must supply:
 
 | | |
 |---|---|
-| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing, and absorbs `RunInterruptedError` itself (notify the human once, return a neutral `output_type()`), so no handler writes a catch; `@guard_usage_limits` — the tier policy; `MailboxCancelCapability` — built unconditionally, so every subclass run is interruptible; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
-| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output |
+| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing, and absorbs `RunInterruptedError` itself (notify the human once, return a neutral `output_type()`), so no handler writes a catch; `@guard_usage_limits` — the tier policy; `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, mid-run arrivals are announced to the model once, and (ADR-019 §3) the recognised cancel will be purged from the mailbox; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
+| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first |
 
 A run-tier breach in `CustomAgent` therefore concludes in **`TriageOutput`** and is delivered
 by **`_route_triage`**, with `CustomAgent` overriding nothing — because the schema and the
@@ -1352,7 +1352,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     receiveMsg_CancelMessage(message, sender) -> None
         Acknowledge a CancelMessage dequeued while the agent is idle — a logged
         no-op. Cancellation is enforced mid-run by the mailbox peek inside
-        MailboxCancelCapability, not by this handler; by the time a cancel is
+        MailboxCapability, not by this handler; by the time a cancel is
         dequeued and lands here there is nothing to cancel.
 
     hire_member(role) -> ActorAddress

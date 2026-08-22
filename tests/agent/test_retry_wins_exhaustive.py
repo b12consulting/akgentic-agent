@@ -42,7 +42,7 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
-from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -87,8 +87,8 @@ def _make_minimal_agent() -> BaseAgent:
     agent._context_updater = MagicMock()  # type: ignore[attr-defined]
     agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
 
-    # Cancel capability normally built in _build_react_agent (Epic 20).
-    agent._cancel_capability = MailboxCancelCapability(observer=agent)  # type: ignore[arg-type]
+    # Mailbox capability normally built in _build_react_agent (Epic 20).
+    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"

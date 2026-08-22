@@ -33,7 +33,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig, AgentState
 
 # =============================================================================
@@ -98,8 +98,8 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
         agent, providers or []
     )
 
-    # Cancel capability normally built in _build_react_agent (Epic 20).
-    agent._cancel_capability = MailboxCancelCapability(observer=agent)  # type: ignore[arg-type]
+    # Mailbox capability normally built in _build_react_agent (Epic 20).
+    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
     return agent
 
 
@@ -212,8 +212,8 @@ def _real_react_agent_pair() -> tuple[ReactAgent, BaseAgent, dict[str, ContextSt
         agent, [_provider("team_roster_state", holder)]
     )
 
-    # Cancel capability normally built in _build_react_agent (Epic 20).
-    agent._cancel_capability = MailboxCancelCapability(observer=agent)  # type: ignore[arg-type]
+    # Mailbox capability normally built in _build_react_agent (Epic 20).
+    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
     return react_agent, agent, holder
 
 

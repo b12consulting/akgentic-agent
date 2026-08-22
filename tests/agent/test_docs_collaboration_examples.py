@@ -46,10 +46,12 @@ from akgentic.tool.event import CommandsAnnouncedEvent
 from akgentic.tool.planning import GetPlanning, PlanningTool, UpdatePlanning
 from akgentic.tool.team import TeamTool
 from pydantic import BaseModel, ValidationError
-from pydantic_ai import ModelRetry
+from pydantic_ai import AgentCapability, ModelRetry
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.models import ModelRequestContext
 
 import akgentic.agent.agent as agent_module
-from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
@@ -119,8 +121,8 @@ def _make_agent(
     agent._context_updater = MagicMock()
     agent._context_updater.compose_update.return_value = None
 
-    # Cancel capability normally built in _build_react_agent (Epic 20).
-    agent._cancel_capability = MailboxCancelCapability(observer=agent)  # type: ignore[arg-type]
+    # Mailbox capability normally built in _build_react_agent (Epic 20).
+    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
 
     config = MagicMock(spec=AgentConfig)
     config.name = name
@@ -826,6 +828,85 @@ class TestActOutputTypePassThrough:
 
         kwargs = _react_agent_of(agent).run_sync.call_args[1]
         assert kwargs["output_type"] is StructuredOutput
+
+
+# =============================================================================
+# extra_capabilities() — README `Adding a capability of your own`
+#                        + collaboration doc §6 (`Supplied here`)
+# =============================================================================
+
+
+class AuditCapability(AbstractCapability[Any]):
+    """The capability the README's `AuditedAgent` snippet returns."""
+
+    def __init__(self, agent_name: str) -> None:
+        self.agent_name = agent_name
+
+    async def before_model_request(
+        self, ctx: Any, request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        return request_context
+
+
+class AuditedAgent(BaseAgent):
+    """Transcribed verbatim from the README's `Adding a capability of your own`."""
+
+    def extra_capabilities(self) -> list[AgentCapability[Any]]:
+        return [AuditCapability(self.config.name)]
+
+
+class TestExtraCapabilitiesSnippet:
+    """Both documents claim the list is `[mailbox, *extra_capabilities()]`.
+
+    The snippet is only honest if a subclass overriding nothing else really gets
+    its capability into the ReactAgent, in that order, without touching
+    ``_build_react_agent``. ``ReactAgent`` is replaced with a recorder so the
+    assembly is observed at the build site the documentation names.
+    """
+
+    @staticmethod
+    def _build(agent: BaseAgent, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+        monkeypatch.delenv("AKGENTIC_MOCK_SCENARIO", raising=False)
+        captured: dict[str, Any] = {}
+
+        class _RecordingReactAgent:
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr(agent_module, "ReactAgent", _RecordingReactAgent)
+        agent._build_react_agent(MagicMock(), [], [])
+        return cast(list[Any], captured["capabilities"])
+
+    def test_the_documented_subclass_gets_its_capability_wired(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent: AuditedAgent = object.__new__(AuditedAgent)
+        config = MagicMock(spec=AgentConfig)
+        config.name = "@Audited"
+        agent.config = config  # type: ignore[attr-defined]
+
+        capabilities = self._build(agent, monkeypatch)
+
+        # Documented order: the framework's own first, the subclass's second.
+        assert capabilities is agent._capabilities
+        assert len(capabilities) == 2
+        assert capabilities[0] is agent._mailbox_capability
+        assert isinstance(capabilities[0], MailboxCapability)
+        assert isinstance(capabilities[1], AuditCapability)
+        # Documented: an override may read self.config.
+        assert capabilities[1].agent_name == "@Audited"
+
+    def test_a_subclass_overriding_nothing_gets_only_the_framework_capability(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Documented: `extra_capabilities()` returns `[]` on BaseAgent."""
+        agent: BaseAgent = object.__new__(BaseAgent)
+
+        assert agent.extra_capabilities() == []
+        capabilities = self._build(agent, monkeypatch)
+
+        assert len(capabilities) == 1
+        assert capabilities[0] is agent._mailbox_capability
 
 
 # =============================================================================

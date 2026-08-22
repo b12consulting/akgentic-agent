@@ -31,7 +31,7 @@ from akgentic.tool.core import ContextState, ContextUpdater
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import akgentic.agent.agent as agent_module
-from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig, AgentState
 
 # =============================================================================
@@ -118,8 +118,8 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
         agent, providers or []
     )
 
-    # Cancel capability normally built in _build_react_agent (Epic 20).
-    agent._cancel_capability = MailboxCancelCapability(observer=agent)  # type: ignore[arg-type]
+    # Mailbox capability normally built in _build_react_agent (Epic 20).
+    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
     return agent
 
 

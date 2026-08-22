@@ -1,4 +1,10 @@
-"""Mailbox-driven run cancellation: the vocabulary and the hook that enforces it.
+"""Mailbox-driven run control: the vocabulary and the hook that acts on it.
+
+The hook has more than one duty. It raises on a pending cancel, and it renders
+and enqueues the mid-run arrival notice for mail that landed while the run was
+in flight; under ADR-019 §3 it will also purge the recognised cancel from the
+mailbox. The mailbox is the single input to all of them, which is what makes
+them one capability rather than three.
 
 This is the first member of ``akgentic.agent.capabilities`` — the home for
 pydantic-ai capabilities the agent builds for itself. More are coming; a
@@ -8,7 +14,7 @@ tool card contributes.
 **Why the vocabulary lives here and not on the card.** ``is_cancel`` and
 ``render_arrival_notice`` used to be imported from ``akgentic.tool.mailbox``.
 They are defined here instead, because ``BaseAgent`` builds
-``MailboxCancelCapability`` unconditionally — precisely so that an agent
+``MailboxCapability`` unconditionally — precisely so that an agent
 configured with no ``MailboxTool`` at all is still interruptible, and a
 ``CancelMessage`` sent to such an agent still stops its run. A predicate that
 ships with the card cannot serve that case: on a card-less agent there is no
@@ -40,7 +46,7 @@ from akgentic.tool.mailbox import MailboxToolObserver
 class RunInterruptedError(Exception):
     """The current run was cancelled by a /stop or CancelMessage.
 
-    Raised by ``MailboxCancelCapability.before_model_request`` at the next step
+    Raised by ``MailboxCapability.before_model_request`` at the next step
     boundary once a cancel is pending in the mailbox (ADR-040 §5). Carries a
     message only. It must never escape a message handler: an escape ends the
     turn through the actor failure path (``Akgent._handle_failure`` — an
@@ -98,7 +104,7 @@ def _unique_ordered(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
-class MailboxCancelCapability(AbstractCapability[Any]):
+class MailboxCapability(AbstractCapability[Any]):
     """Mailbox-driven run cancellation and mid-run arrival notice (ADR-040 §5).
 
     One instance per agent, built unconditionally by ``BaseAgent`` — never

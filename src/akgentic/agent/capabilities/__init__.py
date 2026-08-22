@@ -8,14 +8,14 @@ than importing it from ``akgentic.tool.mailbox``: an agent configured with no
 """
 
 from akgentic.agent.capabilities.mailbox_capability import (
-    MailboxCancelCapability,
+    MailboxCapability,
     RunInterruptedError,
     is_cancel,
     render_arrival_notice,
 )
 
 __all__ = [
-    "MailboxCancelCapability",
+    "MailboxCapability",
     "RunInterruptedError",
     "is_cancel",
     "render_arrival_notice",

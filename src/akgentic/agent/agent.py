@@ -22,14 +22,21 @@ Architecture:
   traffic (every message is an AgentMessage), and receiveMsg_CancelMessage
   acknowledges a cancel that lands while the agent is idle. Akgent still
   contributes the lifecycle handler receiveMsg_StopRecursively
-- Run cancellation (ADR-040): MailboxCancelCapability, from
+- Mailbox-driven run control (ADR-040): MailboxCapability, from
   akgentic.agent.capabilities, peeks the mailbox before every model request and
-  raises RunInterruptedError on a pending /stop or CancelMessage; act() absorbs
-  it, notifies the human and returns a neutral output_type() — an empty
-  StructuredOutput on the team path, which routes nothing, so no handler carries
-  a catch. The run dies, the agent survives. The agent owns both the cancel
-  vocabulary and its enforcement: the capability is built unconditionally, so it
-  must work on an agent configured without MailboxTool
+  does two things with what it finds — it raises RunInterruptedError on a
+  pending /stop or CancelMessage, and it renders the mid-run arrival notice for
+  mail not yet announced this run and enqueues it for the next request. Under
+  ADR-019 §3 it will also purge the recognised cancel from the mailbox. act()
+  absorbs the interruption, notifies the human and returns a neutral
+  output_type() — an empty StructuredOutput on the team path, which routes
+  nothing, so no handler carries a catch. The run dies, the agent survives. The
+  agent owns both the cancel vocabulary and its enforcement: the capability is
+  built unconditionally, so it must work on an agent configured without
+  MailboxTool
+- Custom capabilities: extra_capabilities() is the subclass override. The
+  framework prepends its own capability, so self._capabilities is always
+  [mailbox, *extra_capabilities()] and cancellation cannot be de-configured
 - The usage-limit tier policy is applied, not written here: the handler carries
   @guard_usage_limits(output_type=..., route=...) from usage_limits.py. See
   custom_agent.py for a second agent class doing the same with its own schema
@@ -44,9 +51,9 @@ from datetime import datetime, timezone
 from time import sleep
 from typing import Any, TypeVar, cast
 
-from pydantic_ai import BinaryContent, ModelRetry, RunContext
+from pydantic_ai import AgentCapability, BinaryContent, ModelRetry, RunContext
 
-from akgentic.agent.capabilities import MailboxCancelCapability, RunInterruptedError
+from akgentic.agent.capabilities import MailboxCapability, RunInterruptedError
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput
@@ -90,10 +97,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     - MailboxTool: auto-injected if absent from config.tools; provides mailbox
       status as LLM_CONTEXT state, the read_mailbox peek tool, and the /stop
       command. A card supplied in config.tools wins over the default.
-    - MailboxCancelCapability: built unconditionally in _build_react_agent (no
+    - MailboxCapability: built unconditionally in _build_react_agent (no
       card involvement, no MailboxTool presence check) and handed to the
       ReactAgent via capabilities= — the cancel check and the mid-run arrival
       notice before every model request. act() resets its run-local tracking.
+    - extra_capabilities(): the subclass override for pydantic-ai capabilities
+      of your own. The framework prepends its own, so the list handed to the
+      ReactAgent is always [mailbox, *extra_capabilities()].
 
     Observer Protocol:
     - Implements TeamManagementToolObserver (structural typing via @runtime_checkable)
@@ -295,6 +305,34 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             logger.exception("[%s] ReactAgent.close() failed on stop", self.config.name)
         super().on_stop()
 
+    def extra_capabilities(self) -> list[AgentCapability[Any]]:
+        """Contribute pydantic-ai capabilities of your own. Override point.
+
+        Returns an empty list here. A subclass returning capabilities gets them
+        appended to the framework's, in the order returned, at both build sites:
+        ``self._capabilities = [self._mailbox_capability, *self.extra_capabilities()]``.
+
+        **Never return the mailbox capability from this hook.** The framework
+        prepends it, for two reasons that are the whole point of the split:
+
+        - Cancellation is unconditional (ADR-040 §5). A subclass that forgot to
+          call ``super()`` would otherwise silently lose the ability to be
+          stopped.
+        - The cancel check runs before any custom capability's work. Hook order
+          is registration order, so a run that is about to be cancelled does not
+          first pay for a third party's ``before_model_request``.
+
+        Called from ``_build_react_agent``, which runs during ``on_start``
+        before ``self._react_agent`` exists. An override must not touch it, and
+        must not assume anything built later in ``on_start``.
+
+        Returns:
+            Capabilities to append after the framework's own. Both an
+            ``AbstractCapability`` instance and a plain capability function are
+            accepted — ``AgentCapability`` is the union of the two.
+        """
+        return []
+
     def _build_react_agent(
         self, config: ReactAgentConfig, tools: list[Any], toolsets: list[Any]
     ) -> ReactAgent:
@@ -305,15 +343,26 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         real ``ReactAgent``. The deferred import keeps the optional ``loadtest``
         extra off the normal runtime path.
 
-        Both branches receive exactly one capability, the
-        ``MailboxCancelCapability`` built here — unconditionally, on the agent
-        and never on a card, so cancellation works even when the config carries
-        no ``MailboxTool`` (ADR-040 §5). The mock accepts and ignores
+        Both branches receive the same list, ``self._capabilities``: the
+        framework's own ``MailboxCapability`` built here first, then whatever
+        ``extra_capabilities()`` contributes. The framework's own is built
+        unconditionally, on the agent and never on a card, so cancellation works
+        even when the config carries no ``MailboxTool`` (ADR-040 §5), and it is
+        first because hook order is registration order — a run about to be
+        cancelled should not first pay for a third party's
+        ``before_model_request``. The mock accepts and ignores
         ``capabilities=``; drop-in parity keeps this wiring identical.
         """
         # Enforcement is agent-owned: held on self so act() can reset the
         # run-local announced-id tracking at each run start.
-        self._cancel_capability = MailboxCancelCapability(observer=self)
+        self._mailbox_capability = MailboxCapability(observer=self)
+        # The annotation is required: without it the list infers as
+        # list[MailboxCapability] from its first element and the splat below
+        # does not fit.
+        self._capabilities: list[AgentCapability[Any]] = [
+            self._mailbox_capability,
+            *self.extra_capabilities(),
+        ]
 
         # Env var name mirrors akgentic.llm.loadtest.SCENARIO_ENV_VAR.
         scenario = os.environ.get("AKGENTIC_MOCK_SCENARIO")
@@ -333,7 +382,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     tools=tools,
                     toolsets=toolsets,
                     observer=self,
-                    capabilities=[self._cancel_capability],
+                    capabilities=self._capabilities,
                 ),
             )
         return ReactAgent(
@@ -342,7 +391,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             tools=tools,
             toolsets=toolsets,
             observer=self,
-            capabilities=[self._cancel_capability],
+            capabilities=self._capabilities,
         )
 
     def init_llm_context(self, context: list[EventMessage]) -> None:
@@ -432,10 +481,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 this method neither notifies anyone nor wraps them, and it does
                 not tell the tiers apart — the decorator does all of it.
         """
-        # Run start: the cancel capability's announced-id tracking is run-local
+        # Run start: the mailbox capability's announced-id tracking is run-local
         # by contract, and the instance lives for the agent's lifetime — reset
-        # here, before run_sync, so no cross-run state survives.
-        self._cancel_capability.reset_run_tracking()
+        # here, before run_sync, so no cross-run state survives. The framework's
+        # own capability is reset by name; there is no per-capability lifecycle
+        # protocol and self._capabilities is not iterated here.
+        self._mailbox_capability.reset_run_tracking()
         self._deliver_context_update()
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
         prompt: UserPrompt = user_content
@@ -454,19 +505,19 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
         except RunInterruptedError as interruption:
             logger.info(
-                "[%s] run interrupted by a queued cancel; turn abandoned, nothing routed",
+                "[%s] run interrupted by a queued cancel; turn abandoned, routing nothing",
                 self.config.name,
             )
             self.notify_human("Run interrupted.")
-            # A neutral instance is only available when every field of the
+            # A default instance is only available when every field of the
             # caller's type has a default. When it is not, the caller sees the
             # interruption itself — never the construction error behind it, so
             # the exception is named rather than bare-re-raised.
             try:
-                neutral = output_type()
+                default = output_type()
             except Exception:
                 raise interruption from None
-            return neutral
+            return default
 
         return cast(T, output)
 
@@ -597,7 +648,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """Acknowledge a CancelMessage delivered as its own turn — a logged no-op.
 
         Cancellation is enforced by the mailbox peek inside the run (see
-        ``MailboxCancelCapability``), not by this handler: a cancel interrupts
+        ``MailboxCapability``), not by this handler: a cancel interrupts
         a run while still *pending*. By the time one is dequeued and lands
         here the agent is idle — there is nothing to cancel, no state to set,
         and the next run is unaffected.

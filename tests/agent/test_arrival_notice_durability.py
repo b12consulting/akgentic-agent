@@ -1,7 +1,7 @@
 """Real-chain durability of the mid-run arrival notice (Epic 20, FR4c).
 
 Drives a **real** pydantic-ai run graph — the ``test_retry_wins_exhaustive``
-pattern — with the ``MailboxCancelCapability`` wired in as a capability, so the
+pattern — with the ``MailboxCapability`` wired in as a capability, so the
 delivery path under test is the shipped one: the hook enqueues the notice via
 ``ctx.enqueue(notice, priority="asap")`` and pydantic-ai's auto-injected,
 outermost ``PendingMessageDrainCapability`` drains it into the next model
@@ -37,7 +37,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.capabilities import render_arrival_notice
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
@@ -80,7 +80,7 @@ def _make_minimal_agent(mailbox: _MailboxDouble) -> BaseAgent:
     """Construct a BaseAgent without the Pykka actor system.
 
     Same shape as ``test_retry_wins_exhaustive._make_minimal_agent``, except the
-    cancel capability observes a mailbox double instead of the agent itself, so
+    mailbox capability observes a mailbox double instead of the agent itself, so
     the test controls what mail is pending during the run.
     """
     agent: BaseAgent = object.__new__(BaseAgent)
@@ -96,7 +96,7 @@ def _make_minimal_agent(mailbox: _MailboxDouble) -> BaseAgent:
     agent._context_updater = MagicMock()  # type: ignore[attr-defined]
     agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
 
-    agent._cancel_capability = MailboxCancelCapability(observer=mailbox)
+    agent._mailbox_capability = MailboxCapability(observer=mailbox)
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"
@@ -108,7 +108,7 @@ def _make_minimal_agent(mailbox: _MailboxDouble) -> BaseAgent:
 
 
 def _build_react_agent(agent: BaseAgent, observer: _EventRecorder) -> ReactAgent:
-    """A real ReactAgent carrying the agent's cancel capability and the recorder.
+    """A real ReactAgent carrying the agent's mailbox capability and the recorder.
 
     The provider is ``google-gla`` on purpose (see ``test_retry_wins_exhaustive``):
     only the non-native path makes the output a discrete output tool call, which
@@ -122,7 +122,7 @@ def _build_react_agent(agent: BaseAgent, observer: _EventRecorder) -> ReactAgent
         config=react_config,
         deps_type=BaseAgent,
         observer=observer,
-        capabilities=[agent._cancel_capability],
+        capabilities=[agent._mailbox_capability],
     )
     agent._react_agent = react_agent  # type: ignore[attr-defined]
     return react_agent

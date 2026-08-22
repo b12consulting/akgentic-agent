@@ -2,7 +2,11 @@
 
 Two layers, matching the design's two halves:
 
-- Hook level: ``MailboxCancelCapability.before_model_request`` is invoked
+The capability list itself is pinned in ``TestCapabilityWiring`` (assembly and
+order, both build sites) and in ``TestExtraCapabilityFires`` (a subclass's own
+capability actually running inside a real run).
+
+- Hook level: ``MailboxCapability.before_model_request`` is invoked
   directly against a double exposing ``get_mailbox()``, a recording ``ctx``
   double exposing ``enqueue``, and a fabricated request context — no LLM, no
   actor. This is where the cancel-before-notice ordering, the
@@ -31,18 +35,21 @@ import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.core.messages import CancelMessage
 from akgentic.llm import ModelConfig, PromptTemplate, ReactAgent, ReactAgentConfig
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    ToolCallPart,
     UserPromptPart,
 )
+from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 import akgentic.agent
 import akgentic.agent.agent as agent_module
 from akgentic.agent import RunInterruptedError
-from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
+from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.capabilities import render_arrival_notice
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
@@ -113,20 +120,20 @@ class TestRunInterruptedError:
 
 class TestCancelCheck:
     async def test_pending_stop_raises(self) -> None:
-        capability = MailboxCancelCapability(observer=_MailboxDouble([_pending_message("/stop")]))
+        capability = MailboxCapability(observer=_MailboxDouble([_pending_message("/stop")]))
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
 
     async def test_pending_cancel_message_raises(self) -> None:
-        capability = MailboxCancelCapability(observer=_MailboxDouble([CancelMessage()]))
+        capability = MailboxCapability(observer=_MailboxDouble([CancelMessage()]))
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
 
     async def test_cancel_buried_behind_other_mail_still_raises(self) -> None:
         pending = [_pending_message("hello"), _pending_message("/stop now", "@Bob")]
-        capability = MailboxCancelCapability(observer=_MailboxDouble(pending))
+        capability = MailboxCapability(observer=_MailboxDouble(pending))
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
@@ -134,7 +141,7 @@ class TestCancelCheck:
     async def test_cancel_check_runs_before_the_notice(self) -> None:
         """A pending /stop raises — the new mail beside it is never announced."""
         pending = [_pending_message("hello"), _pending_message("/stop")]
-        capability = MailboxCancelCapability(observer=_MailboxDouble(pending))
+        capability = MailboxCapability(observer=_MailboxDouble(pending))
         ctx = _CtxDouble()
 
         with pytest.raises(RunInterruptedError):
@@ -144,7 +151,7 @@ class TestCancelCheck:
         assert capability._announced_ids == set()
 
     async def test_empty_mailbox_neither_raises_nor_enqueues(self) -> None:
-        capability = MailboxCancelCapability(observer=_MailboxDouble())
+        capability = MailboxCapability(observer=_MailboxDouble())
         ctx = _CtxDouble()
         context = _context()
 
@@ -163,7 +170,7 @@ class TestArrivalNotice:
     async def test_growth_enqueues_one_notice_at_asap_priority(self) -> None:
         """One growth, one ``ctx.enqueue`` call — the hook itself appends nothing."""
         arrived = _pending_message("news", "@Alice")
-        capability = MailboxCancelCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
         existing = ModelRequest(parts=[UserPromptPart(content="the turn prompt")])
         existing_parts = existing.parts
         ctx = _CtxDouble()
@@ -178,7 +185,7 @@ class TestArrivalNotice:
 
     async def test_same_message_is_announced_once_across_firings(self) -> None:
         arrived = _pending_message()
-        capability = MailboxCancelCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
         ctx = _CtxDouble()
 
         await capability.before_model_request(ctx, _context())
@@ -190,7 +197,7 @@ class TestArrivalNotice:
         first = _pending_message("one", "@Alice")
         second = _pending_message("two", "@Bob")
         mailbox = _MailboxDouble([first])
-        capability = MailboxCancelCapability(observer=mailbox)
+        capability = MailboxCapability(observer=mailbox)
         ctx = _CtxDouble()
 
         await capability.before_model_request(ctx, _context())
@@ -204,7 +211,7 @@ class TestArrivalNotice:
 
     async def test_reset_run_tracking_forgets_the_announced_backlog(self) -> None:
         arrived = _pending_message()
-        capability = MailboxCancelCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
         ctx = _CtxDouble()
 
         await capability.before_model_request(ctx, _context())
@@ -216,7 +223,7 @@ class TestArrivalNotice:
     async def test_no_growth_enqueues_nothing(self) -> None:
         arrived = _pending_message()
         mailbox = _MailboxDouble([arrived])
-        capability = MailboxCancelCapability(observer=mailbox)
+        capability = MailboxCapability(observer=mailbox)
         await capability.before_model_request(_CtxDouble(), _context())
 
         ctx = _CtxDouble()
@@ -233,7 +240,7 @@ class TestArrivalNotice:
 class _InterruptibleReactAgent:
     """ReactAgent double: records wiring; ``run_sync`` raises on demand.
 
-    ``interrupts_remaining`` simulates the cancel capability raising
+    ``interrupts_remaining`` simulates the mailbox capability raising
     ``RunInterruptedError`` out of ``run_sync`` mid-run — the doubles never
     drive pydantic-ai's capability chain, so the raise is injected here.
     """
@@ -320,16 +327,55 @@ def _wait_until(predicate: Callable[[], bool], timeout: float = 10.0) -> bool:
 
 
 # =============================================================================
-# FR4 wiring — the ReactAgent receives exactly one capability (both branches)
+# FR4 wiring — self._capabilities is the one list both branches receive
 # =============================================================================
 
 
+class _RecordingCapability(AbstractCapability[Any]):
+    """A custom capability that records every firing and changes nothing.
+
+    Stands in for what a consumer would actually contribute — an observability
+    wrapper, a domain guard — reduced to the part the specs can observe. It
+    returns ``request_context`` unchanged, so it cannot perturb the run it is
+    added to.
+    """
+
+    def __init__(self) -> None:
+        self.firings = 0
+
+    async def before_model_request(
+        self, ctx: Any, request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        self.firings += 1
+        return request_context
+
+
+class _AgentWithOneExtra(BaseAgent):
+    """A subclass contributing exactly one capability of its own.
+
+    ``extra_capabilities`` reads nothing off ``self`` — the wiring specs build
+    the agent with ``object.__new__``, so ``config``, ``state`` and
+    ``_command_registry`` do not exist when ``_build_react_agent`` calls it.
+    """
+
+    extra: ClassVar[_RecordingCapability] = _RecordingCapability()
+
+    def extra_capabilities(self) -> list[Any]:
+        return [self.extra]
+
+
 class TestCapabilityWiring:
-    def test_react_agent_receives_exactly_one_cancel_capability(self) -> None:
+    def test_bare_base_agent_yields_exactly_the_mailbox_capability(self) -> None:
+        """A subclass that overrides nothing gets ``[mailbox]`` and nothing else."""
         with _running_agent():
             capabilities = _InterruptibleReactAgent.captured[-1]["capabilities"]
             assert len(capabilities) == 1
-            assert isinstance(capabilities[0], MailboxCancelCapability)
+            assert isinstance(capabilities[0], MailboxCapability)
+
+    def test_base_agent_extra_capabilities_defaults_to_empty(self) -> None:
+        """The hook is safe on a half-built agent — it reads nothing off self."""
+        agent: BaseAgent = object.__new__(BaseAgent)
+        assert agent.extra_capabilities() == []
 
     def test_real_branch_builds_and_stores_the_capability(
         self, monkeypatch: pytest.MonkeyPatch
@@ -347,10 +393,11 @@ class TestCapabilityWiring:
         agent._build_react_agent(ReactAgentConfig(), [], [])
 
         capabilities = captured["capabilities"]
+        assert capabilities is agent._capabilities
         assert isinstance(capabilities, list)
         assert len(capabilities) == 1
-        assert capabilities[0] is agent._cancel_capability
-        assert isinstance(agent._cancel_capability, MailboxCancelCapability)
+        assert capabilities[0] is agent._mailbox_capability
+        assert isinstance(agent._mailbox_capability, MailboxCapability)
 
     def test_mock_branch_receives_the_same_capability(
         self, monkeypatch: pytest.MonkeyPatch
@@ -370,9 +417,52 @@ class TestCapabilityWiring:
         agent._build_react_agent(ReactAgentConfig(), [], [])
 
         capabilities = captured["capabilities"]
+        assert capabilities is agent._capabilities
         assert isinstance(capabilities, list)
         assert len(capabilities) == 1
-        assert capabilities[0] is agent._cancel_capability
+        assert capabilities[0] is agent._mailbox_capability
+
+    def test_real_branch_puts_the_mailbox_capability_before_the_extra(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Order is mailbox-first: the cancel check precedes any custom work."""
+        monkeypatch.delenv("AKGENTIC_MOCK_SCENARIO", raising=False)
+        captured: dict[str, object] = {}
+
+        class _FakeReactAgent:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+        monkeypatch.setattr(agent_module, "ReactAgent", _FakeReactAgent)
+        extra = _RecordingCapability()
+        monkeypatch.setattr(_AgentWithOneExtra, "extra", extra)
+        agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
+
+        agent._build_react_agent(ReactAgentConfig(), [], [])
+
+        assert captured["capabilities"] == [agent._mailbox_capability, extra]
+
+    def test_mock_branch_puts_the_mailbox_capability_before_the_extra(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same order in the load-test branch — drop-in parity."""
+        monkeypatch.setenv("AKGENTIC_MOCK_SCENARIO", "/tmp/sandpile-research.yaml")
+        captured: dict[str, object] = {}
+
+        class _FakeMockReactAgent:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+        fake_loadtest = types.ModuleType("akgentic.llm.loadtest")
+        fake_loadtest.MockReactAgent = _FakeMockReactAgent  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "akgentic.llm.loadtest", fake_loadtest)
+        extra = _RecordingCapability()
+        monkeypatch.setattr(_AgentWithOneExtra, "extra", extra)
+        agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
+
+        agent._build_react_agent(ReactAgentConfig(), [], [])
+
+        assert captured["capabilities"] == [agent._mailbox_capability, extra]
 
     def test_act_resets_the_run_local_tracking_at_run_start(self) -> None:
         with _running_agent() as (system, agent_addr, _):
@@ -580,7 +670,7 @@ def _make_cardless_agent(pending: list[Any]) -> BaseAgent:
     agent.config = mock_config  # type: ignore[attr-defined]
 
     agent.get_mailbox = MagicMock(return_value=pending)  # type: ignore[method-assign]
-    agent._cancel_capability = MailboxCancelCapability(observer=agent)
+    agent._mailbox_capability = MailboxCapability(observer=agent)
 
     agent.get_team = MagicMock(return_value=[])  # type: ignore[method-assign]
     agent.send = MagicMock()  # type: ignore[method-assign]
@@ -590,7 +680,7 @@ def _make_cardless_agent(pending: list[Any]) -> BaseAgent:
 class TestCardlessAgentStillCancels:
     """The requirement that forced the vocabulary out of the card.
 
-    ``MailboxCancelCapability`` is built unconditionally so that an agent
+    ``MailboxCapability`` is built unconditionally so that an agent
     configured without ``MailboxTool`` is still interruptible — and a
     ``CancelMessage`` from the frontend to such an agent must still kill the
     run. A predicate that shipped with the card could not serve this agent:
@@ -613,7 +703,7 @@ class TestCardlessAgentStillCancels:
                 model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
             ),
             deps_type=BaseAgent,
-            capabilities=[agent._cancel_capability],
+            capabilities=[agent._mailbox_capability],
         )
         agent._react_agent = react_agent  # type: ignore[attr-defined]
 
@@ -631,3 +721,89 @@ class TestCardlessAgentStillCancels:
 
         assert isinstance(output, StructuredOutput)
         assert output.messages == []
+
+
+# =============================================================================
+# The extension point works — a subclass's own capability actually fires
+# =============================================================================
+
+
+def _make_extension_point_agent() -> _AgentWithOneExtra:
+    """An ``_AgentWithOneExtra`` assembled far enough to survive one real run.
+
+    Same ``object.__new__`` shape as ``_make_cardless_agent``, but the
+    capability list is **not** set by hand: ``_build_react_agent`` assembles it,
+    which is the whole point — the spec must exercise the framework's own
+    assembly, not a list the test wrote.
+    """
+    agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
+
+    registry = MagicMock()
+    registry.has.return_value = False
+    agent._command_registry = registry  # type: ignore[attr-defined]
+    agent.team_id = uuid.uuid4()
+
+    agent._context_updater = MagicMock()  # type: ignore[attr-defined]
+    agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
+
+    mock_config = MagicMock(spec=AgentConfig)
+    mock_config.name = "@ExtensionPointAgent"
+    agent.config = mock_config  # type: ignore[attr-defined]
+
+    # No mail: the run must reach the model, so the cancel check must not fire.
+    agent.get_mailbox = MagicMock(return_value=[])  # type: ignore[method-assign]
+    agent.get_team = MagicMock(return_value=[])  # type: ignore[method-assign]
+    agent.send = MagicMock()  # type: ignore[method-assign]
+    agent.notify_event = MagicMock()  # type: ignore[method-assign]
+    return agent
+
+
+class TestExtraCapabilityFires:
+    """The AC that proves the extension point works rather than merely assembling.
+
+    Everything else pins the *list*. This drives a real ``ReactAgent`` — built
+    by ``_build_react_agent`` itself, over a ``FunctionModel`` so no network is
+    touched — and observes the subclass's own hook having run.
+    """
+
+    def test_a_subclass_capability_runs_during_a_real_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        monkeypatch.delenv("AKGENTIC_MOCK_SCENARIO", raising=False)
+        extra = _RecordingCapability()
+        monkeypatch.setattr(_AgentWithOneExtra, "extra", extra)
+
+        agent = _make_extension_point_agent()
+        react_agent = agent._build_react_agent(
+            ReactAgentConfig(
+                model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
+            ),
+            [],
+            [],
+        )
+        agent._react_agent = react_agent  # type: ignore[attr-defined]
+
+        # The framework assembled it, mailbox first, with the subclass's own second.
+        assert agent._capabilities == [agent._mailbox_capability, extra]
+        assert extra.firings == 0
+
+        def stub_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=info.output_tools[0].name,
+                        args={"messages": []},
+                        tool_call_id="out-1",
+                    )
+                ]
+            )
+
+        try:
+            with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+                output = agent.act("do the thing", StructuredOutput)
+        finally:
+            react_agent.close()
+
+        assert isinstance(output, StructuredOutput)
+        assert extra.firings >= 1
