@@ -15,10 +15,10 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import BaseModel
 from akgentic.core import ActorAddress
 from akgentic.core.agent import WarningError
 from akgentic.llm import AgentUsageLimitError, ReactAgent, RunUsageLimitError
+from pydantic import BaseModel
 
 from akgentic.agent.agent import RunInterruptedError
 from akgentic.agent.config import AgentConfig
