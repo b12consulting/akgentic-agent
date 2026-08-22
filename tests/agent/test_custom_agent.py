@@ -19,6 +19,7 @@ from akgentic.core import ActorAddress
 from akgentic.core.agent import WarningError
 from akgentic.llm import AgentUsageLimitError, ReactAgent, RunUsageLimitError
 
+from akgentic.agent.agent import RunInterruptedError
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.custom_agent import CustomAgent, Handoff, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
@@ -193,6 +194,26 @@ class TestCustomAgentRunTierBreach:
 
         agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
         agent.hire_member.assert_not_called()  # type: ignore[attr-defined]
+
+
+class TestCustomAgentRunInterruption:
+    """Epic 20 invariant 2 holds in the exemplar: no escape into the failure path.
+
+    The cancel capability is built unconditionally by ``_build_react_agent``,
+    so a subclass handler that calls ``act()`` must catch
+    ``RunInterruptedError`` itself — the decorator owns usage-limit errors
+    only, and an escape would end the turn through ``Akgent._handle_failure``.
+    """
+
+    def test_an_interrupted_run_notifies_and_routes_nothing(self) -> None:
+        agent = _make_custom_agent()
+        agent.act = MagicMock(side_effect=RunInterruptedError("cancelled"))  # type: ignore[method-assign]
+
+        agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
+
+        agent.notify_human.assert_called_once_with("Run interrupted.")  # type: ignore[attr-defined]
+        agent.send.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
 
 
 class TestCustomAgentOverridesNothing:

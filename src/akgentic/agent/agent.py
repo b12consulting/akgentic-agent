@@ -742,7 +742,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         human = next((member for member in self.get_team() if member.is_user_proxy), None)
         if human is None:
             logger.warning(
-                "No user-proxy team member found; usage-limit notice not delivered: %s",
+                "No user-proxy team member found; notice not delivered: %s",
                 message,
             )
             return
