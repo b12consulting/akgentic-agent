@@ -24,13 +24,13 @@ Architecture:
   contributes the lifecycle handler receiveMsg_StopRecursively
 - Mailbox-driven run control (ADR-040): MailboxCapability, from
   akgentic.agent.capabilities, peeks the mailbox before every model request and
-  does two things with what it finds — it raises RunInterruptedError on a
-  pending /stop or CancelMessage, and it renders the mid-run arrival notice for
-  mail not yet announced this run and enqueues it for the next request. Under
-  ADR-019 §3 it will also purge the recognised cancel from the mailbox. act()
-  absorbs the interruption, notifies the human and returns a neutral
-  output_type() — an empty StructuredOutput on the team path, which routes
-  nothing, so no handler carries a catch. The run dies, the agent survives. The
+  does two things with what it finds — it purges a pending /stop or
+  CancelMessage and raises RunInterruptedError on it, and it renders the mid-run
+  arrival notice for mail not yet announced this run and enqueues it for the
+  next request. act() absorbs the interruption, notifies the human and returns a
+  default output_type() — an empty StructuredOutput on the team path, which
+  routes nothing, so no handler carries a catch. The run dies, the agent
+  survives. The
   agent owns both the cancel vocabulary and its enforcement: the capability is
   built unconditionally, so it must work on an agent configured without
   MailboxTool
@@ -132,8 +132,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       receiveMsg_* — here or in a subclass — writes a catch. The context
       arrives already healed (akgentic-llm repairs dangling tool calls before
       re-raising), so nobody performs context surgery, and the agent survives
-      to process the next queued message (the dequeued /stop itself answers
-      through command dispatch).
+      to process the next queued message — which is ordinary mail, the cancel
+      itself having been purged at recognition rather than left to dequeue.
     - That turn's StructuredOutput goes to _route_output(), which sends one
       AgentMessage per Request. A recipient starting with "@" resolves to an
       existing member; anything else is hired by role. A recipient that resolves
@@ -353,6 +353,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         cancelled should not first pay for a third party's
         ``before_model_request``. The mock accepts and ignores
         ``capabilities=``; drop-in parity keeps this wiring identical.
+
+        Each branch is handed a **copy** of that list. pydantic-ai happens to
+        copy before injecting its own auto-capabilities today, but that is
+        undocumented upstream behaviour; copying here makes ``_capabilities``
+        an agent-side guarantee rather than an assumption to re-verify on every
+        bump.
         """
         # Enforcement is agent-owned: held on self so act() can reset the
         # run-local announced-id tracking at each run start.
@@ -383,7 +389,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     tools=tools,
                     toolsets=toolsets,
                     observer=self,
-                    capabilities=self._capabilities,
+                    capabilities=list(self._capabilities),
                 ),
             )
         return ReactAgent(
@@ -392,7 +398,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             tools=tools,
             toolsets=toolsets,
             observer=self,
-            capabilities=self._capabilities,
+            capabilities=list(self._capabilities),
         )
 
     def init_llm_context(self, context: list[EventMessage]) -> None:
@@ -464,7 +470,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             RunInterruptedError: **Absorbed here, not propagated** — a queued
                 /stop or CancelMessage cancelled the run at a step boundary, so
                 this method logs it, notifies the human once, and returns a
-                neutral ``output_type()`` instead. Callers therefore need no
+                default ``output_type()`` instead. Callers therefore need no
                 try/except: a StructuredOutput with an empty request list routes
                 nothing and the handler completes normally. The context arrives
                 already healed (akgentic-llm repairs dangling tool calls before
@@ -648,10 +654,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     ) -> None:
         """Acknowledge a CancelMessage delivered as its own turn — a logged no-op.
 
-        Cancellation is enforced by the mailbox peek inside the run (see
-        ``MailboxCapability``), not by this handler: a cancel interrupts
-        a run while still *pending*. By the time one is dequeued and lands
-        here the agent is idle — there is nothing to cancel, no state to set,
+        This is the **idle** cancel handler, and by construction the only one it
+        could be. Cancellation is enforced by the mailbox peek inside the run
+        (see ``MailboxCapability``), which purges what it recognises at the
+        moment it recognises it — so a cancel that arrived mid-run is gone from
+        the mailbox before the actor could ever dequeue it, and can never reach
+        here. Arriving here therefore *is* the proof that nothing was running:
+        there is nothing to cancel, no state to set, no run-state check to make,
         and the next run is unaffected.
 
         Args:
@@ -674,10 +683,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
           one operator action, and reported as ``True``.
         - **``None``** — the command handled itself and has decided it has
           nothing to report. Returns ``True`` at once: no notification, no
-          operator-action entry. A command whose whole effect is elsewhere (a
-          cancel that lands in the mailbox and is read by the run) would
-          otherwise be double-reported, once by its own effect and once by an
-          empty reply.
+          operator-action entry. A command whose whole effect is elsewhere —
+          it writes a file, or sends a message of its own — would otherwise be
+          double-reported, once by its own effect and once by an empty reply.
+          This is a general primitive, not a carve-out for any one command.
         - **:class:`CommandNotRecognized`** — the leading token is not a
           registered command. Swallowed; returns ``False`` so the caller falls
           back to the normal LLM path with the original content, and nothing is
@@ -702,9 +711,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             result was sent back (string) or deliberately silent (``None``);
             ``False`` if the leading token was not a known command.
         """
-        # ``CommandRegistry.dispatch`` is declared ``-> str`` in the workspace
-        # today and widens to ``str | None`` when the tool package catches up.
-        # The annotation makes this method correct under both.
+        # ``CommandRegistry.dispatch`` is declared ``-> str | None``: a command
+        # may have nothing to say, and the None branch below is the general
+        # answer to that, not a special case for any one command.
         result: str | None
         try:
             result = self._command_registry.dispatch(message.content)

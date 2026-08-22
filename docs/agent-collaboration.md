@@ -530,9 +530,10 @@ is gone — the system block is frozen and carries no mailbox content):
   the ring, and that record is the audit trail. A notice enqueued at the run's last boundary
   is not lost: the drain redirects through one final model request to deliver it.
 
-The same hook enforces run cancellation: a pending `/stop` or `CancelMessage` raises
-`RunInterruptedError` at the next step boundary, caught in `act()` — which notifies the human
-and returns a neutral output the router delivers as nothing, so no handler carries a catch.
+The same hook enforces run cancellation: a pending `/stop` or `CancelMessage` is purged from
+the mailbox and then raises `RunInterruptedError` at the next step boundary, caught in `act()`
+— which notifies the human and returns a default output the router delivers as nothing, so no
+handler carries a catch.
 The run dies, the agent survives. The hook and the vocabulary it applies (`is_cancel`,
 `render_arrival_notice`) are both the agent's, defined in `akgentic.agent.capabilities` — not
 the card's. `BaseAgent` builds the capability unconditionally so an agent configured *without*
@@ -866,7 +867,7 @@ What the subclass gets, and what it must supply:
 
 | | |
 |---|---|
-| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing, and absorbs `RunInterruptedError` itself (notify the human once, return a neutral `output_type()`), so no handler writes a catch; `@guard_usage_limits` — the tier policy; `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, mid-run arrivals are announced to the model once, and (ADR-019 §3) the recognised cancel will be purged from the mailbox; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
+| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing, and absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`), so no handler writes a catch; `@guard_usage_limits` — the tier policy; `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
 | **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first |
 
 A run-tier breach in `CustomAgent` therefore concludes in **`TriageOutput`** and is delivered

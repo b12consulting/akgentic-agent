@@ -209,7 +209,7 @@ class TestCustomAgentRunInterruption:
     The mailbox capability is built unconditionally by ``_build_react_agent``,
     so every subclass run is interruptible — and the subclass supplies
     **nothing** for it: ``act()`` absorbs the ``RunInterruptedError``, notifies
-    the human once and returns a neutral ``TriageOutput``.
+    the human once and returns a default ``TriageOutput``.
 
     Both specs drive the **real** ``act()``, with ``run_sync`` raising as the
     mailbox capability would. Mocking ``act`` away would test the handler's own
@@ -226,7 +226,7 @@ class TestCustomAgentRunInterruption:
         agent.send.assert_not_called()  # type: ignore[attr-defined]
         agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
 
-    def test_act_hands_the_handler_a_neutral_triage_output(self) -> None:
+    def test_act_hands_the_handler_a_default_triage_output(self) -> None:
         """The caller is not told anything went wrong — it gets an empty triage.
 
         ``TriageOutput`` constructs with no arguments because every field has a

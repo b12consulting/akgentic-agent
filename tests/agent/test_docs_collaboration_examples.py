@@ -887,8 +887,11 @@ class TestExtraCapabilitiesSnippet:
 
         capabilities = self._build(agent, monkeypatch)
 
-        # Documented order: the framework's own first, the subclass's second.
-        assert capabilities is agent._capabilities
+        # Documented order: the framework's own first, the subclass's second —
+        # handed over as a copy, so pydantic-ai's auto-capabilities cannot land
+        # back on the agent's own list.
+        assert capabilities == agent._capabilities
+        assert capabilities is not agent._capabilities
         assert len(capabilities) == 2
         assert capabilities[0] is agent._mailbox_capability
         assert isinstance(capabilities[0], MailboxCapability)

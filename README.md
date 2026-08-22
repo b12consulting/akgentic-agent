@@ -356,7 +356,7 @@ Four things follow, and they are the whole point:
 - **The handler carries no `except` at all — not even for cancellation.** The cancel
   capability is unconditional on every `BaseAgent` subclass, so every run is interruptible,
   but the interruption never reaches the handler: `act()` absorbs `RunInterruptedError`
-  itself, notifies the human once, and returns a neutral `TriageOutput()`. `_route_triage`
+  itself, notifies the human once, and returns a default `TriageOutput()`. `_route_triage`
   then delivers nothing and the handler returns normally (see
   [Run Cancellation](#run-cancellation)).
 
@@ -921,23 +921,38 @@ A running turn can be interrupted. The design is **two surfaces, one predicate, 
   `read_mailbox`, and the `/stop` command registration whose string form `is_cancel`
   recognises without importing anything from the card.
 
-The flow: while a run is in progress, the hook peeks the mailbox before every model request
-and raises `RunInterruptedError` at the next step boundary once a cancel is pending.
-`act()` absorbs it: the human is notified ("Run interrupted.") and `act()` returns a neutral
-instance of the output type the caller named — an empty `StructuredOutput` on the team path,
-which `_route_output` delivers as nothing. **No handler writes a catch**, in this package or
-in yours, and the handler returns normally — **the run dies, the agent survives**. The one
-case a caller still sees the error is an output type that cannot be default-constructed (a
-model with a required field); `act()` then re-raises the original interruption unchanged.
-The actor loop then dequeues the `/stop` itself, which answers through
-ordinary command dispatch (its reply: nothing is running any more). A `CancelMessage`
-dequeued while the agent is idle lands on `receiveMsg_CancelMessage`, an
-acknowledge-and-log no-op — by that point there is nothing to cancel.
+A cancel arrives in one of two situations, and they are handled in completely different
+places:
+
+| | **Mid-run** — it arrives while a message is being processed | **Idle** — it arrives with nothing running |
+|---|---|---|
+| Who sees it | the hook, at the next step boundary | nobody, until the actor dequeues it normally |
+| Mailbox | **purged at recognition** — never dequeued, never dispatched | dequeued in the ordinary way |
+| Effect | `RunInterruptedError`; the run dies; `act()` tells the human | there is no run to cancel |
+| What the human sees | the interruption notification — which is why nothing else speaks | an explicit answer that there is no run to cancel |
+
+**Mid-run.** While a run is in progress, the hook peeks the mailbox before every model
+request. Once a cancel is pending, it purges *every* pending cancel from the mailbox through
+`consume_mailbox` — one `HandledMessage` per removal, emitted by that primitive rather than
+by the hook — and only then raises `RunInterruptedError`. `act()` absorbs it: the human is
+notified ("Run interrupted.") and `act()` returns a default instance of the output type the
+caller named — an empty `StructuredOutput` on the team path, which `_route_output` delivers
+as nothing. **No handler writes a catch**, in this package or in yours, and the handler
+returns normally — **the run dies, the agent survives**. The one case a caller still sees the
+error is an output type that cannot be default-constructed (a model with a required field);
+`act()` then re-raises the original interruption unchanged. Because the cancel was purged, it
+never gets a turn of its own: the next message the actor dequeues is ordinary mail, and the
+human is told once, by the interruption.
+
+**Idle.** A cancel that arrives with nothing running is seen by no hook, and is dequeued like
+any other message. A `CancelMessage` lands on `receiveMsg_CancelMessage`, an
+acknowledge-and-log no-op; a `/stop` answers through ordinary command dispatch, with an
+explicit answer that there is no run to cancel. Neither needs to check whether a run is in
+flight — after the purge, *reaching* either of them is the proof that none is.
 
 **The mailbox is the cancellation's single source of truth.** There is no cancel flag and no
-clear step: recognising the cancel (the hook's peek) and consuming it (the actor loop's
-dequeue) are the same message leaving the same queue, so a cancel can never go stale and
-cancel the next run.
+clear step: recognising the cancel and consuming it are one atomic act, performed by the hook
+at recognition, so a cancel can never go stale and cancel the next run.
 
 ### The mid-run arrival notice
 
@@ -973,8 +988,9 @@ run ends.
   `@guard_usage_limits` tool-free conclusion is running (see
   [What happens when a limit is hit](#what-happens-when-a-limit-is-hit)), a pending cancel
   is caught by `try_conclude_without_tools`'s blanket `except` and **escalates the original
-  breach** rather than reading as an interruption — a safe, known, accepted outcome: the
-  turn ends either way, and the queued `/stop` still answers through dispatch.
+  breach** rather than reading as an interruption — a safe, known, accepted outcome: the turn
+  ends either way. The cancel is still purged before the raise, whoever ends up catching it,
+  so it does not survive to be dispatched afterwards.
 
 ## Examples
 
