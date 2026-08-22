@@ -614,6 +614,7 @@ Runtime state extending `BaseState`:
 | Field | Type | Description |
 |---|---|---|
 | `backstory` | `str` | `config.prompt` rendered at `on_start()`, injected as LLM system context on every call |
+| `tool_state` | `ToolState` | The tool layer's persistent per-agent slot — context-update baselines and the block counter. A **cache, never a record**: the message history is the record, so a lost or stale slot can only cost a full-snapshot re-send, never a lost update. See [Context updates](#context-updates) |
 
 ## Tool Channels
 
@@ -637,6 +638,14 @@ stays byte-identical run to run so the prompt-cache prefix survives. Instead, be
 agent appends **at most one block** at the tail of the conversation carrying what changed since the
 last block it delivered.
 
+The engine that composes that block is not in this package. `akgentic.tool.core.ContextUpdater` —
+built once by `ToolFactory.get_context_updater()` at `on_start()` and held for the agent's lifetime
+— reads the state providers, diffs them against the baselines, composes the block and advances the
+counter; `akgentic-tool` owns those semantics along with the cards that produce the state.
+`BaseAgent` contributes only *when* — one delivery site, at the top of `act()`, before the run — and
+*how* — the append goes through `ContextManager.record_operator_action`, so a fresh agent's first
+block is folded into the first run's user prompt instead of suppressing system-prompt injection.
+
 The block opens with a marker line, `**Context update N**`, followed by one of two **fixed**
 suffixes:
 
@@ -646,19 +655,49 @@ suffixes:
 ```
 
 - `N` is monotonic per agent and advances only when a block is actually appended.
-- The *current state* wording is used when the agent holds no diff baselines as delivery begins —
-  the first block of an agent's life, and any block after `/clear`, a restore, or an eviction. Every
-  section in such a block is a full snapshot.
+- The *current state* wording is used when no diff baselines survive as delivery begins — the first
+  block of an agent's life, and any block after `/clear` or an eviction. Every section in such a
+  block is a full snapshot.
 - The *state has changed* wording is used when the block was diffed against surviving baselines:
   its sections are deltas, plus a full rendering for any provider contributing for the first time.
 - **When nothing changed, nothing is appended** — an idle turn adds only the user's own message.
 
-The mechanism is self-healing. Before trusting its baselines the agent verifies that its last
-delivered marker is still visible in the history; when it is not — after a restore, `/clear`,
-compaction (manual or automatic), or sliding-window trimming — the next block is a fresh full
-snapshot. `clear()` additionally resets the baselines and the counter (the next block is
-`**Context update 1** — current state.`); `compact()` needs no reset of its own — the presence
-check catches a compacted-away block either way.
+#### Where the baselines live
+
+The baselines and the block counter persist on `AgentState.tool_state`. They ride the state
+checkpoints the agent already emits — **no new event, no forced publish**: the engine mutates the
+slot in place, and change detection compares serializations, so the existing `notify_if_changed()`
+picks it up on its own.
+
+The slot is a **cache, never a record.** The message history remains the durable record of what the
+model was actually told, so a slot that is lost or stale costs at most one full-snapshot re-send,
+and never a lost update. That is what makes persisting it lazily safe.
+
+The payoff is on restore. A restored agent whose history still contains its last **Context update**
+block resumes delta delivery — it says only what changed while it was gone, which is **usually
+nothing** — instead of re-appending the whole roster, planning and knowledge-graph snapshot on every
+restart. Only an agent whose history lost its blocks (compaction, `/clear`, a sliding-window trim)
+falls back to a full snapshot.
+
+The mechanism is self-healing: before trusting its baselines the engine reconciles them against the
+markers still visible in the history.
+
+- **The last delivered marker is still there** — the baselines are trusted and the next block is a
+  delta.
+- **The marker is gone** — every baseline is dropped and the next block is a full snapshot. The
+  counter is *not* reset: a partially trimmed history may still show older numbers, so `N` stays
+  monotonic.
+- **The persisted counter is behind the history** — a crash between the append and the next
+  checkpoint. The counter catches up to the highest visible marker and the baselines are **kept**,
+  so the next block re-states what the missed blocks said: a repeat, never an omission.
+
+`clear()` is the one legitimate zeroing of the counter — it empties the history and the slot
+together, so the next block is `**Context update 1** — current state.` `compact()` gets no reset of
+its own: the reconciliation above catches a compacted-away block either way.
+
+> **Never cache `state.tool_state`.** `init_state()` replaces the whole state object on restore, so
+> a held reference goes silently stale. Read the slot through `self.state` on every use — which is
+> exactly what the engine does, on every call.
 
 In the transcript, context-update blocks appear as **user-role messages**, the same way operator
 actions do. The marker line is the stable handle for finding, collapsing, or styling them.
