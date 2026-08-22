@@ -24,9 +24,10 @@ Architecture:
   contributes the lifecycle handler receiveMsg_StopRecursively
 - Run cancellation (ADR-040): MailboxCancelCapability, from
   akgentic.agent.capabilities, peeks the mailbox before every model request and
-  raises RunInterruptedError on a pending /stop or CancelMessage;
-  receiveMsg_AgentMessage catches it around act(), notifies the human and routes
-  nothing — the run dies, the agent survives. The agent owns both the cancel
+  raises RunInterruptedError on a pending /stop or CancelMessage; act() absorbs
+  it, notifies the human and returns a neutral output_type() — an empty
+  StructuredOutput on the team path, which routes nothing, so no handler carries
+  a catch. The run dies, the agent survives. The agent owns both the cancel
   vocabulary and its enforcement: the capability is built unconditionally, so it
   must work on an agent configured without MailboxTool
 - The usage-limit tier policy is applied, not written here: the handler carries
@@ -114,13 +115,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       including a /-prefixed token the registry does not recognise — is
       prefixed with the reply protocol for its message type and run as one
       act() turn.
-    - A turn interrupted by a queued cancel (RunInterruptedError out of act())
-      is caught in receiveMsg_AgentMessage: notify_human("Run interrupted."),
-      nothing routed, normal return. The context arrives already healed —
-      akgentic-llm repairs dangling tool calls before re-raising — so the
-      handler performs no context surgery, and the agent survives to process
-      the next queued message (the dequeued /stop itself answers through
-      command dispatch).
+    - A turn interrupted by a queued cancel never reaches a handler:
+      act() absorbs the RunInterruptedError itself, calls
+      notify_human("Run interrupted.") once and returns an empty
+      StructuredOutput, which _route_output delivers as nothing. No
+      receiveMsg_* — here or in a subclass — writes a catch. The context
+      arrives already healed (akgentic-llm repairs dangling tool calls before
+      re-raising), so nobody performs context surgery, and the agent survives
+      to process the next queued message (the dequeued /stop itself answers
+      through command dispatch).
     - That turn's StructuredOutput goes to _route_output(), which sends one
       AgentMessage per Request. A recipient starting with "@" resolves to an
       existing member; anything else is hired by role. A recipient that resolves
@@ -408,11 +411,18 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             An instance of output_type, as produced by the REACT loop.
 
         Raises:
-            RunInterruptedError: A queued /stop or CancelMessage cancelled the
-                run at a step boundary. Propagates unchanged out of run_sync —
-                the context arrives already healed (akgentic-llm repairs
-                dangling tool calls before re-raising) — and is caught by the
-                calling handler. This method performs no context surgery.
+            RunInterruptedError: **Absorbed here, not propagated** — a queued
+                /stop or CancelMessage cancelled the run at a step boundary, so
+                this method logs it, notifies the human once, and returns a
+                neutral ``output_type()`` instead. Callers therefore need no
+                try/except: a StructuredOutput with an empty request list routes
+                nothing and the handler completes normally. The context arrives
+                already healed (akgentic-llm repairs dangling tool calls before
+                re-raising), so this method performs no context surgery.
+                The one case a caller can still see it: an ``output_type`` that
+                cannot be default-constructed — a model with at least one
+                required field. The original interruption is then re-raised
+                unchanged, never a ValidationError and never a wrapped exception.
             RunUsageLimitError: The turn exhausted its own budget. Recoverable —
                 the @guard_usage_limits decorator on the calling handler answers
                 it with a tool-free conclusion.
@@ -440,7 +450,23 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     for p in parts
                 ]
         # ── End media expansion ─────────────────────────────────────────────────
-        output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
+        try:
+            output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
+        except RunInterruptedError as interruption:
+            logger.info(
+                "[%s] run interrupted by a queued cancel; turn abandoned, nothing routed",
+                self.config.name,
+            )
+            self.notify_human("Run interrupted.")
+            # A neutral instance is only available when every field of the
+            # caller's type has a default. When it is not, the caller sees the
+            # interruption itself — never the construction error behind it, so
+            # the exception is named rather than bare-re-raised.
+            try:
+                neutral = output_type()
+            except Exception:
+                raise interruption from None
+            return neutral
 
         return cast(T, output)
 
@@ -517,16 +543,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         (see REPLY_PROTOCOLS) and run as one act() turn, whose StructuredOutput
         goes to _route_output().
 
-        The one ``try``/``except`` this body carries is the
-        ``RunInterruptedError`` catch around the ``act()`` call: a queued
-        ``/stop`` or ``CancelMessage`` cancelled the run at a step boundary, so
-        the human is notified ("Run interrupted."), nothing is routed, and the
-        handler returns normally — the run dies, the agent survives. The catch
-        must stay here and not move into the decorator: the usage-limit tier
-        policy is the decorator's (see ``usage_limits.guard_usage_limits``),
-        whose ``except`` ordering is load-bearing and owns usage-limit errors
-        only. No context surgery happens here — the context arrives already
-        healed (akgentic-llm repairs dangling tool calls before re-raising).
+        This body carries no ``try``/``except`` at all. A queued ``/stop`` or
+        ``CancelMessage`` is absorbed inside ``act()``, which notifies the human
+        and returns an empty ``StructuredOutput``; ``_route_output`` then
+        delivers nothing and the handler returns normally — the run dies, the
+        agent survives. The usage-limit tier policy is likewise the decorator's
+        (see ``usage_limits.guard_usage_limits``), whose ``except`` ordering is
+        load-bearing and owns usage-limit errors only.
 
         Args:
             message: The AgentMessage instance containing the message content and recipient.
@@ -564,15 +587,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             f"{REPLY_PROTOCOLS.get(message.type, '').format(sender=sender_name)}"
             f"\n\n{message.content}"
         )
-        try:
-            output = self.act(prefixed_content, StructuredOutput)
-        except RunInterruptedError:
-            logger.info(
-                "[%s] run interrupted by a queued cancel; turn abandoned, nothing routed",
-                self.config.name,
-            )
-            self.notify_human("Run interrupted.")
-            return
+        output = self.act(prefixed_content, StructuredOutput)
 
         self._route_output(output)
 

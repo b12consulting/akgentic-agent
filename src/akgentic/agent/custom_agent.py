@@ -19,10 +19,9 @@ Reused unchanged from BaseAgent:
 - ``MailboxCancelCapability`` (``akgentic.agent.capabilities``) — built
   unconditionally by ``_build_react_agent``, so every subclass run is
   interruptible by a queued ``/stop`` or ``CancelMessage``, whether or not the
-  config carries a ``MailboxTool``. What the subclass has to supply is the catch: every
-  ``receiveMsg_*`` that calls ``act()`` must catch ``RunInterruptedError``
-  around that call (notify the human, route nothing, return) — an escape ends
-  the turn through the actor failure path instead of the designed clean end.
+  config carries a ``MailboxTool``. The interruption is absorbed by ``act()``
+  itself, which notifies the human once and returns a neutral instance of the
+  output type you named — so a subclass handler writes nothing for it.
 
 Supplied here:
 
@@ -38,7 +37,6 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.capabilities import RunInterruptedError
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
@@ -138,11 +136,10 @@ class CustomAgent(BaseAgent):
         The decorator owns the usage-limit policy, reads the requester off
         ``message``, and — because it was given this agent's schema and routing —
         concludes a breached turn in TriageOutput without this class overriding
-        anything. The one ``except`` this body carries is the
-        ``RunInterruptedError`` catch around ``act()`` — the piece every
-        ``receiveMsg_*`` that reaches the LLM must supply itself, exactly as
-        ``receiveMsg_AgentMessage`` does: a queued cancel ends the run, the
-        human is told, nothing is routed, and the handler returns normally.
+        anything. This body carries no ``try``/``except``: a queued cancel is
+        absorbed by ``act()``, which tells the human and hands back an empty
+        ``TriageOutput``, so ``_route_triage`` delivers nothing and the handler
+        returns normally — exactly as ``receiveMsg_AgentMessage`` does.
 
         Args:
             message: The incident to triage.
@@ -153,14 +150,6 @@ class CustomAgent(BaseAgent):
             "Assess severity, summarise in one line, and hand off whatever you "
             "cannot resolve yourself."
         )
-        try:
-            output = self.act(prompt, TriageOutput)
-        except RunInterruptedError:
-            logger.info(
-                "[%s] run interrupted by a queued cancel; turn abandoned, nothing routed",
-                self.config.name,
-            )
-            self.notify_human("Run interrupted.")
-            return
+        output = self.act(prompt, TriageOutput)
 
         self._route_triage(output)

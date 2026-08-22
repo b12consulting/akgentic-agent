@@ -318,7 +318,6 @@ Apply the decorator to every `receiveMsg_*` that can reach the LLM, handing it *
 and *your* router:
 
 ```python
-from akgentic.agent import RunInterruptedError
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 
@@ -340,11 +339,7 @@ class CustomAgent(BaseAgent):
 
     @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
-        try:
-            output = self.act(prompt, TriageOutput)
-        except RunInterruptedError:
-            self.notify_human("Run interrupted.")
-            return
+        output = self.act(prompt, TriageOutput)
         self._route_triage(output)
 ```
 
@@ -358,12 +353,12 @@ Four things follow, and they are the whole point:
 - **The router returns `bool`.** The guard is handed a schema it cannot inspect — `TriageOutput`
   has no `.messages` — so "did anything actually go out?" is the router's answer to give, and
   it is what separates a real conclusion from one that routed nothing.
-- **The one `except` the handler does carry is the `RunInterruptedError` catch around
-  `act()`.** The cancel capability is unconditional on every `BaseAgent` subclass, so every
-  run is interruptible — but the catch is not inherited: every subclass handler that calls
-  `act()` must supply it itself, exactly as `receiveMsg_AgentMessage` does (notify the human,
-  route nothing, return). An escape ends the turn through the actor failure path instead of
-  the designed clean end (see [Run Cancellation](#run-cancellation)).
+- **The handler carries no `except` at all — not even for cancellation.** The cancel
+  capability is unconditional on every `BaseAgent` subclass, so every run is interruptible,
+  but the interruption never reaches the handler: `act()` absorbs `RunInterruptedError`
+  itself, notifies the human once, and returns a neutral `TriageOutput()`. `_route_triage`
+  then delivers nothing and the handler returns normally (see
+  [Run Cancellation](#run-cancellation)).
 
 `_route_triage` is defined **before** the handler: the decorator names it as an argument, which
 is evaluated while the class body runs. The requester is lifted off the handler's own message
@@ -881,9 +876,13 @@ A running turn can be interrupted. The design is **two surfaces, one predicate, 
 
 The flow: while a run is in progress, the hook peeks the mailbox before every model request
 and raises `RunInterruptedError` at the next step boundary once a cancel is pending.
-`receiveMsg_AgentMessage` catches it around `act()`: the human is notified
-("Run interrupted."), nothing is routed, and the handler returns normally — **the run dies,
-the agent survives**. The actor loop then dequeues the `/stop` itself, which answers through
+`act()` absorbs it: the human is notified ("Run interrupted.") and `act()` returns a neutral
+instance of the output type the caller named — an empty `StructuredOutput` on the team path,
+which `_route_output` delivers as nothing. **No handler writes a catch**, in this package or
+in yours, and the handler returns normally — **the run dies, the agent survives**. The one
+case a caller still sees the error is an output type that cannot be default-constructed (a
+model with a required field); `act()` then re-raises the original interruption unchanged.
+The actor loop then dequeues the `/stop` itself, which answers through
 ordinary command dispatch (its reply: nothing is running any more). A `CancelMessage`
 dequeued while the agent is idle lands on `receiveMsg_CancelMessage`, an
 acknowledge-and-log no-op — by that point there is nothing to cancel.

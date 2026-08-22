@@ -45,8 +45,10 @@ class RunInterruptedError(Exception):
     message only. It must never escape a message handler: an escape ends the
     turn through the actor failure path (``Akgent._handle_failure`` — an
     ErrorMessage to the orchestrator; actor death under stock pykka) instead
-    of the designed clean end. ``receiveMsg_AgentMessage`` owns the catch
-    around ``act()`` so the *run* dies while the *agent* carries on cleanly.
+    of the designed clean end. ``act()`` owns the catch — it absorbs this
+    error, notifies the human once and returns a neutral instance of the
+    caller's output type — so the *run* dies while the *agent* carries on
+    cleanly, and no handler needs a catch of its own.
     """
 
 

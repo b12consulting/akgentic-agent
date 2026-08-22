@@ -45,6 +45,7 @@ from akgentic.agent import RunInterruptedError
 from akgentic.agent.agent import BaseAgent, MailboxCancelCapability
 from akgentic.agent.capabilities import render_arrival_notice
 from akgentic.agent.config import AgentConfig
+from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
 
@@ -280,8 +281,14 @@ def _agent_config() -> AgentConfig:
 
 
 @contextmanager
-def _running_agent(interrupts: int = 0) -> Iterator[tuple[ActorSystem, ActorAddress, ActorAddress]]:
-    """Run a BaseAgent through the real actor system with the interruptible double."""
+def _running_agent(
+    interrupts: int = 0, agent_class: type[BaseAgent] = BaseAgent
+) -> Iterator[tuple[ActorSystem, ActorAddress, ActorAddress]]:
+    """Run an agent through the real actor system with the interruptible double.
+
+    ``agent_class`` defaults to ``BaseAgent``; ``CustomAgent`` is passed in to
+    exercise a *subclass* handler, which is the shape the exemplar has.
+    """
     _reset_captures(interrupts)
     system = ActorSystem()
     original_react = agent_module.ReactAgent
@@ -291,7 +298,7 @@ def _running_agent(interrupts: int = 0) -> Iterator[tuple[ActorSystem, ActorAddr
             Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
         )
         orchestrator = system.proxy_ask(orch_addr, Orchestrator)
-        agent_addr = orchestrator.createActor(BaseAgent, config=_agent_config())
+        agent_addr = orchestrator.createActor(agent_class, config=_agent_config())
         time.sleep(0.5)
         assert _InterruptibleReactAgent.captured, "ReactAgent was never constructed"
         yield system, agent_addr, orch_addr
@@ -385,6 +392,13 @@ class TestCapabilityWiring:
 
 class TestCatchSite:
     def test_interrupted_turn_notifies_human_and_routes_nothing(self) -> None:
+        """The human is told once, and nothing is delivered.
+
+        Since ``act()`` owns the interruption, ``_route_output`` **is** called —
+        with the neutral, empty ``StructuredOutput`` ``act()`` hands back. So
+        "routes nothing" is measured as *nothing delivered*, never as the router
+        being skipped: an assertion that it was skipped would pin the old design.
+        """
         with (
             patch.object(BaseAgent, "notify_human") as notify,
             patch.object(BaseAgent, "_route_output") as route,
@@ -395,7 +409,11 @@ class TestCatchSite:
             assert _wait_until(lambda: _InterruptibleReactAgent.run_calls >= 1)
             assert _wait_until(lambda: notify.call_count >= 1)
             notify.assert_called_once_with("Run interrupted.")
-            route.assert_not_called()
+
+            assert _wait_until(lambda: route.call_count >= 1)
+            (routed,), _ = route.call_args
+            assert isinstance(routed, StructuredOutput)
+            assert routed.messages == []
 
     def test_agent_survives_and_processes_the_next_queued_message(self) -> None:
         """The actor-death guard — NFR2's mutation target.
@@ -454,6 +472,48 @@ class TestCatchSite:
                 for block in _InterruptibleReactAgent.recorded_blocks
             )
             assert _InterruptibleReactAgent.run_calls == 0  # never reached the LLM
+
+
+# =============================================================================
+# A subclass handler that writes NO catch survives identically
+# =============================================================================
+
+
+class TestNoCatchSubclassSurvives:
+    """The regression the shipped exemplar failed, pinned at actor level.
+
+    ``CustomAgent.receiveMsg_TriageMessage`` carries no ``try``/``except`` — it
+    writes nothing at all for cancellation, because ``act()`` owns it. Driven
+    through the real ``act()`` with a ``run_sync`` that raises, the turn must
+    still end the designed way: the human told once, nothing delivered, the
+    handler returning normally, and ``Akgent._handle_failure`` never entered.
+
+    This is the mutation target for the catch in ``act()``: let the
+    interruption propagate out of ``act()`` instead, and this spec goes red
+    because the subclass has nothing left to catch it.
+    """
+
+    def test_interrupted_subclass_turn_ends_cleanly_with_no_handler_catch(self) -> None:
+        with (
+            patch.object(BaseAgent, "notify_human") as notify,
+            patch.object(BaseAgent, "_handle_failure") as failure,
+            patch.object(CustomAgent, "_route_triage") as route,
+            _running_agent(interrupts=1, agent_class=CustomAgent) as (system, agent_addr, _),
+        ):
+            system.tell(agent_addr, TriageMessage(incident="disk full on node 3"))
+
+            assert _wait_until(lambda: _InterruptibleReactAgent.run_calls >= 1)
+            assert _wait_until(lambda: notify.call_count >= 1)
+            notify.assert_called_once_with("Run interrupted.")
+
+            # The handler ran to its end and routed the neutral output act()
+            # returned — an empty triage, so nothing goes out.
+            assert _wait_until(lambda: route.call_count >= 1)
+            (routed,), _ = route.call_args
+            assert isinstance(routed, TriageOutput)
+            assert routed.handoffs == []
+
+            failure.assert_not_called()
 
 
 # =============================================================================
@@ -562,7 +622,12 @@ class TestCardlessAgentStillCancels:
 
         try:
             with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
-                with pytest.raises(RunInterruptedError):
-                    agent.act("do the long thing", StructuredOutput)
+                # The cancel still kills the run — the stub proves the model was
+                # never reached — but act() absorbs the interruption and hands
+                # back the neutral output instead of raising it at the caller.
+                output = agent.act("do the long thing", StructuredOutput)
         finally:
             react_agent.close()
+
+        assert isinstance(output, StructuredOutput)
+        assert output.messages == []
