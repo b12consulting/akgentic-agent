@@ -635,13 +635,14 @@ Runtime state extending `BaseState`:
 |---|---|---|
 | `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `read_mailbox()`, `web_search()`, `workspace_read()` |
 | `SYSTEM_PROMPT` | LLM system prompt — rendered into the frozen system block | backstory, current date |
-| `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary, mailbox status |
+| `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary |
 | `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`, `stop` |
 
 `TeamTool` **and** `MailboxTool` are always prepended to `config.tools` if not already
-present, so every `BaseAgent` can hire and fire members (`TeamTool`) and carries the
-mailbox surfaces — mailbox status as context state, the `read_mailbox` peek tool, and
-`/stop` (`MailboxTool`). A card already supplied in `config.tools` wins over the prepended
+present, so every `BaseAgent` can hire and fire members (`TeamTool`) and carries the two
+mailbox surfaces — the **consuming** `read_mailbox` tool, which absorbs the mail it shows so
+that mail is not delivered again as its own turn, and `/stop` (`MailboxTool`). A cancel is
+never consumed by the read. A card already supplied in `config.tools` wins over the prepended
 default, and `config.tools` itself is never mutated — `on_start()` copies the list.
 
 ### Assembly: what `on_start` collects
@@ -657,9 +658,11 @@ exactly once:
 | `COMMAND` | `tool_factory.get_command_registry(extra_commands=[compact, clear])` | one `CommandRegistry`, announced once via `CommandsAnnouncedEvent` |
 
 **`BaseAgent` grows behaviour by hosting cards, not by accreting methods.** `MailboxTool`
-is the worked example: three capabilities, each riding its own channel — `MailboxState` on
-`LLM_CONTEXT`, `read_mailbox` on `TOOL_CALL`, `/stop` on `COMMAND` — and the agent gained
-all three without a single new method. When the next feature is a capability the LLM, the
+is the worked example: two capabilities, each riding its own channel — `read_mailbox` on
+`TOOL_CALL`, `/stop` on `COMMAND` — and the agent gained both without a single new method.
+The card serves no `LLM_CONTEXT` at all: mailbox awareness reaches the model through the
+agent's mid-run arrival notice alone, a second card-side carrier having only narrated the
+same arrivals twice. When the next feature is a capability the LLM, the
 operator, or the context should see, write it as a card and let the table above route each
 piece to the hook that serves it. The card-author side of this contract is the
 `akgentic-tool` README's *Building a feature as a card* authoring guide.
@@ -713,8 +716,8 @@ version of the above.
 
 ### Context updates
 
-Volatile, team-shared state — the roster, role profiles, planning, the knowledge-graph summary,
-the mailbox status — never enters the system prompt: the system block holds the backstory and the current date only, and
+Volatile, team-shared state — the roster, role profiles, planning, the knowledge-graph summary
+— never enters the system prompt: the system block holds the backstory and the current date only, and
 stays byte-identical run to run so the prompt-cache prefix survives. Instead, before each run the
 agent appends **at most one block** at the tail of the conversation carrying what changed since the
 last block it delivered.
@@ -917,9 +920,9 @@ A running turn can be interrupted. The design is **two surfaces, one predicate, 
   on an agent configured without `MailboxTool`. The agent owns *both* the vocabulary and the
   enforcement, and the first is a consequence of the second: a card-less agent has no card to
   borrow a predicate from, so a predicate that shipped with the card could not make that agent
-  interruptible. What the card still owns is its own surface — the `MailboxState` provider,
-  `read_mailbox`, and the `/stop` command registration whose string form `is_cancel`
-  recognises without importing anything from the card.
+  interruptible. What the card still owns is its own surface — the consuming `read_mailbox`
+  tool and the `/stop` command registration whose string form `is_cancel` recognises without
+  importing anything from the card.
 
 A cancel arrives in one of two situations, and they are handled in completely different
 places:
@@ -965,10 +968,11 @@ event store as its own user-role message — that record **is** the audit trail 
 doorbell rang. When the run would otherwise end at that boundary, pydantic-ai's drain
 redirects through one final model request so an already-enqueued notice is delivered rather
 than lost — an occasional extra model call, by design. Announced-id tracking is run-local:
-`act()` resets it at each run start, so it dies with the run. The durable record exists
-regardless: the `read_mailbox` tool return if the model chooses to look, and the message's
-own turn either way — every pending message is still delivered as its own turn after the
-run ends.
+`act()` resets it at each run start, so it dies with the run. A durable record exists either
+way, but which one depends on what the model does: if it calls `read_mailbox`, the read
+**absorbs** those messages and the tool return is their record — they are not delivered again
+as their own turn. Whatever it leaves unread stays queued and arrives as its own turn once the
+run ends. A cancel is never consumed by the read.
 
 ### Honest limitations
 

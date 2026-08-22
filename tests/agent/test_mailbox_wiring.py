@@ -12,9 +12,11 @@ All specs go through the real actor system (``on_start`` runs on
 on_start tests; the factory is swapped for a recording subclass so the card
 list, the collected providers, and the built command registry — the exact
 objects ``on_start`` wires into the agent — are observable without reaching
-into actor internals. Mailbox state delivery is live through the Epic 19
-delivery loop, so the delivery spec asserts the mailbox rendering reaches the
-first turn's context-update block.
+into actor internals. ``MailboxTool`` contributes **no** context-state
+provider: it is a two-channel card, and mailbox awareness reaches the model
+through the agent's mid-run arrival notice alone. The delivery spec asserts
+that absence against a live Epic 19 loop — with mail pending, the first turn's
+context-update block carries the roster and no mailbox rendering.
 """
 
 import time
@@ -258,21 +260,17 @@ class TestMailboxToolAutoAdd:
 
 
 # =============================================================================
-# AC 4 — the card's capabilities reach the factory outputs wired into the agent
+# AC 4 — the card's two channels reach the factory outputs wired into the agent
 # =============================================================================
 
 
 class TestMailboxWiring:
-    """AC 4: provider collected, read_mailbox tool wired, stop command registered."""
+    """AC 4: read_mailbox tool wired, stop command registered — and no more."""
 
-    def test_mailbox_provider_read_tool_and_stop_command_are_wired(self) -> None:
+    def test_read_tool_and_stop_command_are_wired(self) -> None:
         _start_agent(_agent_config())
 
-        # The provider list on_start assigned to _context_state_providers.
-        providers = _RecordingToolFactory.captured_providers[-1]
-        assert "mailbox_state" in [provider.__name__ for provider in providers]
-
-        # The tools handed to the ReactAgent include the mailbox peek.
+        # The tools handed to the ReactAgent include the mailbox read.
         tools = _CapturingReactAgent.captured[-1]["tools"]
         assert isinstance(tools, list)
         assert "read_mailbox" in [tool.__name__ for tool in tools]
@@ -281,11 +279,14 @@ class TestMailboxWiring:
         registry = _RecordingToolFactory.captured_registries[-1]
         assert registry.has("stop")
 
-    def test_mailbox_state_reaches_the_first_context_update_block(self) -> None:
-        """Delivery is LIVE: the collected provider feeds the Epic 19 loop.
+    def test_first_context_update_block_carries_the_roster_and_no_mailbox(self) -> None:
+        """Delivery is LIVE, and the mailbox is deliberately absent from it.
 
-        With messages pending, the first turn's **Context update** block carries
-        the mailbox rendering — not a system prompt, and not nothing.
+        With a message pending, the first turn's **Context update** block still
+        arrives and still carries the roster — so the Epic 19 loop is running and
+        this is not a vacuous assertion — but nothing in it names the pending
+        mail. ``MailboxTool`` serves no ``LLM_CONTEXT``; awareness of that
+        message reaches the model through the agent's mid-run arrival notice.
         """
         mailbox = [_make_pending_message("@Alice")]
         with _running_agent(_agent_config(), mailbox) as (system, agent_addr):
@@ -298,4 +299,13 @@ class TestMailboxWiring:
             blocks = _CapturingReactAgent.recorded_blocks
             assert len(blocks) == 1, "first turn must deliver exactly one block"
             assert blocks[0].startswith("**Context update 1** — current state.")
-            assert "pending from @Alice" in blocks[0]
+
+            # The loop is live: the roster provider's rendering is there.
+            assert "team member list" in blocks[0]
+            assert "@Manager" in blocks[0]
+
+            # The mailbox is not: no sender, no content, no count wording.
+            assert "@Alice" not in blocks[0]
+            assert "please review the draft" not in blocks[0]
+            assert "pending" not in blocks[0].lower()
+            assert "mailbox" not in blocks[0].lower()

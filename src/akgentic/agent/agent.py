@@ -93,9 +93,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       states and commands — TOOL_CALL, SYSTEM_PROMPT, LLM_CONTEXT, COMMAND.
     - TeamTool: auto-injected if absent from config.tools; provides hire/fire
       capabilities and team-awareness context state.
-    - MailboxTool: auto-injected if absent from config.tools; provides mailbox
-      status as LLM_CONTEXT state, the read_mailbox peek tool, and the /stop
-      command. A card supplied in config.tools wins over the default.
+    - MailboxTool: auto-injected if absent from config.tools; a two-channel
+      card serving read_mailbox on TOOL_CALL and /stop on COMMAND, and no
+      LLM_CONTEXT at all. The read *consumes*: it absorbs the mail it shows,
+      which is therefore not delivered again as its own turn, while anything
+      left unread stays queued and arrives as its own turn after the run. A
+      pending cancel is never consumed by it. A card supplied in config.tools
+      wins over the default.
     - MailboxCapability: built unconditionally in _build_react_agent (no
       card involvement, no MailboxTool presence check) and handed to the
       ReactAgent via capabilities= — the cancel check and the mid-run arrival
@@ -156,9 +160,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     - agent_backstory (from AgentState.backstory)
     - current_date
     - whatever ToolFactory.get_system_prompts() yields — nothing on a default
-      card set: the roster, role profiles, planning, knowledge-graph and
-      mailbox capabilities declare LLM_CONTEXT and arrive as context-update
-      blocks
+      card set: the roster, role profiles, planning and knowledge-graph
+      capabilities declare LLM_CONTEXT and arrive as context-update blocks.
+      MailboxTool declares no LLM_CONTEXT at all; mailbox awareness reaches
+      the model through the mid-run arrival notice alone
 
     Commands (programmatic, via CommandRegistry built in on_start):
     - A single generic CommandRegistry holds every COMMAND-channel callable keyed

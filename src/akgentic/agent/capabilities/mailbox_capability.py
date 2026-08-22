@@ -21,9 +21,12 @@ card to import it from. Enforcement and vocabulary therefore sit together, and
 this module imports nothing from ``akgentic.tool.mailbox`` at all — its mailbox
 contract, ``MailboxAccess`` below, is the agent's own too, for the same reason.
 
-What the card still owns is its own surface: the ``MailboxState`` provider,
-the ``read_mailbox`` tool, and the ``/stop`` command registration — a string
-surface ``is_cancel`` recognises without importing anything from the card.
+What the card still owns is its own surface, on two channels: the *consuming*
+``read_mailbox`` tool — it absorbs the mail it renders, and never a cancel —
+and the ``/stop`` command registration, a string surface ``is_cancel``
+recognises without importing anything from the card. The card serves no
+``LLM_CONTEXT``: mailbox awareness reaches the model through the mid-run
+arrival notice below alone.
 """
 
 import uuid
@@ -98,7 +101,9 @@ def render_arrival_notice(new_messages: list[Message]) -> str:
     preview of its content cut at ``PREVIEW_LIMIT`` characters, then the pointer
     to ``read_mailbox``. Enough for the model to judge whether any of it is
     worth interrupting itself for; the whole of it stays one ``read_mailbox``
-    call away, and arrives as its own turn regardless.
+    call away. That read *consumes* — what it shows is absorbed and does not
+    arrive again as its own turn — so a message gets its own turn after the run
+    only if the model left it unread.
 
     Returns ``""`` for an empty list. Defensive on message shapes: the base
     ``Message`` declares neither ``content`` nor ``type`` — ``CancelMessage``

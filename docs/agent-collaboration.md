@@ -512,16 +512,19 @@ flowchart TD
 
 ### 5. Mailbox Visibility
 
-An agent sees its pending mail through three live surfaces, all provided by `MailboxTool`
-(auto-added beside `TeamTool`; the former `mailbox_notifications` start-up system prompt
-is gone — the system block is frozen and carries no mailbox content):
+An agent sees its pending mail through two live surfaces (the former `mailbox_notifications`
+start-up system prompt is gone — the system block is frozen and carries no mailbox content).
+Mailbox awareness reaches the model through the mid-run arrival notice alone: `MailboxTool`
+serves no `LLM_CONTEXT`, a second card-side carrier having only narrated the same arrivals
+twice.
 
-- **Mailbox status as context state** (`MailboxState`, `LLM_CONTEXT` channel) — delivered
-  through the same per-turn **Context update** block as the roster and planning state, so
-  the count of waiting messages is current at the start of every turn.
-- **`read_mailbox` tool** (`TOOL_CALL` channel) — a mid-run peek at sender, type and full
-  content of every pending message. Reading does not consume them: each will still be
-  delivered as its own turn after the current run ends.
+- **`read_mailbox` tool** (`TOOL_CALL` channel, provided by `MailboxTool`, auto-added beside
+  `TeamTool`) — a mid-run read of sender, type and full content of every pending message.
+  Reading **absorbs** them: everything it shows has been removed from the mailbox and is
+  **not** delivered again as its own turn, so the model must deal with it in that run.
+  Anything left unread stays queued and arrives as its own turn once the run ends. A pending
+  `/stop` or `CancelMessage` is never consumed by the read — the cancellation surface is left
+  intact for the hook below.
 - **The mid-run arrival notice** — mail arriving *while a run is in progress* is announced
   once by `MailboxCapability.before_model_request`, through
   `ctx.enqueue(notice, priority="asap")`. pydantic-ai's auto-injected drain capability
@@ -538,8 +541,8 @@ The run dies, the agent survives. The hook and the vocabulary it applies (`is_ca
 `render_arrival_notice`) are both the agent's, defined in `akgentic.agent.capabilities` — not
 the card's. `BaseAgent` builds the capability unconditionally so an agent configured *without*
 `MailboxTool` is still interruptible, and such an agent has no card to borrow a predicate
-from. The card keeps its own surface: the `MailboxState` provider, `read_mailbox`, and the
-`/stop` registration whose string form `is_cancel` recognises without importing anything from
+from. The card keeps its own surface: the consuming `read_mailbox` tool and the `/stop`
+registration whose string form `is_cancel` recognises without importing anything from
 the card. See the README's *Run Cancellation* section for the full flow and its stated
 limitations.
 
@@ -909,7 +912,7 @@ Do not finish your turn if the plan is stale."""
 )
 tools = [planning_tool]  # add search_tool, knowledge_graph, etc. as needed
 
-# TeamTool is NOT listed here — it is auto-injected by BaseAgent
+# TeamTool and MailboxTool are NOT listed here — both are auto-injected by BaseAgent
 
 # `role` is NOT an AgentCard constructor keyword — AgentCard.role is a read-only
 # property reading config.role. Passing role= here would be silently ignored.
@@ -1054,10 +1057,11 @@ StructuredOutput(messages=[
 
 2. **Let `TeamTool` handle team awareness — don't duplicate it in prompts**
 
-   `TeamTool` is auto-injected and provides `GetTeamRoster` and
-   `GetRoleProfiles` as dynamic system prompts, giving the LLM live team and
-   role visibility. Writing team member lists in prompts is redundant and will
-   drift out of date:
+   `TeamTool` is auto-injected — as is `MailboxTool` — and provides
+   `GetTeamRoster` and `GetRoleProfiles` on the `LLM_CONTEXT` channel, so they
+   arrive in the per-turn **Context update** block rather than in the frozen
+   system prompt, giving the LLM live team and role visibility. Writing team
+   member lists in prompts is redundant and will drift out of date:
 
    ```python
    # Wrong: hard-codes team members the LLM can already see
@@ -1164,8 +1168,9 @@ StructuredOutput(messages=[
 
 5. **Don't add `TeamTool` to `config.tools` manually (unless customizing it)**
 
-   `BaseAgent.on_start()` auto-injects `TeamTool` if absent. Adding it
-   explicitly is only needed when overriding defaults (e.g., disabling hire):
+   `BaseAgent.on_start()` auto-injects `TeamTool` if absent, and `MailboxTool`
+   the same way. Adding either explicitly is only needed when overriding
+   defaults (e.g., disabling hire):
 
    ```python
    # Only if you want to disable hiring:
