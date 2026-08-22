@@ -513,7 +513,7 @@ flowchart TD
 ### 5. Mailbox Visibility
 
 An agent sees its pending mail through three live surfaces, all provided by `MailboxTool`
-(auto-added beside `TeamTool`; the deprecated `mailbox_notifications` start-up system prompt
+(auto-added beside `TeamTool`; the former `mailbox_notifications` start-up system prompt
 is gone — the system block is frozen and carries no mailbox content):
 
 - **Mailbox status as context state** (`MailboxState`, `LLM_CONTEXT` channel) — delivered
@@ -711,8 +711,10 @@ classes — `RunUsageLimitError` and `AgentUsageLimitError`, both `akgentic-llm`
 subclasses of `UsageLimitError` — and they are told apart by class, never by reading the
 message text.
 
-**It is a decorator, not code inside the handler.** `receiveMsg_AgentMessage` carries no
-`try`/`except` of its own:
+**It is a decorator, not code inside the handler.** The one `try`/`except`
+`receiveMsg_AgentMessage` carries is the `RunInterruptedError` catch around `act()` (run
+cancellation — see [Mailbox Visibility](#5-mailbox-visibility)); the usage-limit ladder is
+entirely the decorator's:
 
 ```python
 @guard_usage_limits(output_type=StructuredOutput, route=_route_output)
@@ -816,6 +818,7 @@ A subclass with its own structured output and its own `receiveMsg_*` gets the ti
 with *your* schema and *your* router:
 
 ```python
+from akgentic.agent import RunInterruptedError
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 
@@ -841,16 +844,21 @@ class CustomAgent(BaseAgent):
 
     @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
-        """Handle one incident. No error handling of its own."""
-        self._route_triage(self.act(prompt, TriageOutput))
+        """Handle one incident. The one except it carries is the cancel catch."""
+        try:
+            output = self.act(prompt, TriageOutput)
+        except RunInterruptedError:
+            self.notify_human("Run interrupted.")
+            return
+        self._route_triage(output)
 ```
 
 What the subclass gets, and what it must supply:
 
 | | |
 |---|---|
-| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing; `@guard_usage_limits` — the tier policy; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
-| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output |
+| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing; `@guard_usage_limits` — the tier policy; `MailboxCancelCapability` — built unconditionally, so every subclass run is interruptible; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
+| **Supplied here** | the output model, the message type and its handler, the router that delivers the output, and the `RunInterruptedError` catch around `act()` — every `receiveMsg_*` that calls `act()` must supply it itself (notify the human, route nothing, return); an escape ends the turn through the actor failure path instead of the designed clean end |
 
 A run-tier breach in `CustomAgent` therefore concludes in **`TriageOutput`** and is delivered
 by **`_route_triage`**, with `CustomAgent` overriding nothing — because the schema and the
@@ -1317,8 +1325,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         @guard_usage_limits(output_type=StructuredOutput, route=_route_output).
         Entry point for all incoming messages. Intercepts "/"-prefixed content as
         a command; otherwise prepends the REPLY_PROTOCOLS line for message.type,
-        runs one act() turn and routes the result. It carries no try/except of
-        its own — the decorator owns the usage-limit policy.
+        runs one act() turn and routes the result. The one try/except it carries
+        is the RunInterruptedError catch around act() — a queued /stop or
+        CancelMessage ends the run cleanly (notify the human, route nothing,
+        return normally). The decorator owns the usage-limit policy.
         A breach is handled by tier, told apart by exception class and never by
         message text. A run-tier breach (RunUsageLimitError — this turn ran out of
         its own budget) first attempts one tool-free conclusion, delivered to the
@@ -1328,6 +1338,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         attempt, notify_human(), then WarningError. A conclusion that delivers
         nothing falls through to the same escalation, reporting the original
         breach. Usage-limit errors are the only ones the decorator catches.
+
+    receiveMsg_CancelMessage(message, sender) -> None
+        Acknowledge a CancelMessage dequeued while the agent is idle — a logged
+        no-op. Cancellation is enforced mid-run by the mailbox peek inside
+        MailboxCancelCapability, not by this handler; by the time a cancel is
+        dequeued and lands here there is nothing to cancel.
 
     hire_member(role) -> ActorAddress
         Hire by role through the registry's typed hire_member command.
