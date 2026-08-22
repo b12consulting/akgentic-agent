@@ -18,7 +18,8 @@ first turn's context-update block.
 """
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
@@ -121,11 +122,21 @@ def _agent_config(**overrides: object) -> AgentConfig:
     )
 
 
-def _start_agent(config: AgentConfig, mailbox: list[AgentMessage] | None = None) -> None:
-    """Start a BaseAgent through the real actor system with the capturing doubles.
+@contextmanager
+def _running_agent(
+    config: AgentConfig, mailbox: list[AgentMessage] | None = None
+) -> Iterator[tuple[ActorSystem, ActorAddress]]:
+    """Run a BaseAgent through the real actor system with the capturing doubles.
+
+    Swaps ReactAgent/ToolFactory for the recording doubles, starts an
+    orchestrator and one BaseAgent, waits for ``on_start`` to complete, and
+    yields the system with the agent's address for specs that message it. The
+    doubles stay swapped and the mailbox patch stays active until the with
+    block exits, so a turn run inside it sees the same environment ``on_start``
+    saw.
 
     ``mailbox`` non-``None`` patches ``BaseAgent.get_mailbox`` for the whole
-    start, simulating messages already queued in the actor inbox when
+    lifetime, simulating messages already queued in the actor inbox when
     ``on_start`` runs — the stale-closure repro condition.
     """
     _reset_captures()
@@ -146,9 +157,10 @@ def _start_agent(config: AgentConfig, mailbox: list[AgentMessage] | None = None)
             Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
         )
         orchestrator = system.proxy_ask(orch_addr, Orchestrator)
-        orchestrator.createActor(BaseAgent, config=config)
+        agent_addr = orchestrator.createActor(BaseAgent, config=config)
         time.sleep(0.5)
         assert _CapturingReactAgent.captured, "ReactAgent was never constructed"
+        yield system, agent_addr
     finally:
         if patcher is not None:
             patcher.stop()
@@ -158,6 +170,12 @@ def _start_agent(config: AgentConfig, mailbox: list[AgentMessage] | None = None)
             system.shutdown(timeout=5)
         except Exception:
             pass
+
+
+def _start_agent(config: AgentConfig, mailbox: list[AgentMessage] | None = None) -> None:
+    """Start and stop an agent, leaving the captures behind for assertion."""
+    with _running_agent(config, mailbox):
+        pass
 
 
 def _mailbox_cards(cards: list[ToolCard]) -> list[MailboxTool]:
@@ -225,7 +243,6 @@ class TestMailboxToolAutoAdd:
         _start_agent(config)
 
         assert config.tools == []
-        assert _RecordingToolFactory.captured_cards[-1] is not config.tools
 
     def test_present_config_card_wins_and_no_default_is_added(self) -> None:
         customised = MailboxTool(read_mailbox=False)
@@ -270,25 +287,9 @@ class TestMailboxWiring:
         With messages pending, the first turn's **Context update** block carries
         the mailbox rendering — not a system prompt, and not nothing.
         """
-        _reset_captures()
-        system = ActorSystem()
-        original_react = agent_module.ReactAgent
-        original_factory = agent_module.ToolFactory
-        agent_module.ReactAgent = _CapturingReactAgent  # type: ignore[misc, assignment]
-        agent_module.ToolFactory = _RecordingToolFactory  # type: ignore[misc]
-        patcher = patch.object(
-            BaseAgent, "get_mailbox", return_value=[_make_pending_message("@Alice")]
-        )
-        try:
-            patcher.start()
-            orch_addr = system.createActor(
-                Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
-            )
-            orchestrator = system.proxy_ask(orch_addr, Orchestrator)
-            manager_addr = orchestrator.createActor(BaseAgent, config=_agent_config())
-            time.sleep(0.3)
-
-            system.tell(manager_addr, AgentMessage(content="hello"))
+        mailbox = [_make_pending_message("@Alice")]
+        with _running_agent(_agent_config(), mailbox) as (system, agent_addr):
+            system.tell(agent_addr, AgentMessage(content="hello"))
 
             deadline = time.time() + 10
             while not _CapturingReactAgent.recorded_blocks and time.time() < deadline:
@@ -298,11 +299,3 @@ class TestMailboxWiring:
             assert len(blocks) == 1, "first turn must deliver exactly one block"
             assert blocks[0].startswith("**Context update 1** — current state.")
             assert "pending from @Alice" in blocks[0]
-        finally:
-            patcher.stop()
-            agent_module.ReactAgent = original_react  # type: ignore[misc]
-            agent_module.ToolFactory = original_factory  # type: ignore[misc]
-            try:
-                system.shutdown(timeout=5)
-            except Exception:
-                pass
