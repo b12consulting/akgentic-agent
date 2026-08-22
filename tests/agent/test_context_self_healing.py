@@ -1,18 +1,20 @@
-"""Tests for context-update self-healing (Epic 19, story 19-2).
+"""Tests for the two self-healing properties the agent still owns (Epics 19, 21).
 
-Before reading any provider, ``_deliver_context_update`` verifies that its last
-delivered **Context update** marker is still visible in the user-role prompt
-parts of the context history; a miss drops every baseline so the next block is
-a full snapshot — one rule covering manual ``compact()``, automatic compaction,
-sliding-window trimming, restore, and any out-of-band wipe. ``clear()`` resets
-baselines and counter directly, and the frozen system block stays byte-identical
-across no-change turns (the prefix-stability guard runs a real ``ReactAgent``
-over a token-free pydantic-ai ``FunctionModel``).
+``clear()`` is the one legitimate zeroing of the context-update state: it wipes
+the history, so it resets the persisted slot through
+``ContextUpdater.reset()``. ``compact()`` deliberately gets no reset — the
+updater's own reconciliation against the visible history catches a folded-away
+block, including the automatic compaction a ``compact()`` hook would miss.
 
-Most specs use the bare-agent + stubbed-ReactAgent pattern from story 19-1's
-suite; the stub context carries a real ``messages`` list whose delivered blocks
-land as user-role messages, so the presence check sees exactly the post-run
-shape the real ``ContextManager`` would give it.
+The prefix-stability property (NFR1) is the other: two consecutive no-change
+turns must leave the ``SystemPromptPart``s of ``messages[0]`` byte-identical and
+add no message beyond the model's own. It runs a real ``ReactAgent`` over a
+token-free pydantic-ai ``FunctionModel``, because the property under guard is
+pydantic-ai's dynamic system-prompt re-evaluation.
+
+Every other eviction and restore scenario the old story-19-2 suite covered is
+engine behaviour now, tested in ``akgentic-tool``; the restore path through a
+real ``init_state()`` is covered in ``test_context_restore.py``.
 """
 
 from collections.abc import Callable
@@ -20,20 +22,19 @@ from typing import Any, Self
 from unittest.mock import MagicMock
 
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
-from akgentic.tool.core import ContextState
+from akgentic.tool.core import ContextState, ContextUpdater
 from pydantic_ai import RunContext
 from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     SystemPromptPart,
     TextPart,
-    ToolReturnPart,
     UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 
 # =============================================================================
 # HELPERS
@@ -68,11 +69,13 @@ def _provider(name: str, holder: dict[str, ContextState | None]) -> Callable[[],
 
 
 def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
-    """Bare BaseAgent (no Pykka) with a stubbed ReactAgent and given providers.
+    """Bare BaseAgent (no Pykka) with a stubbed ReactAgent and a real updater.
 
     ``record_operator_action`` appends each block as a user-role message to a
-    real ``messages`` list (the post-first-run shape), so the presence check
-    scans the same history it would against the real ``ContextManager``.
+    real ``messages`` list (the post-first-run shape), so the updater's
+    reconciliation scans the same history it would against the real
+    ``ContextManager``. The updater holds the agent weakly, so the caller must
+    keep the returned agent alive.
     """
     agent: BaseAgent = object.__new__(BaseAgent)
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
@@ -90,9 +93,10 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     mock_config.name = "@TestAgent"
     agent.config = mock_config  # type: ignore[attr-defined]
 
-    agent._context_state_providers = providers or []  # type: ignore[attr-defined]
-    agent._context_baselines = {}  # type: ignore[attr-defined]
-    agent._context_update_seq = 0  # type: ignore[attr-defined]
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
+    agent._context_updater = ContextUpdater(  # type: ignore[attr-defined]
+        agent, providers or []
+    )
     return agent
 
 
@@ -105,20 +109,17 @@ def _messages(agent: BaseAgent) -> list[Any]:
     return agent._react_agent.context.messages  # type: ignore[attr-defined, no-any-return]
 
 
-FULL_ROSTER_BLOCK_2 = "**Context update 2** — current state.\n\n**Team roster:**\n@Manager"
-
-
 # =============================================================================
-# AC 3 — clear() resets baselines and counter; compact() gains no reset call
+# AC 5 — clear() resets through the updater; compact() gains no reset call
 # =============================================================================
 
 
 class TestClearReset:
-    def test_clear_drops_baselines_and_resets_counter(self) -> None:
+    def test_clear_zeroes_the_persisted_slot(self) -> None:
         holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
         agent = _make_agent([_provider("team_roster_state", holder)])
         agent._deliver_context_update()
-        assert agent._context_update_seq == 1  # type: ignore[attr-defined]
+        assert agent.state.tool_state.context_update_seq == 1
 
         history = _messages(agent)
         agent._react_agent.clear_context.side_effect = (  # type: ignore[attr-defined]
@@ -127,8 +128,18 @@ class TestClearReset:
         result = agent.clear()
 
         assert result == "Cleared."
-        assert agent._context_baselines == {}  # type: ignore[attr-defined]
-        assert agent._context_update_seq == 0  # type: ignore[attr-defined]
+        assert agent.state.tool_state.context_baselines == {}
+        assert agent.state.tool_state.context_update_seq == 0
+
+    def test_clear_resets_through_the_updater_not_by_touching_the_slot(self) -> None:
+        """The agent owns no baseline field of its own — reset() is the path."""
+        agent = _make_agent()
+        agent._context_updater = MagicMock()  # type: ignore[attr-defined]
+        agent._react_agent.clear_context.return_value = "Cleared."  # type: ignore[attr-defined]
+
+        assert agent.clear() == "Cleared."
+
+        agent._context_updater.reset.assert_called_once_with()  # type: ignore[attr-defined]
 
     def test_next_block_after_clear_is_update_1_current_state(self) -> None:
         holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
@@ -152,199 +163,17 @@ class TestClearReset:
         holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
         agent = _make_agent([_provider("team_roster_state", holder)])
         agent._deliver_context_update()
-        baselines_before = dict(agent._context_baselines)  # type: ignore[attr-defined]
+        baselines_before = dict(agent.state.tool_state.context_baselines)
 
         agent.compact()
 
-        # compact() delegates only; FR5's presence check owns the repair.
-        assert agent._context_baselines == baselines_before  # type: ignore[attr-defined]
-        assert agent._context_update_seq == 1  # type: ignore[attr-defined]
+        # compact() delegates only; the updater's reconciliation owns the repair.
+        assert agent.state.tool_state.context_baselines == baselines_before
+        assert agent.state.tool_state.context_update_seq == 1
 
 
 # =============================================================================
-# AC 1 — presence miss drops baselines; counter stays monotonic
-# =============================================================================
-
-
-class TestEvictionSelfHealing:
-    def test_manual_compact_that_folds_block_away_yields_full_snapshot_n_plus_1(self) -> None:
-        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", holder)])
-        agent._deliver_context_update()
-
-        # A compaction summary replaced the history; the marker is gone.
-        _messages(agent)[:] = [
-            ModelRequest(parts=[UserPromptPart(content="Summary of the conversation so far.")])
-        ]
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 2
-        # Full snapshot, numbered N+1 (never reset to 1), worded as current state.
-        assert blocks[1] == FULL_ROSTER_BLOCK_2
-
-    def test_automatic_compaction_between_act_turns_self_heals(self) -> None:
-        """No agent-visible call at all — the case a compact() hook would miss."""
-        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", holder)])
-        agent._react_agent.run_sync.return_value = "response"  # type: ignore[attr-defined]
-
-        agent.act("turn one", output_type=str)
-        # Out-of-band eviction between turns: nothing on the agent was called.
-        _messages(agent)[:] = [
-            ModelRequest(parts=[UserPromptPart(content="Summary of the conversation so far.")])
-        ]
-        agent.act("turn two", output_type=str)
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 2
-        assert blocks[1] == FULL_ROSTER_BLOCK_2
-
-    def test_sliding_window_trim_dropping_the_block_yields_full_snapshot(self) -> None:
-        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", holder)])
-        agent._deliver_context_update()
-        holder["state"] = _RosterState(members=("@Manager", "@Bob"))
-        agent._deliver_context_update()  # delta block, marker 2
-
-        # The window trims the newest marker away; marker 1 survives behind it.
-        del _messages(agent)[-1]
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 3
-        # Marker 2 absent → baselines dropped → full snapshot; the counter is
-        # NOT reset by the miss (a partially trimmed history still shows 1).
-        assert blocks[2] == (
-            "**Context update 3** — current state.\n\n**Team roster:**\n@Manager\n@Bob"
-        )
-
-    def test_marker_present_and_no_change_still_appends_nothing(self) -> None:
-        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", holder)])
-
-        agent._deliver_context_update()
-        holder["state"] = _RosterState(members=("@Manager",))
-        agent._deliver_context_update()
-
-        assert len(_recorded_blocks(agent)) == 1
-        assert agent._context_update_seq == 1  # type: ignore[attr-defined]
-        assert "team_roster_state" in agent._context_baselines  # type: ignore[attr-defined]
-
-
-# =============================================================================
-# AC 2 — restored agent: numbering continuity, full snapshot, never adoption
-# =============================================================================
-
-
-class TestRestoredAgent:
-    def test_restored_history_with_markers_continues_numbering_with_full_snapshot(self) -> None:
-        agent = _make_agent(
-            [_provider("team_roster_state", {"state": _RosterState(members=("@Manager",))})]
-        )
-        # A restored life: baselines empty, counter 0, history carries old blocks.
-        _messages(agent)[:] = [
-            ModelRequest(
-                parts=[UserPromptPart(content="**Context update 1** — current state.\n\nold")]
-            ),
-            ModelResponse(parts=[TextPart(content="ok")]),
-            ModelRequest(
-                parts=[
-                    UserPromptPart(
-                        content=(
-                            "**Context update 3** — state has changed since the last update."
-                            "\n\n@Bob joined the team."
-                        )
-                    )
-                ]
-            ),
-        ]
-
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        # A full snapshot IS delivered (never a silent baseline adoption), and it
-        # continues the sequence past the highest restored marker.
-        assert len(blocks) == 1
-        assert blocks[0] == (
-            "**Context update 4** — current state.\n\n**Team roster:**\n@Manager"
-        )
-        assert agent._context_update_seq == 4  # type: ignore[attr-defined]
-
-    def test_restored_history_with_no_marker_starts_at_1(self) -> None:
-        agent = _make_agent(
-            [_provider("team_roster_state", {"state": _RosterState(members=("@Manager",))})]
-        )
-        _messages(agent)[:] = [
-            ModelRequest(parts=[UserPromptPart(content="hello")]),
-            ModelResponse(parts=[TextPart(content="hi")]),
-        ]
-
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 1
-        assert blocks[0].startswith("**Context update 1** — current state.")
-
-
-# =============================================================================
-# AC 6 / NFR2 — scan scope: user prompt parts only, on ModelRequest only
-# =============================================================================
-
-
-class TestScanScope:
-    def test_marker_only_in_tool_return_part_counts_as_absent(self) -> None:
-        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", holder)])
-        agent._deliver_context_update()
-        delivered = _recorded_blocks(agent)[0]
-
-        # The only occurrence of the marker now sits in a tool return.
-        _messages(agent)[:] = [
-            ModelRequest(
-                parts=[ToolReturnPart(tool_name="echo", content=delivered, tool_call_id="c1")]
-            )
-        ]
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 2
-        assert blocks[1] == FULL_ROSTER_BLOCK_2
-
-    def test_marker_only_in_model_response_counts_as_absent(self) -> None:
-        """A model echoing the marker verbatim must not satisfy the check."""
-        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", holder)])
-        agent._deliver_context_update()
-        delivered = _recorded_blocks(agent)[0]
-
-        _messages(agent)[:] = [ModelResponse(parts=[TextPart(content=delivered)])]
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 2
-        assert blocks[1] == FULL_ROSTER_BLOCK_2
-
-    def test_marker_in_multimodal_list_content_counts_as_present(self) -> None:
-        """A block folded into a multimodal prompt is found in the str items."""
-        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", holder)])
-        agent._deliver_context_update()
-        delivered = _recorded_blocks(agent)[0]
-
-        _messages(agent)[:] = [
-            ModelRequest(parts=[UserPromptPart(content=[delivered, "and an image ref"])])
-        ]
-        holder["state"] = _RosterState(members=("@Manager",))
-        agent._deliver_context_update()
-
-        # Marker present + no change → nothing appended, baselines intact.
-        assert len(_recorded_blocks(agent)) == 1
-        assert agent._context_update_seq == 1  # type: ignore[attr-defined]
-
-
-# =============================================================================
-# AC 5 / NFR1 — prefix stability: real ReactAgent, token-free FunctionModel
+# NFR1 — prefix stability: real ReactAgent, token-free FunctionModel
 # =============================================================================
 
 
@@ -359,7 +188,8 @@ def _real_react_agent_pair() -> tuple[ReactAgent, BaseAgent, dict[str, ContextSt
     The real agent keeps pydantic-ai's dynamic system-prompt re-evaluation
     path intact — the property NFR1 guards, which the stubbed ``_make_agent``
     cannot exercise. The caller registers any dynamic system prompts before
-    the first run and owns ``react_agent.close()``.
+    the first run and owns ``react_agent.close()``, and must keep the returned
+    agent alive: the updater holds it weakly.
     """
     react_agent = ReactAgent(
         config=ReactAgentConfig(model_cfg=ModelConfig(provider="openai", model="gpt-4o")),
@@ -374,11 +204,10 @@ def _real_react_agent_pair() -> tuple[ReactAgent, BaseAgent, dict[str, ContextSt
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"
     agent.config = mock_config  # type: ignore[attr-defined]
-    agent._context_state_providers = [  # type: ignore[attr-defined]
-        _provider("team_roster_state", holder)
-    ]
-    agent._context_baselines = {}  # type: ignore[attr-defined]
-    agent._context_update_seq = 0  # type: ignore[attr-defined]
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
+    agent._context_updater = ContextUpdater(  # type: ignore[attr-defined]
+        agent, [_provider("team_roster_state", holder)]
+    )
     return react_agent, agent, holder
 
 
@@ -432,8 +261,8 @@ class TestPrefixStability:
             react_agent.close()
 
     def test_first_turn_block_is_folded_and_marker_found_next_turn(self) -> None:
-        """The fresh-agent fold lands the marker in a UserPromptPart; the scan
-        finds it there with no fold-specific branch (ADR-037 §7)."""
+        """The fresh-agent fold lands the marker in a UserPromptPart; the
+        updater's reconciliation finds it there with no fold-specific branch."""
         react_agent, agent, holder = _real_react_agent_pair()
         try:
             with react_agent.pydantic_agent.override(model=FunctionModel(_stub_model)):
@@ -445,12 +274,12 @@ class TestPrefixStability:
                     if isinstance(p, UserPromptPart)
                 ]
                 assert any("**Context update 1**" in str(t) for t in user_texts)
-                # Unchanged second turn: the presence check finds the folded
-                # marker, so the surviving baseline appends nothing.
+                # Unchanged second turn: reconciliation finds the folded marker,
+                # so the surviving baseline appends nothing.
                 holder["state"] = _RosterState(members=("@Manager",))
                 agent.act("turn two", output_type=str)
 
-            assert agent._context_update_seq == 1  # type: ignore[attr-defined]
+            assert agent.state.tool_state.context_update_seq == 1
             assert len(react_agent.context.messages) == 4
         finally:
             react_agent.close()

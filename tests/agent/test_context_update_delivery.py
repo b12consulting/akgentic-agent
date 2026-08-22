@@ -1,31 +1,38 @@
-"""Tests for per-turn context-update block delivery (Epic 19, story 19-1).
+"""Tests for the agent's half of context-update delivery (Epics 19 and 21).
 
-BaseAgent collects context-state providers at ``on_start`` and, at the top of
-every ``act()`` turn, appends at most one **Context update** block through
-``ContextManager.record_operator_action``: full renderings on first sight,
-deltas afterwards, nothing at all on an unchanged turn. Providers and
-renderers degrade to "no section" on any failure — never to a failed turn.
+What ``BaseAgent`` still owns after Epic 21 is the *when* and the *how*: one
+``ContextUpdater``, obtained from the factory at ``on_start`` and held for the
+agent's lifetime; ``_deliver_context_update`` as the single delivery site at the
+top of every ``act()`` turn; and the append through
+``ContextManager.record_operator_action`` rather than a bare ``ModelRequest``,
+so a fresh agent's first block is folded into the first run's prompt instead of
+suppressing system-prompt injection.
+
+The composition itself — reading providers, diffing against baselines,
+reconciling against the visible history, the block grammar, the per-provider
+degradation — moved to ``akgentic.tool.core.ContextUpdater`` and is tested
+there. The specs below deliberately drive a *real* updater rather than a stub,
+so a wiring change that breaks the pairing fails here.
 
 Most specs use the bare-agent + stubbed-ReactAgent pattern shared by the other
-unit tests in this package; the first-run fold spec uses the real akgentic-llm
+unit tests in this package; the first-run fold specs use the real akgentic-llm
 ``ContextManager`` because the buffer-vs-append decision is the property under
 test; the on_start spec goes through the real actor system.
 """
 
-import logging
 import time
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, Self
 from unittest.mock import MagicMock
 
-import pytest
 from akgentic.llm import ContextManager, ReactAgent
-from akgentic.tool.core import ContextState
+from akgentic.tool.core import ContextState, ContextUpdater
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
+import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 
 # =============================================================================
 # HELPERS
@@ -66,30 +73,6 @@ class _PlanningState(ContextState):
         return "New tasks: " + " ".join(added)
 
 
-class _OtherTypeState(ContextState):
-    """A reconfigured-card stand-in: diffing across types is forbidden."""
-
-    text: str = ""
-
-    def render_full(self) -> str:
-        return self.text
-
-    def render_delta(self, previous: Self) -> str | None:
-        raise AssertionError("render_delta must never be asked to diff across types")
-
-
-class _ExplodingDeltaState(ContextState):
-    """Full render works; the delta renderer raises (NFR3 degradation path)."""
-
-    text: str = ""
-
-    def render_full(self) -> str:
-        return self.text
-
-    def render_delta(self, previous: Self) -> str | None:
-        raise RuntimeError("renderer boom")
-
-
 def _provider(name: str, holder: dict[str, ContextState | None]) -> Callable[[], Any]:
     """A named provider reading its current state from a mutable holder."""
 
@@ -100,21 +83,19 @@ def _provider(name: str, holder: dict[str, ContextState | None]) -> Callable[[],
     return provider
 
 
-def _raising_provider(name: str) -> Callable[[], Any]:
-    def provider() -> ContextState | None:
-        raise RuntimeError("provider boom")
-
-    provider.__name__ = name
-    return provider
-
-
 def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
-    """Bare BaseAgent (no Pykka) with a stubbed ReactAgent and given providers.
+    """Bare BaseAgent (no Pykka) with a stubbed ReactAgent and a real updater.
 
     The stubbed context carries a real ``messages`` list, and its
     ``record_operator_action`` appends each delivered block as a user-role
-    message (the post-first-run shape) — so the 19-2 presence check finds the
-    marker on later turns exactly as it would against the real ContextManager.
+    message (the post-first-run shape) — so the updater's reconciliation finds
+    the marker on later turns exactly as it would against the real
+    ContextManager.
+
+    The agent gets a real ``AgentState``, because the updater dereferences
+    ``observer.state.tool_state`` on every call, and a real ``ContextUpdater``
+    built over this agent — which the updater holds *weakly*, so the caller
+    must keep the returned agent alive for the duration of the test.
     """
     agent: BaseAgent = object.__new__(BaseAgent)
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
@@ -132,9 +113,10 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     mock_config.name = "@TestAgent"
     agent.config = mock_config  # type: ignore[attr-defined]
 
-    agent._context_state_providers = providers or []  # type: ignore[attr-defined]
-    agent._context_baselines = {}  # type: ignore[attr-defined]
-    agent._context_update_seq = 0  # type: ignore[attr-defined]
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
+    agent._context_updater = ContextUpdater(  # type: ignore[attr-defined]
+        agent, providers or []
+    )
     return agent
 
 
@@ -144,205 +126,110 @@ def _recorded_blocks(agent: BaseAgent) -> list[str]:
 
 
 # =============================================================================
-# AC 3 — first block: full renderings, marker, counter
+# AC 3 / AC 6 — no baseline state on the agent; one updater holds it all
 # =============================================================================
 
 
-class TestFirstBlock:
-    def test_first_turn_appends_one_block_with_every_full_rendering(self) -> None:
-        roster: dict[str, ContextState | None] = {
-            "state": _RosterState(members=("@Manager", "@Analyst"))
-        }
-        planning: dict[str, ContextState | None] = {"state": _PlanningState(tasks=("ID 1 [t]",))}
-        agent = _make_agent(
-            [_provider("team_roster_state", roster), _provider("planning_state", planning)]
-        )
+class TestNoAgentSideBaselineState:
+    def test_the_deleted_engine_members_are_gone(self) -> None:
+        """The deleted engine members, asserted where they would actually live.
 
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 1
-        expected = (
-            "**Context update 1** — current state.\n\n"
-            "**Team roster:**\n@Manager\n@Analyst\n\n"
-            "**Planning:** ID 1 [t]"
-        )
-        assert blocks[0] == expected
-        assert agent._context_update_seq == 1  # type: ignore[attr-defined]
-
-    def test_empty_full_rendering_contributes_nothing_and_counter_stays(self) -> None:
-        roster: dict[str, ContextState | None] = {"state": _RosterState(members=())}
-        agent = _make_agent([_provider("team_roster_state", roster)])
-
-        agent._deliver_context_update()
-
-        assert _recorded_blocks(agent) == []
-        assert agent._context_update_seq == 0  # type: ignore[attr-defined]
-        # No baseline advance either: an empty full render is a skip, not a delivery.
-        assert agent._context_baselines == {}  # type: ignore[attr-defined]
-
-
-# =============================================================================
-# AC 3 / AC 4 — unchanged turn appends nothing; deltas afterwards
-# =============================================================================
-
-
-class TestDeltaTurns:
-    def test_unchanged_second_turn_appends_nothing(self) -> None:
-        roster: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", roster)])
-
-        agent._deliver_context_update()
-        roster["state"] = _RosterState(members=("@Manager",))
-        agent._deliver_context_update()
-
-        assert len(_recorded_blocks(agent)) == 1
-        assert agent._context_update_seq == 1  # type: ignore[attr-defined]
-
-    def test_hire_between_turns_appends_delta_not_relisted_roster(self) -> None:
-        roster: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        agent = _make_agent([_provider("team_roster_state", roster)])
-
-        agent._deliver_context_update()
-        roster["state"] = _RosterState(members=("@Manager", "@Bob"))
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 2
-        assert blocks[1] == (
-            "**Context update 2** — state has changed since the last update.\n\n"
-            "@Bob joined the team."
-        )
-        assert "**Team roster:**" not in blocks[1]
-
-    def test_two_changed_providers_produce_one_block_in_factory_order(self) -> None:
-        roster: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        planning: dict[str, ContextState | None] = {"state": _PlanningState(tasks=("ID 1 [t]",))}
-        agent = _make_agent(
-            [_provider("team_roster_state", roster), _provider("planning_state", planning)]
-        )
-
-        agent._deliver_context_update()
-        roster["state"] = _RosterState(members=("@Manager", "@Bob"))
-        planning["state"] = _PlanningState(tasks=("ID 1 [t]", "ID 2 [u]"))
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 2
-        assert blocks[1] == (
-            "**Context update 2** — state has changed since the last update.\n\n"
-            "@Bob joined the team.\n\n"
-            "New tasks: ID 2 [u]"
-        )
-
-    def test_provider_first_seen_after_first_block_renders_full_in_delta_block(self) -> None:
-        """First-seen-is-never-a-delta, even inside a later, change-worded block.
-
-        A provider unavailable (None) on turn 1 that appears on turn 2 has no
-        baseline: it must render full. A delta against nothing would raise in
-        the renderer and degrade to no section, so the exact full rendering in
-        block 2 discriminates the two paths.
+        The methods belong to the class and the marker pattern to the module,
+        so checking them there is what makes this spec falsifiable: restore the
+        engine and it goes red. The three deleted *instance* fields cannot be
+        checked on the bare fixture below — ``on_start`` is what used to create
+        them, and a fixture that never runs ``on_start`` would report them
+        absent either way. They are covered behaviourally instead: by the next
+        spec, and by the restore specs, which only pass while the counter lives
+        on the persisted slot.
         """
-        roster: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
-        planning: dict[str, ContextState | None] = {"state": None}
-        agent = _make_agent(
-            [_provider("team_roster_state", roster), _provider("planning_state", planning)]
+        for gone in (
+            "_verify_context_baselines",
+            "_iter_user_prompt_texts",
+            "_render_context_section",
+            "_compose_context_update",
+        ):
+            assert not hasattr(BaseAgent, gone), f"BaseAgent still carries {gone}"
+        assert not hasattr(agent_module, "_CONTEXT_UPDATE_MARKER"), (
+            "the marker pattern belongs to the engine's package now"
         )
 
-        agent._deliver_context_update()
-        planning["state"] = _PlanningState(tasks=("ID 1 [t]",))
-        agent._deliver_context_update()
-
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 2
-        assert blocks[1] == (
-            "**Context update 2** — state has changed since the last update.\n\n"
-            "**Planning:** ID 1 [t]"
-        )
-
-
-# =============================================================================
-# AC 4 — same-type rule: a type change renders full, never a cross-type diff
-# =============================================================================
-
-
-class TestTypeChange:
-    def test_state_of_different_type_renders_full_not_delta(self) -> None:
+    def test_delivery_caches_nothing_of_its_own_on_the_agent(self) -> None:
+        """A delivered turn leaves the updater as the agent's only context state."""
         holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
         agent = _make_agent([_provider("team_roster_state", holder)])
 
         agent._deliver_context_update()
-        # Card reconfigured mid-life: same provider name, different concrete type.
-        # _OtherTypeState.render_delta raises AssertionError if it is ever consulted.
-        holder["state"] = _OtherTypeState(text="Reconfigured snapshot.")
+
+        assert {name for name in vars(agent) if name.startswith("_context")} == {
+            "_context_updater"
+        }
+
+    def test_delivery_advances_the_persisted_slot_not_an_agent_field(self) -> None:
+        """The counter and baselines advance on ``state.tool_state``."""
+        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
+        agent = _make_agent([_provider("team_roster_state", holder)])
+
         agent._deliver_context_update()
 
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 2
-        assert "Reconfigured snapshot." in blocks[1]
-        baselines = agent._context_baselines  # type: ignore[attr-defined]
-        assert isinstance(baselines["team_roster_state"], _OtherTypeState)
+        assert agent.state.tool_state.context_update_seq == 1
+        assert "team_roster_state" in agent.state.tool_state.context_baselines
 
 
 # =============================================================================
-# AC 7 — degradation: None states, raising providers, raising renderers
+# AC 4 — thin delivery: compose, then append when there is something to append
 # =============================================================================
 
 
-class TestDegradation:
-    def test_none_state_is_skipped_and_others_still_render(self) -> None:
-        gone: dict[str, ContextState | None] = {"state": None}
-        planning: dict[str, ContextState | None] = {"state": _PlanningState(tasks=("ID 1 [t]",))}
-        agent = _make_agent(
-            [_provider("team_roster_state", gone), _provider("planning_state", planning)]
-        )
+class TestThinDelivery:
+    def test_a_composed_block_is_appended_through_record_operator_action(self) -> None:
+        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
+        agent = _make_agent([_provider("team_roster_state", holder)])
 
         agent._deliver_context_update()
 
         blocks = _recorded_blocks(agent)
         assert len(blocks) == 1
-        assert "**Planning:** ID 1 [t]" in blocks[0]
-        baselines = agent._context_baselines  # type: ignore[attr-defined]
-        assert "team_roster_state" not in baselines
-
-    def test_raising_provider_is_skipped_logged_and_turn_completes(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        planning: dict[str, ContextState | None] = {"state": _PlanningState(tasks=("ID 1 [t]",))}
-        agent = _make_agent(
-            [_raising_provider("team_roster_state"), _provider("planning_state", planning)]
+        assert blocks[0] == (
+            "**Context update 1** — current state.\n\n**Team roster:**\n@Manager"
         )
 
-        with caplog.at_level(logging.ERROR, logger="akgentic.agent.agent"):
-            agent._deliver_context_update()
+    def test_nothing_to_say_appends_nothing(self) -> None:
+        """``compose_update`` returning ``None`` must not reach the context."""
+        holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
+        agent = _make_agent([_provider("team_roster_state", holder)])
 
-        blocks = _recorded_blocks(agent)
-        assert len(blocks) == 1
-        assert "**Planning:** ID 1 [t]" in blocks[0]
-        assert any("team_roster_state" in r.message for r in caplog.records)
-        baselines = agent._context_baselines  # type: ignore[attr-defined]
-        assert "team_roster_state" not in baselines
-
-    def test_raising_renderer_is_skipped_and_baseline_does_not_advance(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        first = _ExplodingDeltaState(text="First snapshot.")
-        holder: dict[str, ContextState | None] = {"state": first}
-        agent = _make_agent([_provider("planning_state", holder)])
-
-        agent._deliver_context_update()  # full render — fine
-        holder["state"] = _ExplodingDeltaState(text="Second snapshot.")
-        with caplog.at_level(logging.ERROR, logger="akgentic.agent.agent"):
-            agent._deliver_context_update()  # delta raises — skipped
+        agent._deliver_context_update()
+        holder["state"] = _RosterState(members=("@Manager",))
+        agent._deliver_context_update()
 
         assert len(_recorded_blocks(agent)) == 1
-        assert any("planning_state" in r.message for r in caplog.records)
-        baselines = agent._context_baselines  # type: ignore[attr-defined]
-        assert baselines["planning_state"] is first
+
+    def test_the_agent_composes_no_text_of_its_own(self) -> None:
+        """Whatever the updater returns is appended verbatim, unwrapped."""
+        agent = _make_agent()
+        agent._context_updater = MagicMock()  # type: ignore[attr-defined]
+        agent._context_updater.compose_update.return_value = "SENTINEL BLOCK"  # type: ignore[attr-defined]
+
+        agent._deliver_context_update()
+
+        assert _recorded_blocks(agent) == ["SENTINEL BLOCK"]
+
+    def test_the_updater_is_handed_the_live_context_messages(self) -> None:
+        """Reconciliation needs the history, so the messages must be passed."""
+        agent = _make_agent()
+        agent._context_updater = MagicMock()  # type: ignore[attr-defined]
+        agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
+
+        agent._deliver_context_update()
+
+        passed = agent._context_updater.compose_update.call_args.args[0]  # type: ignore[attr-defined]
+        assert passed is agent._react_agent.context.messages  # type: ignore[attr-defined]
+        assert _recorded_blocks(agent) == []
 
 
 # =============================================================================
-# AC 2 — single delivery site: top of act(), before run_sync
+# AC 4 — single delivery site: top of act(), before run_sync
 # =============================================================================
 
 
@@ -364,7 +251,7 @@ class TestActDeliverySite:
 
 
 # =============================================================================
-# AC 5 / AC 6 — delivery primitive and the pre-first-run fold (real manager)
+# AC 10 — delivery primitive and the pre-first-run fold (real manager)
 # =============================================================================
 
 
@@ -413,16 +300,20 @@ class TestFirstRunFold:
 
 
 # =============================================================================
-# AC 1 — on_start collects the factory's providers (real actor system)
+# AC 3 — on_start builds one updater from the factory (real actor system)
 # =============================================================================
 
 
-class TestOnStartCollection:
-    """on_start holds tool_factory.get_context_states() for the agent's lifetime.
+class TestOnStartWiring:
+    """on_start holds one ``tool_factory.get_context_updater()`` for the lifetime.
 
     Exercised through the real actor system (on_start runs on createActor) with
     a capturing fake ReactAgent, and asserted through behavior: a card exposing
-    a provider gets its rendering delivered in the first turn's block.
+    a provider gets its rendering delivered in the first turn's block. That
+    round trip also proves the updater is built *after* ``self.state`` is
+    assigned — it dereferences ``state.tool_state`` on the very first call, and
+    the default ``BaseState`` an agent carries before ``on_start`` has no such
+    slot.
     """
 
     def test_card_provider_is_collected_and_delivered_on_first_turn(self) -> None:

@@ -8,7 +8,9 @@ Architecture:
 - Composes ToolFactory (akgentic-tool) aggregating ToolCard[] into 4 channels:
   · TOOL_CALL — LLM-callable tools (hire_members, fire_members, + config.tools)
   · SYSTEM_PROMPT — static prompts rendered once into the frozen system block
-  · LLM_CONTEXT — volatile team state, one per-turn **Context update** block
+  · LLM_CONTEXT — volatile team state, one per-turn **Context update** block,
+    composed by akgentic-tool's ContextUpdater against baselines persisted on
+    AgentState.tool_state; this class only decides when to deliver and how to append
   · COMMAND — commands via a CommandRegistry, dispatched from /-prefixed messages
 - TeamTool auto-injected if not already in config.tools
 - ReactAgent.run_sync(output_type=...) — act() forwards the caller's type;
@@ -29,14 +31,11 @@ Architecture:
 import logging  # noqa: I001
 import os
 import random
-import re
-from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from time import sleep
 from typing import Any, TypeVar, cast
 
 from pydantic_ai import BinaryContent, ModelRetry, RunContext
-from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
@@ -53,7 +52,7 @@ from akgentic.llm import (
     UserPrompt,
     aggregate_usage,
 )
-from akgentic.tool.core import CommandRegistry, ContextState, ToolFactory
+from akgentic.tool.core import CommandRegistry, ContextUpdater, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
 from akgentic.tool.team import TeamTool
@@ -63,11 +62,6 @@ logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
-
-# The Context update marker line (ADR-037 §6). The numbered pattern recovers the
-# block counter from a restored history; the presence check uses the exact
-# per-sequence substring instead.
-_CONTEXT_UPDATE_MARKER = re.compile(r"\*\*Context update (\d+)\*\*")
 
 
 class BaseAgent(Akgent[AgentConfig, AgentState]):
@@ -139,6 +133,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     - on_start emits exactly one CommandsAnnouncedEvent so services can discover the
       command set without per-command coupling.
 
+    Context updates (LLM_CONTEXT channel):
+    - One ContextUpdater, obtained from the factory in on_start and held for the
+      agent's lifetime, composes at most one block per turn. Its baselines and
+      block counter live on AgentState.tool_state, so they are persisted and
+      restored with the rest of the state — a restored agent whose history is
+      intact resumes delta delivery instead of re-snapshotting.
+    - This class holds no baseline state of its own and composes no block text.
+      It owns only the delivery: _deliver_context_update() at the top of act(),
+      appending through record_operator_action.
+
     Internal method (used by _route_output()):
     - hire_member(role) → ActorAddress. A failed hire raises ModelRetry; see
       hire_member() for where that retry is, and is not, honoured.
@@ -163,6 +167,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         and take no RunContext, so pydantic-ai treats them as plain tools.
         Commands are aggregated into a single generic CommandRegistry, held for the
         agent's lifetime, and announced once via a CommandsAnnouncedEvent.
+
+        The context-update engine is built the same way and for the same
+        lifetime, but strictly after self.state is assigned: it is handed this
+        agent as an ActorToolObserver and reads state.tool_state — where the
+        baselines and the block counter persist — live on every call.
         """
         assert self._orchestrator is not None, "Orchestrator address must be provided in config"
         self.orchestrator_proxy_ask = self.proxy_ask(self._orchestrator, Orchestrator)
@@ -211,16 +220,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             )
         )
 
-        # ── Context-state providers (LLM_CONTEXT channel) ──────────────────────
-        # Collected once for the agent's lifetime, like the command registry.
-        # Baselines are an in-memory cache keyed by provider __name__ — never
-        # persisted: the message history is the record, and a lost baseline can
-        # only cause a full-snapshot re-send, never a lost update.
-        self._context_state_providers: list[Callable[[], ContextState | None]] = (
-            tool_factory.get_context_states()
-        )
-        self._context_baselines: dict[str, ContextState] = {}
-        self._context_update_seq: int = 0
+        # ── Context-update engine (LLM_CONTEXT channel) ────────────────────────
+        # One updater for the agent's lifetime, like the command registry. It is
+        # built after self.state is assigned: the factory isinstance-checks this
+        # agent against ActorToolObserver, and the engine reads
+        # observer.state.tool_state live on every call — the baselines and the
+        # block counter persist in that slot, so a restored agent resumes delta
+        # delivery instead of re-snapshotting. The engine itself lives in
+        # akgentic-tool, which owns the semantics it encodes.
+        self._context_updater: ContextUpdater = tool_factory.get_context_updater()
 
         self._react_agent = self._build_react_agent(react_agent_config, tools, toolsets)
 
@@ -398,167 +406,24 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     def _deliver_context_update(self) -> None:
         """Append at most one **Context update** block for this turn.
 
-        The single delivery site (called at the top of ``act()``, before
-        ``run_sync``): reads every context-state provider in factory order,
-        diffs against the in-memory baselines, composes at most one block, and
-        appends it through ``ContextManager.record_operator_action`` — the
-        buffer-vs-append decision stays with the context, so on a fresh agent
-        the first block is folded into the first run's user prompt instead of
-        suppressing system-prompt injection.
+        What the agent still owns is the whole of this method: the *when* —
+        this is the single delivery site, called at the top of ``act()`` before
+        ``run_sync`` — and the *how* — the append goes through
+        ``ContextManager.record_operator_action``, never a bare
+        ``ModelRequest``, so the buffer-vs-append decision stays with the
+        context and a fresh agent's first block is folded into the first run's
+        user prompt instead of suppressing system-prompt injection.
 
-        The baselines of contributing providers and the block counter advance
-        only when a block is actually appended; a turn with nothing to say
-        appends nothing, so an unchanged turn stays byte-identical for the
-        prompt cache. Context construction never raises (see
-        ``_render_context_section`` for the per-provider degradation).
-
-        Before any provider is read, ``_verify_context_baselines`` checks that
-        the last delivered block is still visible to the model and drops the
-        baselines when it is not, so every eviction path (compaction, window
-        trimming, restore, out-of-band wipe) self-heals with a full snapshot.
-        ``full_snapshot`` is captured right after that check — a no-change
-        delta advances a baseline mid-loop, so the wording flag must be taken
-        before the providers are read.
+        Everything else is the engine's: reading the providers, diffing against
+        the persisted baselines, reconciling them against the visible history,
+        composing the block and advancing the counter. See
+        ``akgentic.tool.core.ContextUpdater``, which owns those semantics along
+        with the cards that produce them. It never raises and returns ``None``
+        when there is nothing to say.
         """
-        self._verify_context_baselines()
-        full_snapshot = not self._context_baselines
-        sections: list[str] = []
-        advanced: dict[str, ContextState] = {}
-        for provider in self._context_state_providers:
-            contribution = self._render_context_section(provider)
-            if contribution is None:
-                continue
-            rendering, state = contribution
-            sections.append(rendering)
-            advanced[provider.__name__] = state
-        if not sections:
-            return
-        block = self._compose_context_update(sections, full_snapshot)
-        self._react_agent.context.record_operator_action(block)
-        self._context_baselines.update(advanced)
-        self._context_update_seq += 1
-
-    def _verify_context_baselines(self) -> None:
-        """Trust the baselines only while the last delivered marker is visible.
-
-        A delta is only correct relative to a baseline the model can still see
-        (ADR-037 §7). When a block has been delivered (``seq > 0``), its exact
-        marker substring must appear in the user-role prompt parts of the
-        context history; a miss — compaction (manual or automatic), sliding-
-        window trimming, any out-of-band wipe — drops **every** baseline so the
-        next block is a full snapshot. The counter is never reset on a miss:
-        ``N`` stays monotonic, because a partially trimmed history may still
-        show older numbers.
-
-        On a fresh life (``seq == 0`` — baselines are never persisted), the
-        counter is instead recovered as the highest marker number found in the
-        restored history, so the next block continues the sequence as ``N+1``
-        rather than re-emitting a number the model may already see. Baselines
-        stay empty either way — a restored agent re-delivers a full snapshot,
-        never silently adopts current state as a baseline (a lost baseline may
-        only cause a re-send, never a lost update).
-        """
-        if self._context_update_seq > 0:
-            marker = f"**Context update {self._context_update_seq}**"
-            if not any(marker in text for text in self._iter_user_prompt_texts()):
-                self._context_baselines.clear()
-            return
-        highest = 0
-        for text in self._iter_user_prompt_texts():
-            for match in _CONTEXT_UPDATE_MARKER.finditer(text):
-                highest = max(highest, int(match.group(1)))
-        self._context_update_seq = highest
-
-    def _iter_user_prompt_texts(self) -> Iterator[str]:
-        """Yield the user-prompt text of the context history, one lazy pass.
-
-        Scan scope is deliberately narrow: only ``UserPromptPart`` content on
-        ``ModelRequest`` messages — a ``str`` content directly, the ``str``
-        items of a multimodal ``list`` content otherwise. Tool returns,
-        retry prompts, system prompts and ``ModelResponse`` messages are never
-        inspected (a model echoing the marker must not count), and nothing is
-        concatenated. Never construct a ``ModelRequest`` here or anywhere
-        outside ``record_operator_action`` — appending one is the retired
-        ADR-007 defect; these imports exist for ``isinstance`` checks only.
-        """
-        for message in self._react_agent.context.messages:
-            if not isinstance(message, ModelRequest):
-                continue
-            for part in message.parts:
-                if not isinstance(part, UserPromptPart):
-                    continue
-                if isinstance(part.content, str):
-                    yield part.content
-                elif isinstance(part.content, list):
-                    yield from (item for item in part.content if isinstance(item, str))
-
-    def _render_context_section(
-        self, provider: Callable[[], ContextState | None]
-    ) -> tuple[str, ContextState] | None:
-        """Compute one provider's section for this turn, or ``None`` for no section.
-
-        First-seen states — and states whose concrete type differs from their
-        baseline's (a card reconfigured mid-life) — render ``render_full()``;
-        otherwise ``render_delta(baseline)``. The rendering is used verbatim.
-
-        Degradation, never failure: a provider or renderer that raises is
-        logged and skipped without advancing its baseline; a ``None`` state or
-        an empty full rendering contributes nothing. A ``None`` delta means no
-        change, so the baseline may advance to the current (equal) state even
-        though no section is produced.
-
-        Returns:
-            The ``(rendering, state)`` pair to contribute, or ``None``.
-        """
-        name = provider.__name__
-        try:
-            state = provider()
-        except Exception:
-            logger.exception(
-                "[%s] context-state provider '%s' raised; skipped", self.config.name, name
-            )
-            return None
-        if state is None:
-            return None
-        baseline = self._context_baselines.get(name)
-        try:
-            if baseline is None or type(state) is not type(baseline):
-                rendering: str | None = state.render_full()
-            else:
-                rendering = state.render_delta(baseline)
-        except Exception:
-            logger.exception(
-                "[%s] context-state renderer '%s' raised; skipped", self.config.name, name
-            )
-            return None
-        if rendering is None:
-            self._context_baselines[name] = state
-            return None
-        if not rendering:
-            return None
-        return rendering, state
-
-    def _compose_context_update(self, sections: list[str], full_snapshot: bool) -> str:
-        """Compose one Context update block: marker line + verbatim sections.
-
-        The marker is ``**Context update N**`` with a fixed suffix — worded as
-        current state when the baselines were empty as delivery began (first
-        block of a life, post-``/clear``, post-eviction, post-restore: every
-        section renders full then), as change only when the block was diffed
-        against surviving baselines. Both suffixes are fixed strings — nothing
-        turn-varying beyond ``N`` may appear: a timestamp or "as of" line would
-        defeat the cache property this epic exists for. Sections are joined to
-        the marker and to each other with blank lines, never re-wrapped — the
-        renderers own their internal join style.
-        """
-        number = self._context_update_seq + 1
-        suffix = (
-            "current state."
-            if full_snapshot
-            else "state has changed since the last update."
-        )
-        marker = f"**Context update {number}** — {suffix}"
-        return "\n\n".join([marker, *sections])
+        block = self._context_updater.compose_update(self._react_agent.context.messages)
+        if block is not None:
+            self._react_agent.context.record_operator_action(block)
 
     def _route_output(self, output: StructuredOutput) -> bool:
         """Send one AgentMessage per Request — the class's single routed send path.
@@ -779,14 +644,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     def clear(self) -> str:
         """Clear this agent's conversation; the system prompt regenerates on the next run.
 
-        Also drops the context-update baselines and resets the block counter:
-        the emptied history has no markers left to continue, so the next block
-        is ``**Context update 1**`` — a full snapshot of current state.
-        ``compact()`` deliberately gets no such reset — the presence check in
-        ``_verify_context_baselines`` catches a folded-away block, including
-        the automatic compaction a ``compact()`` hook would miss entirely.
+        Resetting the updater zeroes the persisted slot — baselines and block
+        counter both — because the emptied history has no markers left to
+        continue, so the next block is ``**Context update 1**``, a full
+        snapshot of current state. This is the one legitimate zeroing of the
+        counter. ``compact()`` deliberately gets no reset: the updater's own
+        reconciliation against the visible history catches a folded-away
+        block, including the automatic compaction a ``compact()`` hook would
+        miss entirely.
         """
         result = self._react_agent.clear_context()
-        self._context_baselines.clear()
-        self._context_update_seq = 0
+        self._context_updater.reset()
         return result
