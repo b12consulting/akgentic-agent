@@ -12,7 +12,7 @@ Architecture:
     composed by akgentic-tool's ContextUpdater against baselines persisted on
     AgentState.tool_state; this class only decides when to deliver and how to append
   · COMMAND — commands via a CommandRegistry, dispatched from /-prefixed messages
-- TeamTool auto-injected if not already in config.tools
+- TeamTool and MailboxTool auto-injected if not already in config.tools
 - ReactAgent.run_sync(output_type=...) — act() forwards the caller's type;
   receiveMsg_AgentMessage asks for StructuredOutput, so the team path stays
   schema-driven
@@ -55,6 +55,7 @@ from akgentic.llm import (
 from akgentic.tool.core import CommandRegistry, ContextUpdater, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
+from akgentic.tool.mailbox import MailboxTool
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace.readers import MediaContent
 
@@ -76,6 +77,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       states and commands — TOOL_CALL, SYSTEM_PROMPT, LLM_CONTEXT, COMMAND.
     - TeamTool: auto-injected if absent from config.tools; provides hire/fire
       capabilities and team-awareness context state.
+    - MailboxTool: auto-injected if absent from config.tools; provides mailbox
+      status as LLM_CONTEXT state, the read_mailbox peek tool, and the /stop
+      command. A card supplied in config.tools wins over the default.
 
     Observer Protocol:
     - Implements TeamManagementToolObserver (structural typing via @runtime_checkable)
@@ -118,9 +122,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     - agent_backstory (from AgentState.backstory)
     - current_date
     - whatever ToolFactory.get_system_prompts() yields — nothing on a default
-      card set: the roster, role profiles, planning and knowledge-graph
-      capabilities declare LLM_CONTEXT and arrive as context-update blocks
-    - mailbox_notifications, only when the mailbox is non-empty at on_start
+      card set: the roster, role profiles, planning, knowledge-graph and
+      mailbox capabilities declare LLM_CONTEXT and arrive as context-update
+      blocks
 
     Commands (programmatic, via CommandRegistry built in on_start):
     - A single generic CommandRegistry holds every COMMAND-channel callable keyed
@@ -157,10 +161,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         - Usage limits conversion
 
         Every dynamic system prompt is registered here, after construction, via
-        @self._react_agent.system_prompt: agent_backstory, current_date, whatever
-        ToolFactory.get_system_prompts() yields (nothing on a default card set —
-        the volatile capabilities declare LLM_CONTEXT), and mailbox_notifications
-        when the mailbox is non-empty at start. ReactAgent registers none of its own.
+        @self._react_agent.system_prompt: agent_backstory, current_date, and
+        whatever ToolFactory.get_system_prompts() yields (nothing on a default
+        card set — the volatile capabilities declare LLM_CONTEXT). ReactAgent
+        registers none of its own.
 
         Tools (hire_members, fire_members) come from TeamTool.get_tools() as
         closures over the orchestrator proxy — not bound methods of this agent —
@@ -181,10 +185,14 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # ── State ───────────────────────────────────────────────────────────────
         self.state = AgentState(backstory=self.config.prompt.render()).observer(self)
 
-        # ── Add TeamTool automatically (without mutating config) ──────────────
-        # TeamTool is hardcoded in akgentic-agent package
-        has_team_tool = any(isinstance(t, TeamTool) for t in self.config.tools)
-        tool_cards = self.config.tools if has_team_tool else [TeamTool(), *self.config.tools]
+        # ── Add TeamTool and MailboxTool automatically (without mutating config) ──
+        # Both intrinsic cards are hardcoded in akgentic-agent package; a card
+        # already present in config.tools wins over the prepended default.
+        tool_cards = list(self.config.tools)
+        if not any(isinstance(t, MailboxTool) for t in tool_cards):
+            tool_cards.insert(0, MailboxTool())
+        if not any(isinstance(t, TeamTool) for t in tool_cards):
+            tool_cards.insert(0, TeamTool())
 
         # ── ReactAgent: wraps model, http client, context, usage limits ──────
         # Tools come from ToolFactory (includes TeamTool hire/fire via factory pattern)
@@ -247,16 +255,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         for system_prompt in tool_factory.get_system_prompts():
             self._react_agent.system_prompt(system_prompt)
-
-        if inbox := self.get_mailbox():
-            @self._react_agent.system_prompt
-            def mailbox_notifications(ctx: RunContext[BaseAgent]) -> str | None:
-                    senders = {msg.sender.name for msg in inbox if msg.sender}
-                    return (
-                        f"NOTICE: {len(inbox)} new message(s) arrived in your mailbox "
-                        f"from team member(s): {', '.join(senders)}."
-                        "\nConsider wrapping up the current thread to process them."
-                    )
 
     def on_stop(self) -> None:
         """Release LLM resources on stop, then run the base teardown.
