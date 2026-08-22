@@ -17,11 +17,11 @@ Reused unchanged from BaseAgent:
 - ``notify_human``, ``send``, ``get_team_member``, ``hire_member`` — no schema in
   their signatures.
 - ``MailboxCapability`` (``akgentic.agent.capabilities``) — built
-  unconditionally by ``_build_react_agent``, so every subclass gets all three of
-  its duties without asking: a queued ``/stop`` or ``CancelMessage`` interrupts
-  the run, mail that arrives mid-run is announced to the model once, and under
-  ADR-019 §3 the recognised cancel will be purged from the mailbox. None of it
-  depends on the config carrying a ``MailboxTool``. The interruption is absorbed
+  unconditionally by ``_build_react_agent``, so every subclass gets all of its
+  duties without asking: a queued ``/stop`` or ``CancelMessage`` interrupts the
+  run, and mail that arrives mid-run is announced to the model once. Under
+  ADR-019 §3 it will also purge the recognised cancel from the mailbox. None of
+  it depends on the config carrying a ``MailboxTool``. The interruption is absorbed
   by ``act()`` itself, which notifies the human once and returns a neutral
   instance of the output type you named — so a subclass handler writes nothing
   for it.

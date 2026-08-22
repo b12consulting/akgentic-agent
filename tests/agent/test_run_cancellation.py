@@ -35,6 +35,7 @@ import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.core.messages import CancelMessage
 from akgentic.llm import ModelConfig, PromptTemplate, ReactAgent, ReactAgentConfig
+from pydantic_ai import AgentCapability
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     ModelMessage,
@@ -360,7 +361,7 @@ class _AgentWithOneExtra(BaseAgent):
 
     extra: ClassVar[_RecordingCapability] = _RecordingCapability()
 
-    def extra_capabilities(self) -> list[Any]:
+    def extra_capabilities(self) -> list[AgentCapability[Any]]:
         return [self.extra]
 
 

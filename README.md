@@ -684,6 +684,9 @@ class AuditedAgent(BaseAgent):
         return [AuditCapability(self.config.name)]
 ```
 
+`AuditCapability` is yours to write — any `pydantic_ai.capabilities.AbstractCapability`
+subclass, or a plain capability function.
+
 `_build_react_agent` assembles the list once and hands the same object to both build sites:
 
 ```python

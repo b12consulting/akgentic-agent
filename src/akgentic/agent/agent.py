@@ -323,8 +323,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
           first pay for a third party's ``before_model_request``.
 
         Called from ``_build_react_agent``, which runs during ``on_start``
-        before ``self._react_agent`` exists. An override must not touch it, and
-        must not assume anything built later in ``on_start``.
+        before ``self._react_agent`` exists. ``self.config`` is assigned before
+        ``on_start`` and is safe to read; an override must not touch the
+        ReactAgent, and must not assume anything built later in ``on_start``.
 
         Returns:
             Capabilities to append after the framework's own. Both an
