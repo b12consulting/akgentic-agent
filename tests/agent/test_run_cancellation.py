@@ -1,19 +1,19 @@
-"""Tests for run cancellation and the mid-run arrival notice (Epic 20, story 20-2).
+"""Tests for run cancellation and the mid-run arrival notice (Epic 20).
 
 Two layers, matching the design's two halves:
 
 - Hook level: ``MailboxCancelCapability.before_model_request`` is invoked
-  directly against a double exposing ``get_mailbox()`` and a fabricated
-  request context whose ``messages`` is a plain list — no LLM, no actor. This
-  is where the cancel-before-notice ordering, the announce-once/growth-only
-  tracking, the ephemeral append (shallow-copy semantics) and the debug log
-  line are pinned.
+  directly against a double exposing ``get_mailbox()``, a recording ``ctx``
+  double exposing ``enqueue``, and a fabricated request context — no LLM, no
+  actor. This is where the cancel-before-notice ordering, the
+  announce-once/growth-only tracking, and the enqueue contract (one
+  ``ctx.enqueue(notice, priority="asap")`` per growth, nothing appended by
+  the hook itself) are pinned. Durable delivery through pydantic-ai's drain
+  is pinned by the real-chain test in ``test_arrival_notice_durability.py``.
 - Actor level: the catch site in ``receiveMsg_AgentMessage`` and the
   ``receiveMsg_CancelMessage`` handler run through the real actor system with
   a ReactAgent double whose ``run_sync`` raises ``RunInterruptedError`` on
-  demand — simulating the capability raising mid-run. The doubles never drive
-  pydantic-ai's capability chain, so hook firing inside a live REACT loop is
-  covered at the hook level only (flagged in the story's Dev Agent Record).
+  demand — simulating the capability raising mid-run.
 """
 
 import logging
@@ -72,6 +72,17 @@ def _context(messages: list[Any] | None = None) -> Any:
     return SimpleNamespace(messages=messages if messages is not None else [])
 
 
+class _CtxDouble:
+    """Recording RunContext double: exposes ``enqueue`` and records every call."""
+
+    def __init__(self) -> None:
+        self.enqueue_calls: list[tuple[tuple[Any, ...], Any]] = []
+
+    def enqueue(self, *content: Any, priority: Any = "asap") -> str:
+        self.enqueue_calls.append((content, priority))
+        return f"enqueue-{len(self.enqueue_calls)}"
+
+
 # =============================================================================
 # FR3 — RunInterruptedError declaration and export
 # =============================================================================
@@ -98,148 +109,113 @@ class TestCancelCheck:
         capability = MailboxCancelCapability(observer=_MailboxDouble([_pending_message("/stop")]))
 
         with pytest.raises(RunInterruptedError):
-            await capability.before_model_request(None, _context())
+            await capability.before_model_request(_CtxDouble(), _context())
 
     async def test_pending_cancel_message_raises(self) -> None:
         capability = MailboxCancelCapability(observer=_MailboxDouble([CancelMessage()]))
 
         with pytest.raises(RunInterruptedError):
-            await capability.before_model_request(None, _context())
+            await capability.before_model_request(_CtxDouble(), _context())
 
     async def test_cancel_buried_behind_other_mail_still_raises(self) -> None:
         pending = [_pending_message("hello"), _pending_message("/stop now", "@Bob")]
         capability = MailboxCancelCapability(observer=_MailboxDouble(pending))
 
         with pytest.raises(RunInterruptedError):
-            await capability.before_model_request(None, _context())
+            await capability.before_model_request(_CtxDouble(), _context())
 
     async def test_cancel_check_runs_before_the_notice(self) -> None:
         """A pending /stop raises — the new mail beside it is never announced."""
         pending = [_pending_message("hello"), _pending_message("/stop")]
         capability = MailboxCancelCapability(observer=_MailboxDouble(pending))
-        context = _context()
+        ctx = _CtxDouble()
 
         with pytest.raises(RunInterruptedError):
-            await capability.before_model_request(None, context)
+            await capability.before_model_request(ctx, _context())
 
-        assert context.messages == []
+        assert ctx.enqueue_calls == []
         assert capability._announced_ids == set()
 
-    async def test_empty_mailbox_neither_raises_nor_appends(self) -> None:
+    async def test_empty_mailbox_neither_raises_nor_enqueues(self) -> None:
         capability = MailboxCancelCapability(observer=_MailboxDouble())
+        ctx = _CtxDouble()
         context = _context()
 
-        result = await capability.before_model_request(None, context)
+        result = await capability.before_model_request(ctx, context)
 
         assert result is context
-        assert context.messages == []
+        assert ctx.enqueue_calls == []
 
 
 # =============================================================================
-# FR4b — the mid-run arrival notice
+# FR4c — the mid-run arrival notice, delivered via ctx.enqueue
 # =============================================================================
 
 
 class TestArrivalNotice:
-    async def test_growth_appends_one_fresh_trailing_model_request(self) -> None:
+    async def test_growth_enqueues_one_notice_at_asap_priority(self) -> None:
+        """One growth, one ``ctx.enqueue`` call — the hook itself appends nothing."""
         arrived = _pending_message("news", "@Alice")
         capability = MailboxCancelCapability(observer=_MailboxDouble([arrived]))
         existing = ModelRequest(parts=[UserPromptPart(content="the turn prompt")])
         existing_parts = existing.parts
+        ctx = _CtxDouble()
         context = _context([existing])
 
-        result = await capability.before_model_request(None, context)
+        result = await capability.before_model_request(ctx, context)
 
         assert result is context
-        assert len(context.messages) == 2
-        assert context.messages[0] is existing
+        assert context.messages == [existing]  # delivery is the drain's job, not the hook's
         assert existing.parts is existing_parts  # no part-level mutation
-        notice = context.messages[-1]
-        assert isinstance(notice, ModelRequest)
-        assert notice is not existing
-        assert len(notice.parts) == 1
-        part = notice.parts[0]
-        assert isinstance(part, UserPromptPart)
-        assert part.content == render_arrival_notice([arrived])
-
-    async def test_append_is_ephemeral_the_source_list_is_untouched(self) -> None:
-        """The hook's list is a shallow copy of durable history by contract."""
-        capability = MailboxCancelCapability(observer=_MailboxDouble([_pending_message()]))
-        durable = [ModelRequest(parts=[UserPromptPart(content="the turn prompt")])]
-        context = _context(list(durable))
-
-        await capability.before_model_request(None, context)
-
-        assert len(durable) == 1  # the durable side never saw the notice
-        assert len(context.messages) == 2
+        assert ctx.enqueue_calls == [((render_arrival_notice([arrived]),), "asap")]
 
     async def test_same_message_is_announced_once_across_firings(self) -> None:
         arrived = _pending_message()
         capability = MailboxCancelCapability(observer=_MailboxDouble([arrived]))
-        context = _context()
+        ctx = _CtxDouble()
 
-        await capability.before_model_request(None, context)
-        await capability.before_model_request(None, context)
+        await capability.before_model_request(ctx, _context())
+        await capability.before_model_request(ctx, _context())
 
-        assert len(context.messages) == 1
+        assert len(ctx.enqueue_calls) == 1
 
     async def test_second_arrival_announces_only_the_growth(self) -> None:
         first = _pending_message("one", "@Alice")
         second = _pending_message("two", "@Bob")
         mailbox = _MailboxDouble([first])
         capability = MailboxCancelCapability(observer=mailbox)
-        context = _context()
+        ctx = _CtxDouble()
 
-        await capability.before_model_request(None, context)
+        await capability.before_model_request(ctx, _context())
         mailbox.pending.append(second)
-        await capability.before_model_request(None, context)
+        await capability.before_model_request(ctx, _context())
 
-        assert len(context.messages) == 2
-        growth_part = context.messages[-1].parts[0]
-        assert growth_part.content == render_arrival_notice([second])
+        assert len(ctx.enqueue_calls) == 2
+        growth_content, growth_priority = ctx.enqueue_calls[-1]
+        assert growth_content == (render_arrival_notice([second]),)
+        assert growth_priority == "asap"
 
     async def test_reset_run_tracking_forgets_the_announced_backlog(self) -> None:
         arrived = _pending_message()
         capability = MailboxCancelCapability(observer=_MailboxDouble([arrived]))
-        context = _context()
+        ctx = _CtxDouble()
 
-        await capability.before_model_request(None, context)
+        await capability.before_model_request(ctx, _context())
         capability.reset_run_tracking()
-        await capability.before_model_request(None, context)
+        await capability.before_model_request(ctx, _context())
 
-        assert len(context.messages) == 2  # the backlog re-announced after reset
+        assert len(ctx.enqueue_calls) == 2  # the backlog re-announced after reset
 
-    async def test_no_growth_injects_nothing(self) -> None:
+    async def test_no_growth_enqueues_nothing(self) -> None:
         arrived = _pending_message()
         mailbox = _MailboxDouble([arrived])
         capability = MailboxCancelCapability(observer=mailbox)
-        await capability.before_model_request(None, _context())
+        await capability.before_model_request(_CtxDouble(), _context())
 
-        context = _context()
-        await capability.before_model_request(None, context)
+        ctx = _CtxDouble()
+        await capability.before_model_request(ctx, _context())
 
-        assert context.messages == []
-
-    async def test_debug_log_line_fires_on_injection(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        capability = MailboxCancelCapability(observer=_MailboxDouble([_pending_message()]))
-
-        with caplog.at_level(logging.DEBUG, logger=AGENT_LOGGER):
-            await capability.before_model_request(None, _context())
-
-        assert any(
-            record.levelno == logging.DEBUG and "arrival notice" in record.getMessage()
-            for record in caplog.records
-        )
-
-    async def test_no_injection_no_debug_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
-        capability = MailboxCancelCapability(observer=_MailboxDouble())
-
-        with caplog.at_level(logging.DEBUG, logger=AGENT_LOGGER):
-            await capability.before_model_request(None, _context())
-
-        assert not any("arrival notice" in record.getMessage() for record in caplog.records)
+        assert ctx.enqueue_calls == []
 
 
 # =============================================================================

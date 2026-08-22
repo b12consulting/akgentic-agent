@@ -887,13 +887,18 @@ cancel the next run.
 ### The mid-run arrival notice
 
 The same hook, after the cancel check, announces mail that arrived during the run: new
-pending messages are announced **once**, by an **ephemeral** notice appended to the outgoing
-model request (rendered by `render_arrival_notice`). The notice reaches the provider and
-never the durable history or the event store — the debug log line at injection time is the
-only audit trail that the doorbell rang. Announced-id tracking is run-local: `act()` resets
-it at each run start, so it dies with the run. The durable record exists regardless: the
-`read_mailbox` tool return if the model chooses to look, and the message's own turn either
-way — every pending message is still delivered as its own turn after the run ends.
+pending messages are announced **once**, by a **durable** notice (rendered by
+`render_arrival_notice`) delivered through `ctx.enqueue(notice, priority="asap")` —
+pydantic-ai's supported injection path. The auto-injected drain capability delivers it into
+the model request at the next step boundary and records it in the agent's history and the
+event store as its own user-role message — that record **is** the audit trail that the
+doorbell rang. When the run would otherwise end at that boundary, pydantic-ai's drain
+redirects through one final model request so an already-enqueued notice is delivered rather
+than lost — an occasional extra model call, by design. Announced-id tracking is run-local:
+`act()` resets it at each run start, so it dies with the run. The durable record exists
+regardless: the `read_mailbox` tool return if the model chooses to look, and the message's
+own turn either way — every pending message is still delivered as its own turn after the
+run ends.
 
 ### Honest limitations
 

@@ -110,14 +110,16 @@ class MailboxCancelCapability(AbstractCapability[Any]):
        and consuming it are the same dequeue, performed later by the actor
        loop.
     2. Arrival notice — pending messages not yet announced in this run are
-       announced by appending one fresh trailing
-       ``ModelRequest([UserPromptPart(...)])`` to the hook's ``messages``
-       list. That list is a shallow copy of the durable history, so the
-       append is ephemeral by construction: it reaches the provider and
-       nothing else. Existing messages are never mutated (their parts are
-       shared with durable history) and ``ctx.enqueue()`` is never used (the
-       drain capability would inject durably). The debug log line at
-       injection time is the only audit trail that the doorbell rang.
+       announced through one ``ctx.enqueue(notice, priority="asap")`` call,
+       pydantic-ai's supported injection path. The auto-injected, outermost
+       ``PendingMessageDrainCapability`` drains the queue at the *next* step
+       boundary: the notice lands in that model request, in the durable
+       history and in the ``LlmMessageEvent`` stream by design — the event
+       store is the audit trail that the doorbell rang. When the run would
+       otherwise end first, the drain redirects through one final model
+       request so an already-enqueued notice is delivered rather than lost.
+       The hook constructs no message of its own and never mutates an
+       existing message's parts (they are shared with durable history).
 
     Announced-id tracking is run-local: the instance lives for the agent's
     lifetime, so ``act()`` resets the set at each run start. A backlog
@@ -136,7 +138,7 @@ class MailboxCancelCapability(AbstractCapability[Any]):
     async def before_model_request(
         self, ctx: RunContext[Any], request_context: ModelRequestContext
     ) -> ModelRequestContext:
-        """Raise on a pending cancel, else announce mailbox growth ephemerally."""
+        """Raise on a pending cancel, else enqueue an arrival notice for new mail."""
         pending = self._observer.get_mailbox()
         if any(is_cancel(message) for message in pending):
             raise RunInterruptedError(
@@ -144,14 +146,8 @@ class MailboxCancelCapability(AbstractCapability[Any]):
             )
         new_messages = [m for m in pending if m.id not in self._announced_ids]
         if new_messages:
-            notice = render_arrival_notice(new_messages)
-            request_context.messages.append(ModelRequest(parts=[UserPromptPart(content=notice)]))
+            ctx.enqueue(render_arrival_notice(new_messages), priority="asap")
             self._announced_ids.update(message.id for message in new_messages)
-            logger.debug(
-                "Mid-run arrival notice injected into the next model request "
-                "(%d new message(s); ephemeral — absent from durable history)",
-                len(new_messages),
-            )
         return request_context
 
 

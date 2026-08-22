@@ -523,9 +523,12 @@ is gone — the system block is frozen and carries no mailbox content):
   content of every pending message. Reading does not consume them: each will still be
   delivered as its own turn after the current run ends.
 - **The mid-run arrival notice** — mail arriving *while a run is in progress* is announced
-  once by `MailboxCancelCapability.before_model_request`, as an ephemeral notice appended to
-  the outgoing model request. It reaches the provider but never the durable history, so a
-  busy agent learns the doorbell rang without the transcript recording the ring.
+  once by `MailboxCancelCapability.before_model_request`, through
+  `ctx.enqueue(notice, priority="asap")`. pydantic-ai's auto-injected drain capability
+  delivers the notice into the model request at the next step boundary and records it in the
+  durable history and the event store as its own user-role message — the transcript records
+  the ring, and that record is the audit trail. A notice enqueued at the run's last boundary
+  is not lost: the drain redirects through one final model request to deliver it.
 
 The same hook enforces run cancellation: a pending `/stop` or `CancelMessage` raises
 `RunInterruptedError` at the next step boundary, caught in `receiveMsg_AgentMessage` — the
