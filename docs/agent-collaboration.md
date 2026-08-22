@@ -1163,8 +1163,10 @@ StructuredOutput(messages=[
 4. **Don't skip the `PlanningTool` for multi-step work**
 
    Without a shared plan, agents lack visibility into what others are doing.
-   The `SYSTEM_PROMPT` channel ensures every agent sees the current task
-   list — this is how agents coordinate implicitly without direct messaging.
+   The `LLM_CONTEXT` channel ensures every agent sees the current task list:
+   the planning summary arrives in the per-turn **Context update** block, not
+   in the frozen system prompt — this is how agents coordinate implicitly
+   without direct messaging.
 
 5. **Don't add `TeamTool` to `config.tools` manually (unless customizing it)**
 
