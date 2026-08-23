@@ -14,7 +14,7 @@ from pydantic_ai import BinaryContent
 
 from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig
-from akgentic.agent.messages import AgentMessage
+from akgentic.agent.messages import AgentMessage, LlmRenderable
 from akgentic.agent.output_models import StructuredOutput
 
 # =============================================================================
@@ -35,6 +35,19 @@ def _make_mock_message(sender_name: str = "@Human") -> MagicMock:
     msg.sender = _make_mock_sender(sender_name)
     msg.type = "request"
     return msg
+
+
+def _message(content: str, sender_name: str = "@Human") -> AgentMessage:
+    """A real AgentMessage carrying ``content`` — what act() now takes.
+
+    These specs are about media expansion, and expansion runs on what the
+    message *renders*, not on the raw body. Comparing against
+    ``message.render_for_llm()`` rather than against the body is therefore the
+    spec, not a concession to the new signature.
+    """
+    message = AgentMessage(content=content)
+    message.sender = _make_mock_sender(sender_name)
+    return message
 
 
 def _make_registry(media_cmd: Any = None) -> MagicMock:
@@ -118,9 +131,11 @@ class TestBaseAgentMediaExpansion:
 
         agent._react_agent.run_sync.side_effect = capture_run_sync  # type: ignore[attr-defined]
 
-        agent.act("describe !!photo.png please", output_type=str)
+        message = _message("describe !!photo.png please")
+        agent.act(message, output_type=str)
 
-        mock_cmd.assert_called_once_with("describe !!photo.png please")
+        # Expansion consumes the RENDERED string, after render_for_llm().
+        mock_cmd.assert_called_once_with(message.render_for_llm())
         assert len(captured_prompts) == 1
         result_prompt = captured_prompts[0]
         assert isinstance(result_prompt, list)
@@ -136,7 +151,8 @@ class TestBaseAgentMediaExpansion:
 
     def test_pure_text_passed_as_str_unchanged(self) -> None:
         """No MediaContent in expansion result → original str passed to run_sync."""
-        mock_cmd = MagicMock(return_value=["no special tokens"])
+        # _expand_media_refs returns [original] when there is nothing to expand.
+        mock_cmd = MagicMock(side_effect=lambda text: [text])
         agent = _make_minimal_agent(media_cmd=mock_cmd)
 
         captured_prompts: list[Any] = []
@@ -147,13 +163,14 @@ class TestBaseAgentMediaExpansion:
 
         agent._react_agent.run_sync.side_effect = capture_run_sync  # type: ignore[attr-defined]
 
-        agent.act("no special tokens", output_type=str)
+        message = _message("no special tokens")
+        agent.act(message, output_type=str)
 
         assert len(captured_prompts) == 1
         result_prompt = captured_prompts[0]
-        # Must be the original string, NOT a list
+        # Must be the rendered string, NOT a list
         assert isinstance(result_prompt, str)
-        assert result_prompt == "no special tokens"
+        assert result_prompt == message.render_for_llm()
 
     # ------------------------------------------------------------------
     # document token → hint string list, no BinaryContent
@@ -177,7 +194,7 @@ class TestBaseAgentMediaExpansion:
 
         agent._react_agent.run_sync.side_effect = capture_run_sync  # type: ignore[attr-defined]
 
-        agent.act("check !!report.pdf", output_type=str)
+        agent.act(_message("check !!report.pdf"), output_type=str)
 
         assert len(captured_prompts) == 1
         result_prompt = captured_prompts[0]
@@ -189,8 +206,8 @@ class TestBaseAgentMediaExpansion:
     # no media command registered → user_content passed as-is
     # ------------------------------------------------------------------
 
-    def test_command_absent_passes_user_content_as_is(self) -> None:
-        """registry.has('_expand_media_refs') is False → user_content str unchanged."""
+    def test_command_absent_passes_rendered_message_as_is(self) -> None:
+        """registry.has('_expand_media_refs') is False → rendered str unchanged."""
         agent = _make_minimal_agent()  # no media command registered
 
         captured_prompts: list[Any] = []
@@ -201,27 +218,33 @@ class TestBaseAgentMediaExpansion:
 
         agent._react_agent.run_sync.side_effect = capture_run_sync  # type: ignore[attr-defined]
 
-        agent.act("look at !!photo.png", output_type=str)
+        message = _message("look at !!photo.png")
+        agent.act(message, output_type=str)
 
         # callable() must NOT be consulted when has() is False
         agent._command_registry.callable.assert_not_called()  # type: ignore[attr-defined]
         assert len(captured_prompts) == 1
         result_prompt = captured_prompts[0]
         assert isinstance(result_prompt, str)
-        assert result_prompt == "look at !!photo.png"
+        assert result_prompt == message.render_for_llm()
 
     # ------------------------------------------------------------------
-    # act() signature unchanged
+    # act() takes the message, and there is no string path
     # ------------------------------------------------------------------
 
-    def test_act_signature_unchanged(self) -> None:
-        """act(user_content: str, output_type: type[T]) -> T signature intact."""
+    def test_act_takes_a_renderable_message_not_a_string(self) -> None:
+        """act(message: LlmRenderable, output_type: type[T]) -> T.
+
+        The absence of a ``str`` annotation here is the point: two ways in
+        would mean the framing can be bypassed, which is the fault this design
+        removes.
+        """
         import inspect
 
         sig = inspect.signature(BaseAgent.act)
         params = list(sig.parameters.keys())
-        assert params == ["self", "user_content", "output_type"]
-        assert sig.parameters["user_content"].annotation is str
+        assert params == ["self", "message", "output_type"]
+        assert sig.parameters["message"].annotation is LlmRenderable
 
     # ------------------------------------------------------------------
     # branch: both True/False paths of any(isinstance(p, MediaContent)...)
@@ -244,16 +267,16 @@ class TestBaseAgentMediaExpansion:
 
         agent._react_agent.run_sync.side_effect = capture_run_sync  # type: ignore[attr-defined]
 
-        agent.act("prefix !!img.jpg", output_type=str)
+        agent.act(_message("prefix !!img.jpg"), output_type=str)
 
         result_prompt = captured_prompts[0]
         assert isinstance(result_prompt, list)
         assert any(isinstance(p, BinaryContent) for p in result_prompt)
 
     def test_no_refs_passes_original_str(self) -> None:
-        """Branch coverage: no !! tokens → parts == [user_content] → str returned."""
+        """Branch coverage: no !! tokens → parts == [rendered] → str returned."""
         # _expand_media_refs returns [original_str] when no !! tokens are present
-        mock_cmd = MagicMock(return_value=["only strings here"])
+        mock_cmd = MagicMock(side_effect=lambda text: [text])
         agent = _make_minimal_agent(media_cmd=mock_cmd)
 
         captured_prompts: list[Any] = []
@@ -264,7 +287,7 @@ class TestBaseAgentMediaExpansion:
 
         agent._react_agent.run_sync.side_effect = capture_run_sync  # type: ignore[attr-defined]
 
-        agent.act("only strings here", output_type=str)
+        agent.act(_message("only strings here"), output_type=str)
 
         result_prompt = captured_prompts[0]
         assert isinstance(result_prompt, str)
@@ -295,8 +318,8 @@ class TestActPassesOutputTypeThrough:
 
         agent._react_agent.run_sync.side_effect = capture_run_sync  # type: ignore[attr-defined]
 
-        agent.act("do something", output_type=StructuredOutput)
-        agent.act("do something else", output_type=str)
+        agent.act(_message("do something"), output_type=StructuredOutput)
+        agent.act(_message("do something else"), output_type=str)
 
         assert captured_types == [StructuredOutput, str]
 

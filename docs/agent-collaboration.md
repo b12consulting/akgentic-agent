@@ -519,19 +519,27 @@ serves no `LLM_CONTEXT`, a second card-side carrier having only narrated the sam
 twice.
 
 - **`read_mailbox` tool** (`TOOL_CALL` channel, provided by `MailboxTool`, auto-added beside
-  `TeamTool`) — a mid-run read of sender, type and full content of every pending message.
-  Reading **absorbs** them: everything it shows has been removed from the mailbox and is
-  **not** delivered again as its own turn, so the model must deal with it in that run.
-  Anything left unread stays queued and arrives as its own turn once the run ends. A pending
-  `/stop` or `CancelMessage` is never consumed by the read — the cancellation surface is left
-  intact for the hook below.
+  `TeamTool`) — it names **one** message, by the id the arrival notice gave it. The tool reads
+  nothing and returns nothing but an acknowledgement; `MailboxCapability.after_tool_execute` is
+  what makes that acknowledgement true, consuming exactly the named message and injecting its
+  own `render_for_llm()` as a turn of its own. So naming an id **absorbs that one message**: it
+  is not delivered again, and the model must deal with it in this run. Mail left unnamed stays
+  queued and arrives as its own turn once the run ends. An absent or unknown id is a silent
+  no-op. A pending `/stop` or `CancelMessage` is never offered an id and never absorbed by a
+  read — the cancellation surface is left intact for the hook below.
 - **The mid-run arrival notice** — mail arriving *while a run is in progress* is announced
   once by `MailboxCapability.before_model_request`, through
   `ctx.enqueue(notice, priority="asap")`. pydantic-ai's auto-injected drain capability
   delivers the notice into the model request at the next step boundary and records it in the
   durable history and the event store as its own user-role message — the transcript records
   the ring, and that record is the audit trail. A notice enqueued at the run's last boundary
-  is not lost: the drain redirects through one final model request to deliver it.
+  is not lost: the drain redirects through one final model request to deliver it. Every
+  announced message is listed, but only a message this run can take on carries an `(id: …)`
+  beside its preview; everything else is listed as `- Message cannot be handled in the run`,
+  with no id. That missing id *is* the constraint — such a message is visible but unaskable,
+  not rejected and not refused. The closing line matches: it points at `read_mailbox` only when
+  at least one id is on offer. See the README's *The mid-run arrival notice* for the four
+  conditions that decide it.
 
 The same hook enforces run cancellation: a pending `/stop` or `CancelMessage` is purged from
 the mailbox and then raises `RunInterruptedError` at the next step boundary, caught in `act()`
@@ -541,7 +549,7 @@ The run dies, the agent survives. The hook and the vocabulary it applies (`is_ca
 `render_arrival_notice`) are both the agent's, defined in `akgentic.agent.capabilities` — not
 the card's. `BaseAgent` builds the capability unconditionally so an agent configured *without*
 `MailboxTool` is still interruptible, and such an agent has no card to borrow a predicate
-from. The card keeps its own surface: the consuming `read_mailbox` tool and the `/stop`
+from. The card keeps its own surface: the id-taking `read_mailbox` tool and the `/stop`
 registration whose string form `is_cancel` recognises without importing anything from
 the card. See the README's *Run Cancellation* section for the full flow and its stated
 limitations.
@@ -609,26 +617,30 @@ output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 against the **static** schema. It is also the type handed to `@guard_usage_limits`, so a
 turn cut short reasons against the same schema by construction.
 
-The reply-protocol guidance is carried in the **prompt**, not the output schema. On
-receipt, `receiveMsg_AgentMessage()` prepends the matching `REPLY_PROTOCOLS` line to the
-raw content before running the turn:
+The reply-protocol guidance is carried in the **prompt**, not the output schema. The handler
+composes none of it: it hands the message over, and the message frames itself when `act()`
+renders it:
 
 ```python
-sender_name = message.sender.name if message.sender else "unknown"
-article = "an" if message.type[0] in "aeiou" else "a"
-prefixed_content = (
-    f"You received {article} {message.type} from {sender_name}. "
-    f"{REPLY_PROTOCOLS.get(message.type, '').format(sender=sender_name)}"
-    f"\n\n{message.content}"
-)
-output = self.act(prefixed_content, StructuredOutput)
+# In receiveMsg_AgentMessage():
+output = self.act(message, StructuredOutput)
 
 self._route_output(output)
+
+
+# In AgentMessage.render_for_llm(), which act() calls once:
+sender_name = self.sender.name if self.sender else "unknown"
+article = "an" if self.type[0] in "aeiou" else "a"
+return (
+    f"You received {article} {self.type} from {sender_name}. "
+    f"{REPLY_PROTOCOLS.get(self.type, '').format(sender=sender_name)}"
+    f"\n\n{self.content}"
+)
 ```
 
-`"unknown"` here is prose for the prompt only. The guard keeps its own requester as `None`
-when the message carried no sender, because a placeholder *there* would be echoed back as a
-`Request.recipient` — and a recipient without a leading `@` is a role to **hire**, so the
+`"unknown"` in the renderer is prose for the prompt only. The guard keeps its own requester as
+`None` when the message carried no sender, because a placeholder *there* would be echoed back
+as a `Request.recipient` — and a recipient without a leading `@` is a role to **hire**, so the
 teardown of a breached turn would spin up a member called "unknown".
 
 This supersedes the schema-constrained-recipient + docstring-injection mechanism from
@@ -862,7 +874,7 @@ class CustomAgent(BaseAgent):
     @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
         """Handle one incident. No try/except: act() owns the interruption."""
-        output = self.act(prompt, TriageOutput)
+        output = self.act(message, TriageOutput)
         self._route_triage(output)
 ```
 
@@ -870,7 +882,7 @@ What the subclass gets, and what it must supply:
 
 | | |
 |---|---|
-| **Reused unchanged** | `act(user_content, output_type)` — forwards the type you name to the REACT loop, so a custom output model needs no plumbing, and absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`), so no handler writes a catch; `@guard_usage_limits` — the tier policy; `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
+| **Reused unchanged** | `act(message, output_type)` — renders the message you hand it and forwards the type you name to the REACT loop, so a custom output model needs no plumbing, and absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`), so no handler writes a catch; `@guard_usage_limits` — the tier policy; `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
 | **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first |
 
 A run-tier breach in `CustomAgent` therefore concludes in **`TriageOutput`** and is delivered
@@ -1323,26 +1335,31 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
     Key methods:
 
-    act(user_content, output_type) -> T
+    act(message, output_type) -> T
         Execute one LLM REACT loop against the caller's output_type, delegating
-        to ReactAgent.run_sync(output_type=output_type). receiveMsg_AgentMessage
-        passes StructuredOutput, which is why the delegation path is schema-driven.
+        to ReactAgent.run_sync(output_type=output_type). Takes the message, not a
+        prompt: it renders it once through message.render_for_llm(), so framing
+        lives in the message class and no caller composes a prompt of its own.
+        There is no string overload — passing a str is a type error.
+        receiveMsg_AgentMessage passes StructuredOutput, which is why the
+        delegation path is schema-driven.
 
     _route_output(output) -> bool
         Core routing engine. Delivers a StructuredOutput: one AgentMessage per
         Request, carrying the RAW request.message and request.message_type. A
         recipient starting with "@" resolves to an existing member and one that
         does not is hired by role; a recipient that resolves to nothing is
-        skipped. It does not enrich the content — the receiver adds the reply
-        protocol. Returns whether anything was actually delivered, which is what
+        skipped. It does not enrich the content — the delivered message adds its
+        own reply protocol. Returns whether anything was actually delivered, which is what
         the usage-limit guard asks to tell a real conclusion from an empty one.
 
     receiveMsg_AgentMessage(message, sender) -> None
         Pykka message handler, decorated with
         @guard_usage_limits(output_type=StructuredOutput, route=_route_output).
         Entry point for all incoming messages. Intercepts "/"-prefixed content as
-        a command; otherwise prepends the REPLY_PROTOCOLS line for message.type,
-        runs one act() turn and routes the result. It carries no try/except of
+        a command; otherwise runs one act() turn on the message — whose own
+        render_for_llm() carries the REPLY_PROTOCOLS line for message.type — and
+        routes the result. It carries no try/except of
         its own: a queued /stop or CancelMessage is absorbed inside act(), which
         notifies the human and returns an empty StructuredOutput, so the routing
         delivers nothing and the handler returns normally. The decorator owns

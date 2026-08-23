@@ -99,10 +99,12 @@ class TestCustomAgentNormalTurn:
 
         agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
 
-        prompt, output_type = agent.act.call_args[0]  # type: ignore[attr-defined]
+        # act() receives the MESSAGE now; the framing is the message's own.
+        message, output_type = agent.act.call_args[0]  # type: ignore[attr-defined]
         assert output_type is TriageOutput
-        assert "disk full on node 3" in prompt
-        assert "monitoring" in prompt
+        assert isinstance(message, TriageMessage)
+        assert "disk full on node 3" in message.render_for_llm()
+        assert "monitoring" in message.render_for_llm()
 
         agent.send.assert_called_once()  # type: ignore[attr-defined]
         _, sent = agent.send.call_args[0]  # type: ignore[attr-defined]
@@ -235,7 +237,7 @@ class TestCustomAgentRunInterruption:
         agent = _make_custom_agent()
         agent._react_agent.run_sync.side_effect = RunInterruptedError("cancelled")  # type: ignore[attr-defined]
 
-        output = agent.act("assess this", TriageOutput)
+        output = agent.act(_incident(), TriageOutput)
 
         assert isinstance(output, TriageOutput)
         assert output.handoffs == []
@@ -251,7 +253,7 @@ class TestCustomAgentRunInterruption:
         agent._react_agent.run_sync.side_effect = interruption  # type: ignore[attr-defined]
 
         with pytest.raises(RunInterruptedError) as raised:
-            agent.act("assess this", _Mandatory)
+            agent.act(_incident(), _Mandatory)
 
         assert raised.value is interruption
         agent.notify_human.assert_called_once_with("Run interrupted.")  # type: ignore[attr-defined]

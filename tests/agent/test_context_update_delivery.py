@@ -33,6 +33,7 @@ from pydantic_ai.messages import ModelRequest, UserPromptPart
 import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig, AgentState
+from akgentic.agent.messages import AgentMessage
 
 # =============================================================================
 # HELPERS
@@ -248,7 +249,7 @@ class TestActDeliverySite:
             lambda *a, **k: order.append("run_sync") or "response"
         )
 
-        agent.act("hello", output_type=str)
+        agent.act(AgentMessage(content="hello"), output_type=str)
 
         assert order == ["record", "run_sync"]
 

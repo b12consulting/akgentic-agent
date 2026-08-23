@@ -76,9 +76,10 @@ class _MailboxDouble:
     double that emitted any would hide the hook emitting one as well.
     """
 
-    def __init__(self, pending: list[Any] | None = None) -> None:
+    def __init__(self, pending: list[Any] | None = None, current: Any = None) -> None:
         self.pending: list[Any] = list(pending or [])
         self.consume_calls: list[list[uuid.UUID]] = []
+        self.current = current
 
     def get_mailbox(self) -> list[Any]:
         return list(self.pending)
@@ -89,6 +90,15 @@ class _MailboxDouble:
         removed = [message for message in self.pending if message.id in wanted]
         self.pending = [message for message in self.pending if message.id not in wanted]
         return removed
+
+    def current_message(self) -> Any:
+        """The handler's message — what the offer rule matches a pending class against.
+
+        Added by hand when ``MailboxAccess`` widened: the Protocol checks member
+        presence, not signatures, so a fake missing this fails at the call site
+        rather than at construction.
+        """
+        return self.current
 
 
 def _pending_message(content: str = "please review", sender_name: str = "@Alice") -> AgentMessage:
@@ -188,7 +198,8 @@ class TestArrivalNotice:
     async def test_growth_enqueues_one_notice_at_asap_priority(self) -> None:
         """One growth, one ``ctx.enqueue`` call — the hook itself appends nothing."""
         arrived = _pending_message("news", "@Alice")
-        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        handled = _pending_message("the turn prompt", "@Human")
+        capability = MailboxCapability(observer=_MailboxDouble([arrived], current=handled))
         existing = ModelRequest(parts=[UserPromptPart(content="the turn prompt")])
         existing_parts = existing.parts
         ctx = _CtxDouble()
@@ -199,7 +210,7 @@ class TestArrivalNotice:
         assert result is context
         assert context.messages == [existing]  # delivery is the drain's job, not the hook's
         assert existing.parts is existing_parts  # no part-level mutation
-        assert ctx.enqueue_calls == [((render_arrival_notice([arrived]),), "asap")]
+        assert ctx.enqueue_calls == [((render_arrival_notice([arrived], {arrived.id}),), "asap")]
 
     async def test_same_message_is_announced_once_across_firings(self) -> None:
         arrived = _pending_message()
@@ -214,7 +225,7 @@ class TestArrivalNotice:
     async def test_second_arrival_announces_only_the_growth(self) -> None:
         first = _pending_message("one", "@Alice")
         second = _pending_message("two", "@Bob")
-        mailbox = _MailboxDouble([first])
+        mailbox = _MailboxDouble([first], current=_pending_message("handled", "@Human"))
         capability = MailboxCapability(observer=mailbox)
         ctx = _CtxDouble()
 
@@ -224,7 +235,7 @@ class TestArrivalNotice:
 
         assert len(ctx.enqueue_calls) == 2
         growth_content, growth_priority = ctx.enqueue_calls[-1]
-        assert growth_content == (render_arrival_notice([second]),)
+        assert growth_content == (render_arrival_notice([second], {second.id}),)
         assert growth_priority == "asap"
 
     async def test_reset_run_tracking_forgets_the_announced_backlog(self) -> None:
@@ -883,7 +894,7 @@ class TestCardlessAgentStillCancels:
                 # The cancel still kills the run — the stub proves the model was
                 # never reached — but act() absorbs the interruption and hands
                 # back the default output instead of raising it at the caller.
-                output = agent.act("do the long thing", StructuredOutput)
+                output = agent.act(AgentMessage(content="do the long thing"), StructuredOutput)
         finally:
             react_agent.close()
 
@@ -969,7 +980,7 @@ class TestExtraCapabilityFires:
 
         try:
             with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
-                output = agent.act("do the thing", StructuredOutput)
+                output = agent.act(AgentMessage(content="do the thing"), StructuredOutput)
         finally:
             react_agent.close()
 

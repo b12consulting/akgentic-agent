@@ -150,7 +150,7 @@ def _stub_act(agent: BaseAgent) -> MagicMock:
 
 def _run_turn(agent: BaseAgent, prompt: str = "prompt") -> bool:
     """Drive one routed turn the way ``receiveMsg_AgentMessage`` does."""
-    return agent._route_output(agent.act(prompt, StructuredOutput))
+    return agent._route_output(agent.act(AgentMessage(content=prompt), StructuredOutput))
 
 
 # =============================================================================
@@ -459,13 +459,14 @@ class TestReceiverSidePrefixSnippet:
 
         agent.receiveMsg_AgentMessage(message, _make_address("@Manager"))
 
-        prompt = act.call_args[0][0]
+        # act() receives the message; the composition is the message's own.
+        assert act.call_args[0][0] is message
         # The subject here is the COMPOSITION — framing, article, protocol, blank
         # line, raw content — not the protocol's wording, which is pinned verbatim
         # by TestReplyProtocolsTable. Deriving that one span keeps this test on its
         # own subject and stops a deliberate rewording from failing it.
         protocol = REPLY_PROTOCOLS["request"].format(sender="@Manager")
-        assert prompt == (
+        assert message.render_for_llm() == (
             f"You received a request from @Manager. {protocol}\n\nEstimate feature X"
         )
 
@@ -479,7 +480,8 @@ class TestReceiverSidePrefixSnippet:
         message.sender = _make_address("@Manager")
         agent.receiveMsg_AgentMessage(message, _make_address("@Manager"))
 
-        assert act.call_args[0][0].startswith("You received an instruction from @Manager.")
+        assert act.call_args[0][0] is message
+        assert message.render_for_llm().startswith("You received an instruction from @Manager.")
 
     @patch("akgentic.agent.agent.sleep", MagicMock())
     def test_raw_content_is_preserved_after_the_prefix(self) -> None:
@@ -490,7 +492,8 @@ class TestReceiverSidePrefixSnippet:
         message.sender = _make_address("@Developer456")
         agent.receiveMsg_AgentMessage(message, _make_address("@Developer456"))
 
-        assert act.call_args[0][0].endswith("\n\n3 days")
+        assert act.call_args[0][0] is message
+        assert message.render_for_llm().endswith("\n\n3 days")
 
 
 # =============================================================================
@@ -615,7 +618,8 @@ class TestSlashDispatchFallback:
         agent.receiveMsg_AgentMessage(message, _make_address("@Human"))
 
         act.assert_called_once()
-        assert act.call_args[0][0].endswith("\n\n/usr/local is full — please fix")
+        assert act.call_args[0][0] is message
+        assert message.render_for_llm().endswith("\n\n/usr/local is full — please fix")
 
     @patch("akgentic.agent.agent.sleep", MagicMock())
     def test_a_recognised_slash_message_never_reaches_the_llm_path(self) -> None:
@@ -748,9 +752,10 @@ class TestActMediaExpansion:
         agent = _make_agent()
         _react_agent_of(agent).run_sync.return_value = StructuredOutput()
 
-        agent.act("just text", StructuredOutput)
+        message = AgentMessage(content="just text")
+        agent.act(message, StructuredOutput)
 
-        assert _react_agent_of(agent).run_sync.call_args[0][0] == "just text"
+        assert _react_agent_of(agent).run_sync.call_args[0][0] == message.render_for_llm()
 
     def test_unchanged_expansion_leaves_the_prompt_a_plain_string(self) -> None:
         def _expand_media_refs(prompt: str) -> Any:
@@ -760,9 +765,10 @@ class TestActMediaExpansion:
         agent = _make_agent(commands={"_expand_media_refs": _expand_media_refs})
         _react_agent_of(agent).run_sync.return_value = StructuredOutput()
 
-        agent.act("just text", StructuredOutput)
+        message = AgentMessage(content="just text")
+        agent.act(message, StructuredOutput)
 
-        assert _react_agent_of(agent).run_sync.call_args[0][0] == "just text"
+        assert _react_agent_of(agent).run_sync.call_args[0][0] == message.render_for_llm()
 
     def test_changed_expansion_switches_to_a_parts_prompt(self) -> None:
         def _expand_media_refs(prompt: str) -> Any:
@@ -772,7 +778,7 @@ class TestActMediaExpansion:
         agent = _make_agent(commands={"_expand_media_refs": _expand_media_refs})
         _react_agent_of(agent).run_sync.return_value = StructuredOutput()
 
-        agent.act("look at !!shot.png the shot", StructuredOutput)
+        agent.act(AgentMessage(content="look at !!shot.png the shot"), StructuredOutput)
 
         assert _react_agent_of(agent).run_sync.call_args[0][0] == [
             "look at ",
@@ -804,7 +810,7 @@ class TestActOutputTypePassThrough:
         agent = _make_agent()
         _react_agent_of(agent).run_sync.return_value = Summary(headline="ok")
 
-        agent.act("anything", Summary)
+        agent.act(AgentMessage(content="anything"), Summary)
 
         kwargs = _react_agent_of(agent).run_sync.call_args[1]
         assert kwargs["output_type"] is Summary

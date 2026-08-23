@@ -5,9 +5,11 @@ of its own and handles a message type of its own, and what it has to supply.
 
 Reused unchanged from BaseAgent:
 
-- ``act(user_content, output_type)`` — forwards the type you name to the REACT
-  loop, so a custom output model needs no plumbing. This is the whole reason a
-  subclass can have its own schema at all.
+- ``act(message, output_type)`` — forwards the type you name to the REACT loop,
+  so a custom output model needs no plumbing. This is the whole reason a
+  subclass can have its own schema at all. It takes the *message*, not a string:
+  framing is the message's own ``render_for_llm()``, so a handler composes no
+  prompt and there is no second way in that could bypass it.
 - ``@guard_usage_limits(output_type=..., route=...)`` — the usage-limit tier
   policy. Decorate every ``receiveMsg_*`` that can reach the LLM; never copy the
   clause ladder into a new handler, because the ordering is load-bearing and a
@@ -28,7 +30,9 @@ Reused unchanged from BaseAgent:
 Supplied here:
 
 - ``TriageOutput`` — the structured output this agent reasons against.
-- ``TriageMessage`` — the message type, with its own ``receiveMsg_`` handler.
+- ``TriageMessage`` — the message type, with its own ``receiveMsg_`` handler and
+  its own ``render_for_llm()``. It declares no ``mailbox_preview``, which is
+  what keeps it out of mid-run mailbox reads.
 - ``_route_triage`` — how a TriageOutput is delivered. Passed to the decorator,
   so it serves the normal turn and the interrupted one alike.
 - ``extra_capabilities`` — one pydantic-ai capability of this agent's own,
@@ -91,10 +95,25 @@ class TriageMessage(Message):
     fields and its own protocol. Dispatch walks the message class MRO looking
     for ``receiveMsg_<Type>``, so this lands on ``receiveMsg_TriageMessage``
     below with no registration step.
+
+    It satisfies ``LlmRenderable`` through ``render_for_llm`` below — the whole
+    point of keying that contract on a method: this class has no ``content``
+    field and was never going to grow one. It declares **no**
+    ``mailbox_preview``, so it is never offered for a mid-run read: a triage run
+    is not a place to absorb unrelated mail, and a class that cannot render a
+    preview must not be handed an id it cannot honour.
     """
 
     incident: str
     reported_by: str = "unknown"
+
+    def render_for_llm(self) -> str:
+        """The incident, framed as the triage prompt this agent reasons against."""
+        return (
+            f"Incident reported by {self.reported_by}:\n\n{self.incident}\n\n"
+            "Assess severity, summarise in one line, and hand off whatever you "
+            "cannot resolve yourself."
+        )
 
 
 # ============================================================================
@@ -198,11 +217,6 @@ class CustomAgent(BaseAgent):
             message: The incident to triage.
             sender: Who sent it.
         """
-        prompt = (
-            f"Incident reported by {message.reported_by}:\n\n{message.incident}\n\n"
-            "Assess severity, summarise in one line, and hand off whatever you "
-            "cannot resolve yourself."
-        )
-        output = self.act(prompt, TriageOutput)
+        output = self.act(message, TriageOutput)
 
         self._route_triage(output)

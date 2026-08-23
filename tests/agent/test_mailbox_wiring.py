@@ -34,6 +34,7 @@ from akgentic.tool.team import TeamTool
 
 import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent
+from akgentic.agent.capabilities import MailboxCapability
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -309,3 +310,56 @@ class TestMailboxWiring:
             assert "please review the draft" not in blocks[0]
             assert "pending" not in blocks[0].lower()
             assert "mailbox" not in blocks[0].lower()
+
+
+# =============================================================================
+# Epic 23 — the preview whitelist travels from the card to the capability
+# =============================================================================
+
+
+def _wired_capability() -> MailboxCapability:
+    """The MailboxCapability on_start handed to the ReactAgent it built."""
+    capabilities = _CapturingReactAgent.captured[-1]["capabilities"]
+    assert isinstance(capabilities, list)
+    capability = capabilities[0]
+    assert isinstance(capability, MailboxCapability)
+    return capability
+
+
+class TestPreviewWhitelistReachesTheCapability:
+    """The whitelist is configured on a card and enforced in a capability.
+
+    Nothing else crosses that gap: every offer-rule spec constructs the
+    capability with ``preview_handlers=`` directly. A wrong attribute name, a
+    card filter that misses, or a dropped constructor argument would leave all
+    of them green while every deployment fell back to admitting every handler —
+    the permissive direction, and a silent one.
+
+    These specs configure a stock ``MailboxTool`` on purpose. Reading the field
+    off the real card is what makes them a guard on the seam rather than on this
+    package alone: a rename on the ``akgentic-tool`` side turns them red here,
+    which is the only place the mismatch is visible.
+    """
+
+    _HANDLER = "akgentic.agent.messages.AgentMessage"
+
+    def test_the_cards_whitelist_is_what_the_capability_enforces(self) -> None:
+        card = MailboxTool(mailbox_preview_handlers=[self._HANDLER])
+
+        _start_agent(_agent_config(tools=[card]))
+
+        assert _wired_capability()._preview_handlers == [self._HANDLER]
+
+    def test_an_empty_whitelist_survives_the_trip_as_itself(self) -> None:
+        """``[]`` admits no handler and is never coerced to ``None`` on the way."""
+        card = MailboxTool(mailbox_preview_handlers=[])
+
+        _start_agent(_agent_config(tools=[card]))
+
+        assert _wired_capability()._preview_handlers == []
+
+    def test_a_card_declaring_no_whitelist_admits_every_handler(self) -> None:
+        """The card's own default, reached through the auto-inserted mailbox card."""
+        _start_agent(_agent_config())
+
+        assert _wired_capability()._preview_handlers is None

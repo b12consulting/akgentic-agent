@@ -9,6 +9,7 @@ than importing it from ``akgentic.tool.mailbox``: an agent configured with no
 
 from akgentic.agent.capabilities.mailbox_capability import (
     MailboxCapability,
+    MailboxRenderError,
     RunInterruptedError,
     is_cancel,
     render_arrival_notice,
@@ -16,6 +17,7 @@ from akgentic.agent.capabilities.mailbox_capability import (
 
 __all__ = [
     "MailboxCapability",
+    "MailboxRenderError",
     "RunInterruptedError",
     "is_cancel",
     "render_arrival_notice",

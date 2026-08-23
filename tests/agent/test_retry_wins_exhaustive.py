@@ -42,15 +42,16 @@ import uuid
 from unittest.mock import MagicMock
 
 import pytest
-from akgentic.agent.agent import BaseAgent, MailboxCapability
-from akgentic.agent.config import AgentConfig
-from akgentic.agent.messages import AgentMessage
-from akgentic.agent.output_models import StructuredOutput
 from akgentic.core import ActorAddress
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+from akgentic.agent.agent import BaseAgent, MailboxCapability
+from akgentic.agent.config import AgentConfig
+from akgentic.agent.messages import AgentMessage
+from akgentic.agent.output_models import StructuredOutput
 
 # The two turns emit *different* routing decisions. That is what makes the routing
 # assertion discriminating on its own: under v1 semantics the first turn's output would
@@ -205,7 +206,7 @@ class TestRetryWinsUnderExhaustiveStrategy:
                 # One routed turn, as receiveMsg_AgentMessage runs it: act() into
                 # _route_output(). Driven directly so the run graph — not a message
                 # handler's prompt assembly — is the only thing under test.
-                agent._route_output(agent.act("route this", StructuredOutput))
+                agent._route_output(agent.act(AgentMessage(content="route this"), StructuredOutput))
         finally:
             # Close on the way out so no event loop or httpx pool leaks into later tests.
             react_agent.close()

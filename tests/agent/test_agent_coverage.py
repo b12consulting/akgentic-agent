@@ -106,7 +106,7 @@ def _run_turn(agent: BaseAgent, content: str = "test content") -> bool:
     about routing drives both calls rather than patching a seam that would only
     prove the double was wired up.
     """
-    return agent._route_output(agent.act(content, StructuredOutput))
+    return agent._route_output(agent.act(AgentMessage(content=content), StructuredOutput))
 
 
 # =============================================================================
@@ -242,8 +242,15 @@ class TestReceiveAgentMessage:
     """Test receiveMsg_AgentMessage handler."""
 
     @patch("akgentic.agent.agent.sleep")
-    def test_calls_act_with_reconstructed_prefix(self, mock_sleep: MagicMock) -> None:
-        """AC-3: prompt carries the reply protocol inline with the raw content."""
+    def test_calls_act_with_the_message_which_carries_the_prefix(
+        self, mock_sleep: MagicMock
+    ) -> None:
+        """AC-3: the handler hands act() the message; the message carries the prefix.
+
+        Two halves, and both matter. The handler builds no prompt any more — so
+        it is the *message* act() receives. The prefix text is unchanged, which
+        is what ``render_for_llm()`` is asserted against here byte-for-byte.
+        """
         agent = _make_minimal_agent()
         act = _stub_act(agent)
 
@@ -255,9 +262,11 @@ class TestReceiveAgentMessage:
 
         agent.receiveMsg_AgentMessage(message, sender)
 
+        act.assert_called_once_with(message, StructuredOutput)
+
         protocol = REPLY_PROTOCOLS["request"].format(sender="@Alice")
         expected = f"You received a request from @Alice. {protocol}\n\nhello world"
-        act.assert_called_once_with(expected, StructuredOutput)
+        assert message.render_for_llm() == expected
 
     @patch("akgentic.agent.agent.sleep")
     def test_usage_limit_error_notifies_human(self, mock_sleep: MagicMock) -> None:
@@ -323,9 +332,11 @@ class TestReceiveAgentMessage:
         sender = _make_mock_sender("@Bob")
         agent.receiveMsg_AgentMessage(message, sender)
 
+        act.assert_called_once_with(message, StructuredOutput)
+
         protocol = REPLY_PROTOCOLS["request"].format(sender="@Bob")
         expected = f"You received a request from @Bob. {protocol}\n\ndo this"
-        act.assert_called_once_with(expected, StructuredOutput)
+        assert message.render_for_llm() == expected
 
     @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_an_for_acknowledgment(self, mock_sleep: MagicMock) -> None:
@@ -338,10 +349,11 @@ class TestReceiveAgentMessage:
 
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Carol"))
 
-        called_content = act.call_args[0][0]
+        assert act.call_args[0][0] is message
+        rendered = message.render_for_llm()
         protocol = REPLY_PROTOCOLS["acknowledgment"]
-        assert called_content.startswith(f"You received an acknowledgment from @Carol. {protocol}")
-        assert called_content.endswith("ack")
+        assert rendered.startswith(f"You received an acknowledgment from @Carol. {protocol}")
+        assert rendered.endswith("ack")
 
     @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_an_for_instruction(self, mock_sleep: MagicMock) -> None:
@@ -354,10 +366,11 @@ class TestReceiveAgentMessage:
 
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Manager"))
 
-        called_content = act.call_args[0][0]
+        assert act.call_args[0][0] is message
+        rendered = message.render_for_llm()
         protocol = REPLY_PROTOCOLS["instruction"].format(sender="@Manager")
-        assert called_content.startswith(f"You received an instruction from @Manager. {protocol}")
-        assert called_content.endswith("step 1")
+        assert rendered.startswith(f"You received an instruction from @Manager. {protocol}")
+        assert rendered.endswith("step 1")
 
     @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_unknown_when_sender_is_none(
@@ -377,9 +390,10 @@ class TestReceiveAgentMessage:
 
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Somewhere"))
 
-        called_content = act.call_args[0][0]
-        assert "from unknown. " in called_content
-        assert called_content.endswith("hello")
+        assert act.call_args[0][0] is message
+        rendered = message.render_for_llm()
+        assert "from unknown. " in rendered
+        assert rendered.endswith("hello")
 
 
 # =============================================================================
@@ -601,9 +615,11 @@ class TestSlashCommandDispatch:
 
         # No result string sent for the dispatch attempt
         agent.send.assert_not_called()
-        # Fell back to the normal path with the prefixed ORIGINAL content
+        # Fell back to the normal path with the ORIGINAL message, whose own
+        # rendering still carries the prefix.
         act.assert_called_once()
-        prefixed = act.call_args[0][0]
+        assert act.call_args[0][0] is message
+        prefixed = message.render_for_llm()
         assert prefixed.endswith("/etc/passwd")
         assert "You received a request from @Human. " in prefixed
 
