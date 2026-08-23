@@ -1126,11 +1126,12 @@ injection in this one — and **neither may be released alone**. A tool that tak
 agent-side injection acknowledges and delivers nothing; an injection with no id-taking signature
 never receives an id. The order is `akgentic-tool` first, then this package **with its
 `akgentic-tool` floor raised** — a floor raise that is owed and deliberately not yet made, because
-the version to pin does not exist yet. In the gap, an agent running the older tool is told by the
-notice to call `read_mailbox` with an id the old signature does not accept, and burns retries on
-the rejected call: **inert but noisy**. Nothing is lost — the older tool consumes nothing, so
-unnamed mail stays queued and arrives as its own turn — and the noise stops of its own accord once
-this package's release lands on the raised floor.
+the version to pin does not exist yet. In the gap the tool has shipped and this package has not, so
+an agent still running the older code announces mail the old way and tells the model to call
+`read_mailbox` with no id at all; the new signature requires one, rejects the call, and the model
+burns retries on it: **inert but noisy**. Nothing is lost — the new tool consumes nothing, so unread
+mail stays queued and arrives as its own turn — and the noise stops of its own accord once this
+package's release lands on the raised floor.
 
 > **Note:** No pre-commit hooks are configured in this package. Quality checks run
 > exclusively in CI.
