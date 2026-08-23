@@ -1,9 +1,20 @@
-"""Mailbox-driven run control: the vocabulary and the hook that acts on it.
+"""Mailbox-driven run control: the vocabulary and the hooks that act on it.
 
-The hook has more than one duty. It purges a pending cancel from the mailbox
-and raises on it, and it renders and enqueues the mid-run arrival notice for
-mail that landed while the run was in flight. The mailbox is the single input
-to all of them, which is what makes them one capability rather than three.
+The capability has more than one duty. Before every model request it purges a
+pending cancel from the mailbox and raises on it, and it renders and enqueues
+the mid-run arrival notice for mail that landed while the run was in flight.
+After every ``read_mailbox`` call it absorbs the message the model named and
+injects that message's own rendering. The mailbox is the single input to all of
+them, which is what makes them one capability rather than three.
+
+**The agent renders; the card does not.** ``read_mailbox`` is a signal that
+carries an id across and acknowledges it — it reads nothing, consumes nothing
+and renders nothing. It used to do all three, and its renderer took each
+message's body as ``getattr(message, "content", "")``: correct for exactly the
+one message class it was written against, and silently empty for every other,
+so a class declaring its own fields was consumed, rendered blank and never
+reached its own handler. Rendering a message is the message's job
+(``LlmRenderable``), and delivering one is this capability's.
 
 This is the first member of ``akgentic.agent.capabilities`` — the home for
 pydantic-ai capabilities the agent builds for itself. More are coming; a
@@ -21,25 +32,40 @@ card to import it from. Enforcement and vocabulary therefore sit together, and
 this module imports nothing from ``akgentic.tool.mailbox`` at all — its mailbox
 contract, ``MailboxAccess`` below, is the agent's own too, for the same reason.
 
-What the card still owns is its own surface, on two channels: the *consuming*
-``read_mailbox`` tool — it absorbs the mail it renders, and never a cancel —
-and the ``/stop`` command registration, a string surface ``is_cancel``
-recognises without importing anything from the card. The card serves no
-``LLM_CONTEXT``: mailbox awareness reaches the model through the mid-run
-arrival notice below alone.
+What the card still owns is its own surface, on two channels: the
+``read_mailbox`` signal, plus the whitelist naming which handlers show a
+preview at all, and the ``/stop`` command registration, a string surface
+``is_cancel`` recognises without importing anything from the card. The card
+serves no ``LLM_CONTEXT``: mailbox awareness reaches the model through the
+mid-run arrival notice below alone.
 """
 
+import logging
 import uuid
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic_ai import RunContext
-from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.capabilities import AbstractCapability, ValidatedToolArgs
+from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models import ModelRequestContext
+from pydantic_ai.tools import ToolDefinition
 
+from akgentic.agent.messages import LlmRenderable, MailboxPreviewable
 from akgentic.core.messages import CancelMessage, Message
 
-PREVIEW_LIMIT = 120
-"""How much of a message's content the arrival notice previews, in characters."""
+logger = logging.getLogger(__name__)
+
+READ_MAILBOX_TOOL = "read_mailbox"
+"""The tool whose completed calls this capability turns into injected content."""
+
+MESSAGE_ID_ARG = "message_id"
+"""The ``read_mailbox`` argument naming the message the model takes on.
+
+A cross-repository contract, read **by name** off the validated arguments of a
+completed tool call. ``akgentic-tool`` owns the signature; an argument this
+capability cannot find is a silent no-op, which is what lets the two halves land
+in sequence rather than atomically.
+"""
 
 
 @runtime_checkable
@@ -49,8 +75,12 @@ class MailboxAccess(Protocol):
     Declared here rather than borrowed from a card's observer protocol, for the
     same reason the vocabulary is: the capability is built unconditionally, so
     an agent carrying no ``MailboxTool`` must still satisfy it. ``Akgent``
-    satisfies it structurally, through the two methods below, exactly as it
+    satisfies it structurally, through the three methods below, exactly as it
     satisfied the narrower card-side protocol this replaced.
+
+    ``@runtime_checkable`` checks member presence, not signatures, so widening
+    this Protocol does not fail loudly for a fake that misses a method: every
+    implementer — the agent and each test fake — must be swept by hand.
     """
 
     def get_mailbox(self) -> list[Message]:
@@ -59,6 +89,10 @@ class MailboxAccess(Protocol):
 
     def consume_mailbox(self, message_ids: list[uuid.UUID]) -> list[Message]:
         """Remove the named messages from the mailbox, recording each removal."""
+        ...
+
+    def current_message(self) -> Message | None:
+        """The message whose handler is running, or ``None`` when idle."""
         ...
 
 
@@ -74,6 +108,22 @@ class RunInterruptedError(Exception):
     error, notifies the human once and returns a default instance of the
     caller's output type — so the *run* dies while the *agent* carries on
     cleanly, and no handler needs a catch of its own.
+    """
+
+
+class MailboxRenderError(Exception):
+    """The offer filter marked a message offerable that cannot render a preview.
+
+    An internal-invariant guard on **our own filter**, never on the feature. The
+    everyday "this run cannot handle that message" case is a silent non-offer —
+    the message is listed without an id and the model simply has no affordance
+    to ask for it. Reaching this exception means the filter admitted something
+    :class:`MailboxPreviewable` excludes, which is a defect here rather than a
+    configuration a deployment could produce.
+
+    Unreachable in correct code, and therefore verifiable only by mutation:
+    delete the previewability condition from the filter and a non-previewable
+    message of the handler's own class reaches the render.
     """
 
 
@@ -94,68 +144,72 @@ def is_cancel(msg: Message) -> bool:
     return bool(tokens) and tokens[0] == "/stop"
 
 
-def render_arrival_notice(new_messages: list[Message]) -> str:
-    """Doorbell for messages that arrived mid-run (ADR-040 §5, ADR-019 §4b).
+UNOFFERABLE_LINE = "- Message cannot be handled in the run"
+"""What a message this run cannot take on renders as — no id, no content."""
 
-    A count line, then one line per message carrying its sender, its type and a
-    preview of its content cut at ``PREVIEW_LIMIT`` characters, then the pointer
-    to ``read_mailbox``. Enough for the model to judge whether any of it is
-    worth interrupting itself for; the whole of it stays one ``read_mailbox``
-    call away. That read *consumes* — what it shows is absorbed and does not
-    arrive again as its own turn — so a message gets its own turn after the run
-    only if the model left it unread.
+_CLOSING_WITH_IDS = (
+    "Call `read_mailbox` with one of the ids above to take that message on now, "
+    "or finish your current work first — you will get them just after."
+)
 
-    Returns ``""`` for an empty list. Defensive on message shapes: the base
-    ``Message`` declares neither ``content`` nor ``type`` — ``CancelMessage``
-    carries ``reason``, ``AgentMessage`` carries both — so a message missing
-    either, or carrying a non-string value in it, still renders.
+_CLOSING_WITHOUT_IDS = "Finish your current work first — you will get them just after."
+
+
+def render_arrival_notice(new_messages: list[Message], offerable_ids: set[uuid.UUID]) -> str:
+    """Doorbell for messages that arrived mid-run (ADR-010 §5, ADR-040 §5).
+
+    A count line, one line per message **in the order given**, then the closing
+    pointer. Every message the caller hands over is listed, offerable or not:
+    dropping one would hide an arrival the human can see, and the notice's job
+    is to say what is waiting.
+
+    What varies is the *id*. A message whose id is in ``offerable_ids`` renders
+    as its own ``mailbox_preview()`` followed by ``(id: …)``, which is the only
+    way the model can name it in a ``read_mailbox`` call. Everything else
+    renders as :data:`UNOFFERABLE_LINE` — visible, but unaskable. That missing
+    id *is* the constraint: not an error, not a validation, not a refusal the
+    model can argue with; the affordance simply is not offered.
+
+    The closing line follows the same rule. It points at ``read_mailbox`` only
+    when at least one id is on offer, because promising a read for a listing
+    that carries no id would be an instruction the model cannot follow. The
+    reassurance that unread mail arrives as its own turn is true either way and
+    is kept in both.
+
+    Args:
+        new_messages: The messages to announce, in reception order.
+        offerable_ids: Ids the offer filter admitted. Every one of them must
+            belong to a message satisfying ``MailboxPreviewable``.
+
+    Returns:
+        The rendered notice, or ``""`` for an empty list.
+
+    Raises:
+        MailboxRenderError: An id was marked offerable for a message that
+            cannot render a preview — the filter is broken. Never raised for a
+            message that was simply not offered.
     """
     if not new_messages:
         return ""
     count = len(new_messages)
     noun = "message" if count == 1 else "messages"
     lines = [f"{count} new {noun} arrived:"]
-    lines.extend(_message_line(message) for message in new_messages)
-    lines.append(
-        "Call `read_mailbox` to see them entirely, or finish your current work "
-        "first — you will get them just after."
-    )
+    lines.extend(_message_line(message, offerable_ids) for message in new_messages)
+    offered = any(message.id in offerable_ids for message in new_messages)
+    lines.append(_CLOSING_WITH_IDS if offered else _CLOSING_WITHOUT_IDS)
     return "\n".join(lines)
 
 
-def _message_line(message: Message) -> str:
-    """``- @Sender (type): preview`` for one message; no preview, no colon."""
-    head = f"- {_sender_name(message)} ({_message_type(message)})"
-    preview = _content_preview(message)
-    return f"{head}: {preview}" if preview else head
-
-
-def _sender_name(message: Message) -> str:
-    """The sender's display name, or ``"unknown"`` when the message has none."""
-    sender = getattr(message, "sender", None)
-    name = getattr(sender, "name", None)
-    return name if isinstance(name, str) and name else "unknown"
-
-
-def _message_type(message: Message) -> str:
-    """The message's declared type, or the bare ``"message"`` when it has none."""
-    message_type = getattr(message, "type", None)
-    return message_type if isinstance(message_type, str) and message_type else "message"
-
-
-def _content_preview(message: Message) -> str:
-    """The first ``PREVIEW_LIMIT`` characters of the content, ellipsised if cut.
-
-    ``""`` when the message carries no string content at all — the line then
-    renders as sender and type alone rather than as an empty quotation.
-    """
-    content = getattr(message, "content", "")
-    if not isinstance(content, str):
-        return ""
-    content = " ".join(content.split())
-    if len(content) <= PREVIEW_LIMIT:
-        return content
-    return f"{content[:PREVIEW_LIMIT]}…"
+def _message_line(message: Message, offerable_ids: set[uuid.UUID]) -> str:
+    """One notice line: a preview plus an id, or the unofferable line."""
+    if message.id not in offerable_ids:
+        return UNOFFERABLE_LINE
+    if not isinstance(message, MailboxPreviewable):
+        raise MailboxRenderError(
+            f"{type(message).__name__} was offered for a mid-run read but declares no "
+            f"mailbox_preview(); the offer filter admitted a message it must exclude."
+        )
+    return f"- {message.mailbox_preview()} (id: {message.id})"
 
 
 class MailboxCapability(AbstractCapability[Any]):
@@ -193,19 +247,82 @@ class MailboxCapability(AbstractCapability[Any]):
        The hook constructs no message of its own and never mutates an
        existing message's parts (they are shared with durable history).
 
+    Each announced message is offered an **id** only if ``offerable_ids``
+    admits it; everything else is listed without one and is therefore visible
+    but unaskable. ``after_tool_execute`` is the other half of that bargain: it
+    turns an id the model names back into the message's own rendering.
+
     Announced-id tracking is run-local: the instance lives for the agent's
     lifetime, so ``act()`` resets the set at each run start. A backlog
     re-announced next run is acceptable; a leak of announced ids across runs
-    is not.
+    is not. The preview whitelist is the opposite — resolved once from the
+    card at agent init and constant for the agent's life.
     """
 
-    def __init__(self, observer: MailboxAccess) -> None:
+    def __init__(self, observer: MailboxAccess, preview_handlers: list[str] | None = None) -> None:
         self._observer = observer
         self._announced_ids: set[uuid.UUID] = set()
+        self._preview_handlers = preview_handlers
 
     def reset_run_tracking(self) -> None:
         """Forget which arrivals this run announced (called at each run start)."""
         self._announced_ids.clear()
+
+    def offerable_ids(self, pending: list[Message]) -> set[uuid.UUID]:
+        """Which of ``pending`` this run may be offered an id for.
+
+        A message is offerable when **all four** hold:
+
+        0. it satisfies ``MailboxPreviewable`` — it can render a preview at all;
+        1. the **current handler's** message class is in the configured
+           whitelist;
+        2. its class is *exactly* the class of the message being handled;
+        3. it is not a cancel.
+
+        Condition 0 is not defensive tidiness. Without it, a message class
+        carrying no preview — the ordinary case for a class that declares its
+        own fields — pending during a run of its **own** handler passes 1-3 on
+        the default configuration, is marked offerable, and the render raises
+        :class:`MailboxRenderError` in production. With it, that case is what it
+        was always meant to be: a silent non-offer.
+
+        Condition 2 is what keeps routing correct. Same class means same
+        handler means same output type, so an absorbed message is answered in
+        the shape its own handler would have produced. An exact class check,
+        not ``isinstance``: a subclass routes to its own handler.
+
+        Condition 3 exists because a ``/stop`` arrives as an ordinary
+        ``AgentMessage``, which *does* have a preview. Offering its id would let
+        the model read its way out of being cancelled.
+
+        Returns an empty set while idle — there is no current message to match
+        against, so nothing can be offered.
+        """
+        current = self._observer.current_message()
+        if current is None or not self._handler_shows_previews(type(current)):
+            return set()
+        return {
+            message.id
+            for message in pending
+            if isinstance(message, MailboxPreviewable)
+            and type(message) is type(current)
+            and not is_cancel(message)
+        }
+
+    def _handler_shows_previews(self, handler_message_class: type[Message]) -> bool:
+        """Whether the running handler's message class is whitelisted.
+
+        The whitelist is the ``MailboxTool`` card's ``mailbox_preview_handlers``,
+        a list of dotted paths resolved by the card at agent init. It is read
+        **defensively**: the param does not exist on older published versions of
+        that card, so an absent value — like an explicit ``None`` — admits every
+        handler and leaves conditions 0, 2 and 3 to decide. An empty list is a
+        different value and admits none.
+        """
+        if self._preview_handlers is None:
+            return True
+        dotted = f"{handler_message_class.__module__}.{handler_message_class.__qualname__}"
+        return dotted in self._preview_handlers
 
     async def before_model_request(
         self, ctx: RunContext[Any], request_context: ModelRequestContext
@@ -229,6 +346,69 @@ class MailboxCapability(AbstractCapability[Any]):
             )
         new_messages = [m for m in pending if m.id not in self._announced_ids]
         if new_messages:
-            ctx.enqueue(render_arrival_notice(new_messages), priority="asap")
+            notice = render_arrival_notice(new_messages, self.offerable_ids(new_messages))
+            ctx.enqueue(notice, priority="asap")
             self._announced_ids.update(message.id for message in new_messages)
         return request_context
+
+    async def after_tool_execute(
+        self,
+        ctx: RunContext[Any],
+        *,
+        call: ToolCallPart,
+        tool_def: ToolDefinition,
+        args: ValidatedToolArgs,
+        result: Any,
+    ) -> Any:
+        """Turn a completed ``read_mailbox`` call into the message it named.
+
+        The tool is a *signal*: it takes an id, touches no mailbox and renders
+        nothing. This hook is what makes its acknowledgement true — it consumes
+        exactly the named message and enqueues that message's own
+        ``render_for_llm()`` at ``"asap"``, the same durable drain the arrival
+        notice uses. The tool's return value is passed through untouched; the
+        content arrives as its own injected turn rather than as a tool result.
+
+        Every failure is a **silent no-op**, deliberately. An absent, empty,
+        malformed or unknown id consumes nothing and enqueues nothing, and the
+        run carries on. That is what lets the tool half and this half land in
+        sequence rather than atomically: against an older ``read_mailbox`` that
+        takes no arguments there is no id to find, and the correct behaviour is
+        to do nothing rather than to raise inside someone's run.
+        ``MailboxRenderError`` guards the offer filter and has no business here.
+
+        Args:
+            ctx: The run context, whose ``enqueue`` is documented safe from a
+                capability hook.
+            call: The completed tool call; only its name is consulted.
+            tool_def: The tool's definition. Unused.
+            args: The call's validated arguments, read by name.
+            result: The tool's own return value, returned unchanged.
+
+        Returns:
+            ``result``, always and unmodified.
+        """
+        if call.tool_name != READ_MAILBOX_TOOL:
+            return result
+
+        raw_id = args.get(MESSAGE_ID_ARG)
+        try:
+            message_id = uuid.UUID(str(raw_id))
+        except (ValueError, AttributeError, TypeError):
+            logger.info("read_mailbox named no usable message id (%r); nothing absorbed", raw_id)
+            return result
+
+        consumed = self._observer.consume_mailbox([message_id])
+        if not consumed:
+            logger.info("read_mailbox named id %s, which is no longer queued", message_id)
+            return result
+
+        for message in consumed:
+            if not isinstance(message, LlmRenderable):
+                logger.info(
+                    "%s was absorbed but renders nothing for the model; not injected",
+                    type(message).__name__,
+                )
+                continue
+            ctx.enqueue(message.render_for_llm(), priority="asap")
+        return result

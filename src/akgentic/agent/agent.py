@@ -54,12 +54,12 @@ from pydantic_ai import AgentCapability, BinaryContent, ModelRetry, RunContext
 
 from akgentic.agent.capabilities import MailboxCapability, RunInterruptedError
 from akgentic.agent.config import AgentConfig, AgentState
-from akgentic.agent.messages import AgentMessage
-from akgentic.agent.output_models import REPLY_PROTOCOLS, StructuredOutput
+from akgentic.agent.messages import AgentMessage, LlmRenderable
+from akgentic.agent.output_models import StructuredOutput
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 from akgentic.core import ActorAddress, Akgent, Orchestrator
-from akgentic.core.messages import CancelMessage, EventMessage
+from akgentic.core.messages import CancelMessage, EventMessage, Message
 from akgentic.llm import (
     AgentUsageSummary,
     LlmUsageEvent,
@@ -125,9 +125,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       traffic, and receiveMsg_CancelMessage acknowledging a cancel that lands
       while idle (Akgent contributes receiveMsg_StopRecursively). /-prefixed
       content is offered to the CommandRegistry first; everything else —
-      including a /-prefixed token the registry does not recognise — is
-      prefixed with the reply protocol for its message type and run as one
-      act() turn.
+      including a /-prefixed token the registry does not recognise — is run as
+      one act() turn, framed by the message's own render_for_llm(), which is
+      where the reply protocol for its type lives.
     - A turn interrupted by a queued cancel never reaches a handler:
       act() absorbs the RunInterruptedError itself, calls
       notify_human("Run interrupted.") once and returns an empty
@@ -191,6 +191,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       hire_member() for where that retry is, and is not, honoured.
     """
 
+    _mailbox_preview_handlers: list[str] | None = None
+    """Handler classes whose runs may be offered a mid-run mailbox read.
+
+    Resolved from the ``MailboxTool`` card in ``on_start``. The class-level
+    ``None`` is the meaningful default rather than a placeholder: no whitelist
+    means every handler is admitted, which is what an agent carrying no mailbox
+    card — or one built without ``on_start``, as the wiring specs do — must fall
+    back to.
+    """
+
     def on_start(self) -> None:
         """Initialize BaseAgent using ReactAgent from akgentic-llm.
 
@@ -219,8 +229,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         assert self._orchestrator is not None, "Orchestrator address must be provided in config"
         self.orchestrator_proxy_ask = self.proxy_ask(self._orchestrator, Orchestrator)
 
-        self._current_message: AgentMessage | None = None
-
         # ── State ───────────────────────────────────────────────────────────────
         self.state = AgentState(backstory=self.config.prompt.render()).observer(self)
 
@@ -232,6 +240,21 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             tool_cards.insert(0, MailboxTool())
         if not any(isinstance(t, TeamTool) for t in tool_cards):
             tool_cards.insert(0, TeamTool())
+
+        # ── The mid-run preview whitelist, read off the mailbox card ──────────
+        # Resolved here because _build_react_agent — which constructs the
+        # capability — runs further down, and the card list is only assembled
+        # above. Read with getattr: the param does not exist on older published
+        # versions of MailboxTool, and an agent pinned to one must keep running
+        # with every handler admitted rather than fail at init.
+        self._mailbox_preview_handlers = next(
+            (
+                getattr(card, "mailbox_preview_handlers", None)
+                for card in tool_cards
+                if isinstance(card, MailboxTool)
+            ),
+            None,
+        )
 
         # ── ReactAgent: wraps model, http client, context, usage limits ──────
         # Tools come from ToolFactory (includes TeamTool hire/fire via factory pattern)
@@ -366,7 +389,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """
         # Enforcement is agent-owned: held on self so act() can reset the
         # run-local announced-id tracking at each run start.
-        self._mailbox_capability = MailboxCapability(observer=self)
+        self._mailbox_capability = MailboxCapability(
+            observer=self, preview_handlers=self._mailbox_preview_handlers
+        )
         # The annotation is required: without it the list infers as
         # list[MailboxCapability] from its first element and the splat below
         # does not fit.
@@ -447,8 +472,24 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     # CORE LLM INTERACTION
     # ============================================================================
 
-    def act(self, user_content: str, output_type: type[T]) -> T:
+    def current_message(self) -> Message | None:
+        """The message whose handler is running, or ``None`` when idle.
+
+        The public reader for core's ``_current_message``, which core sets for
+        the whole of a handler and clears after it — so this is live during
+        ``before_model_request`` and is what the mailbox capability matches a
+        pending message's class against. Part of ``MailboxAccess``.
+        """
+        return self._current_message
+
+    def act(self, message: LlmRenderable, output_type: type[T]) -> T:
         """Execute one LLM REACT loop against the output type the caller names.
+
+        Takes the **message**, not a prompt. Framing is
+        ``message.render_for_llm()`` — one definition per message class, living
+        in the class — so a handler composes no prompt and there is no second
+        way in that could bypass the framing. There is deliberately no string
+        overload: passing a bare ``str`` is a type error, not a supported path.
 
         Delegates entirely to ReactAgent.run_sync(), which:
         - Manages context history via ContextManager
@@ -458,11 +499,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         - Runs the full REACT loop (tools, retries, system prompts)
 
         Recipient validity is NOT constrained in the schema — it is enforced at
-        routing time in _route_output(). Reply-protocol guidance is carried in
-        the prompt (see receiveMsg_AgentMessage), not the output-schema docstring.
+        routing time in _route_output(). Reply-protocol guidance is carried by
+        the message itself (see ``AgentMessage.render_for_llm``), not the
+        output-schema docstring.
 
         Args:
-            user_content: User message to process.
+            message: The message to reason about. Rendered exactly once, at the
+                top of this method; media expansion then runs on the rendered
+                string, so a ``!!glob`` written anywhere in a message's own
+                framing expands the same way it always did.
             output_type: The type the REACT loop reasons against. Forwarded to
                 ReactAgent.run_sync(), which wraps it with get_output_type().
                 receiveMsg_AgentMessage passes StructuredOutput.
@@ -499,12 +544,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # protocol and self._capabilities is not iterated here.
         self._mailbox_capability.reset_run_tracking()
         self._deliver_context_update()
+        rendered = message.render_for_llm()
         # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
-        prompt: UserPrompt = user_content
+        prompt: UserPrompt = rendered
         if self._command_registry.has("_expand_media_refs"):
             expand = self._command_registry.callable("_expand_media_refs")
-            parts = expand(user_content)
-            if parts != [user_content]:
+            parts = expand(rendered)
+            if parts != [rendered]:
                 prompt = [
                     BinaryContent(data=p.data, media_type=p.media_type)
                     if isinstance(p, MediaContent)
@@ -601,9 +647,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Content starting with ``/`` is offered to the command registry first; if a
         command handles it, the method returns without involving the LLM. Otherwise
-        the raw content is prefixed with the reply protocol for ``message.type``
-        (see REPLY_PROTOCOLS) and run as one act() turn, whose StructuredOutput
-        goes to _route_output().
+        the message itself is run as one act() turn — it frames itself through
+        ``AgentMessage.render_for_llm()``, which is where the reply protocol for
+        ``message.type`` now lives — whose StructuredOutput goes to
+        _route_output().
 
         This body carries no ``try``/``except`` at all. A queued ``/stop`` or
         ``CancelMessage`` is absorbed inside ``act()``, which notifies the human
@@ -631,25 +678,14 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             f"from {sender} ({len(message.content)} chars)"
         )
 
-        # "unknown" is prose for the prompt. The guard keeps its own requester as
-        # None, because a placeholder there would become a routing target in the
-        # tool-free conclusion — it would answer a member called "unknown".
-        sender_name = message.sender.name if message.sender else "unknown"
-
         sleep(random.uniform(0.25, 0.5))  # Simulate processing delay
 
         # Slash-command interception runs on the RAW content (before the
-        # typed-protocol prefix) so dispatch sees the leading "/<command>".
+        # message's own framing) so dispatch sees the leading "/<command>".
         if message.content.startswith("/") and self._dispatch_command(message, sender):
             return
 
-        article = "an" if message.type[0] in "aeiou" else "a"
-        prefixed_content = (
-            f"You received {article} {message.type} from {sender_name}. "
-            f"{REPLY_PROTOCOLS.get(message.type, '').format(sender=sender_name)}"
-            f"\n\n{message.content}"
-        )
-        output = self.act(prefixed_content, StructuredOutput)
+        output = self.act(message, StructuredOutput)
 
         self._route_output(output)
 

@@ -36,7 +36,10 @@ EXPECTED_PUBLIC_API = {
     "HumanProxy",
     "BaseAgent",
     "RunInterruptedError",
+    "MailboxRenderError",
     "AgentMessage",
+    "LlmRenderable",
+    "MailboxPreviewable",
 }
 
 
@@ -61,9 +64,10 @@ class TestOneClassNotTwo:
         assert capabilities_module.MailboxCapability is MailboxCapability
         assert agent_module.MailboxCapability is MailboxCapability
 
-    def test_capabilities_package_re_exports_all_four_symbols(self) -> None:
+    def test_capabilities_package_re_exports_every_symbol(self) -> None:
         assert set(capabilities_module.__all__) == {
             "MailboxCapability",
+            "MailboxRenderError",
             "RunInterruptedError",
             "is_cancel",
             "render_arrival_notice",

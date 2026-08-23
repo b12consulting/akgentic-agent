@@ -35,6 +35,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig, AgentState
+from akgentic.agent.messages import AgentMessage
 
 # =============================================================================
 # HELPERS
@@ -239,7 +240,7 @@ class TestPrefixStability:
                 return "The current date is 2026-08-22."
 
             with react_agent.pydantic_agent.override(model=FunctionModel(_stub_model)):
-                agent.act("turn one", output_type=str)
+                agent.act(AgentMessage(content="turn one"), output_type=str)
                 first_system = [
                     p.content
                     for p in react_agent.context.messages[0].parts
@@ -247,7 +248,7 @@ class TestPrefixStability:
                 ]
                 count_after_first = len(react_agent.context.messages)
                 holder["state"] = _RosterState(members=("@Manager",))
-                agent.act("turn two", output_type=str)
+                agent.act(AgentMessage(content="turn two"), output_type=str)
 
             second_system = [
                 p.content
@@ -272,7 +273,7 @@ class TestPrefixStability:
         react_agent, agent, holder = _real_react_agent_pair()
         try:
             with react_agent.pydantic_agent.override(model=FunctionModel(_stub_model)):
-                agent.act("turn one", output_type=str)
+                agent.act(AgentMessage(content="turn one"), output_type=str)
                 # The block was folded into turn one's user prompt.
                 user_texts = [
                     p.content
@@ -283,7 +284,7 @@ class TestPrefixStability:
                 # Unchanged second turn: reconciliation finds the folded marker,
                 # so the surviving baseline appends nothing.
                 holder["state"] = _RosterState(members=("@Manager",))
-                agent.act("turn two", output_type=str)
+                agent.act(AgentMessage(content="turn two"), output_type=str)
 
             assert agent.state.tool_state.context_update_seq == 1
             assert len(react_agent.context.messages) == 4

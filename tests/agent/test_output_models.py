@@ -4,13 +4,24 @@ Covers REPLY_PROTOCOLS wording/order, Request.message_type, the plain-string
 (un-enumerated) recipient schema, and the prompt-carried reply protocol.
 """
 
+from unittest.mock import MagicMock
+
+from akgentic.core import ActorAddress
 from pydantic import ValidationError
 
+from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import (
     REPLY_PROTOCOLS,
     Request,
     StructuredOutput,
 )
+
+
+def _sender_named(name: str) -> ActorAddress:
+    """A stand-in ActorAddress carrying a display name."""
+    sender = MagicMock(spec=ActorAddress)
+    sender.name = name
+    return sender
 
 
 # Phrasings that assign work rather than describe a message. Both directions are
@@ -107,16 +118,27 @@ class TestPromptCarriedReplyProtocol:
     """AC-3: the reply protocol is carried in the prompt, not the output schema."""
 
     def test_request_prompt_prefix(self) -> None:
-        """A request from @Manager composes the exact AC-3 prompt prefix."""
+        """A request from @Manager composes the exact AC-3 prompt prefix.
+
+        The composition now lives on ``AgentMessage.render_for_llm()`` — the
+        table keeps its home here, and the message reads it. Driving the real
+        renderer rather than re-composing the prefix locally is what stops this
+        spec from being a tautology that agrees with itself.
+        """
         sender = "@Manager"
         protocol = REPLY_PROTOCOLS["request"].format(sender=sender)
-        prefix = f"You received a request from {sender}. {protocol}"
+
+        message = AgentMessage(content="Estimate feature X", type="request")
+        message.sender = _sender_named(sender)
+        rendered = message.render_for_llm()
+
         # The subject is the AC-3 framing and the {sender} substitution, not the
         # protocol's wording — asserting the composed literal here would just
         # duplicate TestReplyProtocolsTable's verbatim pin and break with it.
-        assert prefix.startswith("You received a request from @Manager. ")
-        assert prefix.endswith(protocol)
-        assert "{sender}" not in prefix
+        assert rendered.startswith("You received a request from @Manager. ")
+        assert rendered.endswith("\n\nEstimate feature X")
+        assert protocol in rendered
+        assert "{sender}" not in rendered
         assert "@Manager" in protocol
 
 

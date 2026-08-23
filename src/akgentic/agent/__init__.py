@@ -7,10 +7,10 @@ structured-output schema for routing messages between team members.
 from importlib import metadata as _metadata
 
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.capabilities import RunInterruptedError
+from akgentic.agent.capabilities import MailboxRenderError, RunInterruptedError
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.human_proxy import HumanProxy
-from akgentic.agent.messages import AgentMessage
+from akgentic.agent.messages import AgentMessage, LlmRenderable, MailboxPreviewable
 
 __all__ = [
     # Version
@@ -22,8 +22,13 @@ __all__ = [
     "BaseAgent",
     # Run cancellation
     "RunInterruptedError",
+    # Mailbox offer-rule invariant
+    "MailboxRenderError",
     # Team messages
     "AgentMessage",
+    # Rendering contracts
+    "LlmRenderable",
+    "MailboxPreviewable",
 ]
 
 try:

@@ -49,13 +49,33 @@ from akgentic.agent.output_models import StructuredOutput
 
 
 class _MailboxDouble:
-    """Exposes ``get_mailbox()`` over a mutable pending list (no actor)."""
+    """The ``MailboxAccess`` surface over a mutable pending list (no actor).
 
-    def __init__(self, pending: list[AgentMessage] | None = None) -> None:
+    Swept by hand when the Protocol widened: ``@runtime_checkable`` checks
+    member presence, not signatures, so a fake that misses a method fails at
+    the call rather than at construction.
+    """
+
+    def __init__(
+        self,
+        pending: list[AgentMessage] | None = None,
+        current: AgentMessage | None = None,
+    ) -> None:
         self.pending: list[AgentMessage] = list(pending or [])
+        self.current = current
+        self.consumed: list[uuid.UUID] = []
 
     def get_mailbox(self) -> list[AgentMessage]:
         return list(self.pending)
+
+    def consume_mailbox(self, message_ids: list[uuid.UUID]) -> list[AgentMessage]:
+        taken = [m for m in self.pending if m.id in message_ids]
+        self.pending = [m for m in self.pending if m.id not in message_ids]
+        self.consumed.extend(message_ids)
+        return taken
+
+    def current_message(self) -> AgentMessage | None:
+        return self.current
 
 
 class _EventRecorder:
@@ -174,8 +194,9 @@ class TestArrivalNoticeDurability:
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
 
         arrived = _pending_message("news", "@Alice")
-        notice = render_arrival_notice([arrived])
-        agent = _make_minimal_agent(_MailboxDouble([arrived]))
+        handled = _pending_message("carry on", "@Human")
+        notice = render_arrival_notice([arrived], {arrived.id})
+        agent = _make_minimal_agent(_MailboxDouble([arrived], current=handled))
         recorder = _EventRecorder()
         react_agent = _build_react_agent(agent, recorder)
 
@@ -207,7 +228,7 @@ class TestArrivalNoticeDurability:
 
         try:
             with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
-                agent.act("carry on", StructuredOutput)
+                agent.act(handled, StructuredOutput)
         finally:
             react_agent.close()
 
@@ -233,8 +254,9 @@ class TestArrivalNoticeDurability:
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
 
         arrived = _pending_message("late news", "@Bob")
-        notice = render_arrival_notice([arrived])
-        agent = _make_minimal_agent(_MailboxDouble([arrived]))
+        handled = _pending_message("wrap up", "@Human")
+        notice = render_arrival_notice([arrived], {arrived.id})
+        agent = _make_minimal_agent(_MailboxDouble([arrived], current=handled))
         recorder = _EventRecorder()
         react_agent = _build_react_agent(agent, recorder)
 
@@ -256,7 +278,7 @@ class TestArrivalNoticeDurability:
 
         try:
             with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
-                agent.act("wrap up", StructuredOutput)
+                agent.act(handled, StructuredOutput)
         finally:
             react_agent.close()
 
