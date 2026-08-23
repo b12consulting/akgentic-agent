@@ -52,13 +52,6 @@ def _address(name: str, role: str = "Agent") -> ActorAddressProxy:
     )
 
 
-def _user_message(sender: str, content: str) -> UserMessage:
-    """A UserMessage carrying a mock sender address."""
-    message = UserMessage(content=content)
-    message.sender = _address(sender)
-    return message
-
-
 def _agent_message(sender: str, content: str) -> AgentMessage:
     """An AgentMessage carrying a mock sender address.
 
