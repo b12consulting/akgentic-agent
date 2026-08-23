@@ -544,20 +544,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # protocol and self._capabilities is not iterated here.
         self._mailbox_capability.reset_run_tracking()
         self._deliver_context_update()
-        rendered = message.render_for_llm()
-        # ── Media expansion (!!glob_pattern → BinaryContent) ────────────────────
-        prompt: UserPrompt = rendered
-        if self._command_registry.has("_expand_media_refs"):
-            expand = self._command_registry.callable("_expand_media_refs")
-            parts = expand(rendered)
-            if parts != [rendered]:
-                prompt = [
-                    BinaryContent(data=p.data, media_type=p.media_type)
-                    if isinstance(p, MediaContent)
-                    else p
-                    for p in parts
-                ]
-        # ── End media expansion ─────────────────────────────────────────────────
+        rendered_message = message.render_for_llm()
+        prompt = self._build_prompt_expanding_media_refs(rendered_message)
         try:
             output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
         except RunInterruptedError as interruption:
@@ -599,6 +587,41 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         block = self._context_updater.compose_update(self._react_agent.context.messages)
         if block is not None:
             self._react_agent.context.record_operator_action(block)
+
+    def _build_prompt_expanding_media_refs(self, rendered: str) -> UserPrompt:
+        """Build the run's ``UserPrompt``, expanding any ``!!glob`` media references.
+
+        Expansion is a ``COMMAND``-channel capability of the workspace card,
+        reached through the command registry rather than imported. An agent
+        configured without that card simply has no ``_expand_media_refs``
+        command registered, so the prompt passes straight through — the absence
+        is the off switch, and no branch here has to know which cards exist.
+
+        The unchanged prompt is returned as the **plain string** it arrived as,
+        not as a single-element list. Both satisfy ``UserPrompt``, but wrapping
+        would make every prompt multipart for the benefit of the rare one that
+        actually carries media.
+
+        Args:
+            rendered: The prompt text, already produced by the message's own
+                ``render_for_llm()``.
+
+        Returns:
+            ``rendered`` unchanged when no reference expanded; otherwise the
+            mixed list of text and ``BinaryContent`` parts the command produced.
+        """
+        prompt: UserPrompt = rendered
+        if self._command_registry.has("_expand_media_refs"):
+            expand = self._command_registry.callable("_expand_media_refs")
+            parts = expand(rendered)
+            if parts != [rendered]:
+                prompt = [
+                    BinaryContent(data=p.data, media_type=p.media_type)
+                    if isinstance(p, MediaContent)
+                    else p
+                    for p in parts
+                ]
+        return prompt
 
     def _route_output(self, output: StructuredOutput) -> bool:
         """Send one AgentMessage per Request — the class's single routed send path.
