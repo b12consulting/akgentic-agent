@@ -39,14 +39,17 @@ Human
 HumanProxy ──send()──► BaseAgent (Manager)
                              │
                     receiveMsg_AgentMessage()   ← @guard_usage_limits(...)
-                             │  prepend reply protocol to the prompt:
-                             │  "You received a request from @Human. A reply is
-                             │   expected: respond to @Human with the result."
+                             │  hands the message over unchanged — it composes
+                             │  no prompt of its own
                              │
-                    act(prompt, StructuredOutput)
+                    act(message, StructuredOutput)
                       │
                       ├─ append **Context update N** block (if shared state changed)
-                      ├─ expand !!glob_pattern refs (if WorkspaceTool present)
+                      ├─ message.render_for_llm() — the message frames itself:
+                      │  "You received a request from @Human. A reply is
+                      │   expected: respond to @Human with the result."
+                      ├─ expand !!glob_pattern refs in the rendered string
+                      │  (if WorkspaceTool present)
                       └─ ReactAgent.run_sync(prompt, output_type=StructuredOutput)
                            (a queued /stop or CancelMessage cancels the run at the
                             next step boundary — see Run Cancellation)
@@ -63,8 +66,8 @@ HumanProxy ──send()──► BaseAgent (Manager)
                     send AgentMessage(content=request.message,
                                       type=request.message_type)
                       └─ the RAW message — the sender does not enrich it.
-                         The receiving agent prepends its own reply
-                         protocol when it runs the loop above.
+                         The delivered message frames itself with its own
+                         reply protocol when the receiver runs the loop above.
 ```
 
 ## Installation
@@ -185,10 +188,10 @@ Intent flows through the system in two complementary ways:
    delivers the **raw** `request.message` as an `AgentMessage` whose `type` field carries that
    intent unchanged. The sender does not rewrite the content.
 
-2. **When receiving** — `receiveMsg_AgentMessage()` prepends a one-line reply protocol, keyed on
-   the incoming `type` via `REPLY_PROTOCOLS`, to the raw content before handing it to the LLM.
-   The guidance is therefore always the one matching the intent *that* agent received, and it
-   reaches the LLM through the **prompt** — not through the output schema.
+2. **When receiving** — `AgentMessage.render_for_llm()` puts a one-line reply protocol, keyed on
+   the message's own `type` via `REPLY_PROTOCOLS`, in front of its content. The guidance is
+   therefore always the one matching the intent *that* agent received, and it reaches the LLM
+   through the **prompt** — not through the output schema. The handler composes nothing.
 
 ### AgentMessage
 
@@ -243,7 +246,7 @@ per-call subclass and no `type()` metaprogramming on the hot path:
 output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 ```
 
-`receiveMsg_AgentMessage()` calls `act(prefixed_content, StructuredOutput)`, so the team
+`receiveMsg_AgentMessage()` calls `act(message, StructuredOutput)`, so the team
 delegation path reasons against the **static** `StructuredOutput` type.
 
 `Request.recipient` is a **plain string** with no `enum` constraint. Recipient validity is
@@ -255,8 +258,8 @@ enforced at **routing time** in `_route_output()`, not in the schema:
 | `RoleName` | `hire_member(role)` → create actor → send |
 
 The reply-protocol guidance lives where the LLM actually reads it — the **prompt**.
-`receiveMsg_AgentMessage()` prepends a one-line protocol (keyed on the incoming message
-type via `REPLY_PROTOCOLS`) to the raw content before handing it to the LLM:
+`AgentMessage.render_for_llm()` puts a one-line protocol (keyed on the message's own
+type via `REPLY_PROTOCOLS`) in front of the content, and `act()` calls it:
 
 ```
 You received a request from @Human. A reply is expected: respond to @Human with the result.
@@ -273,12 +276,17 @@ You received a request from @Human. A reply is expected: respond to @Human with 
 `receiveMsg_AgentMessage()` runs one LLM turn and hands the result to `_route_output()`,
 which resolves each `Request.recipient` (see the table above) and sends the **raw**
 `request.message` as an `AgentMessage`. The sender does not enrich the content —
-the reply-protocol prefix is added by the *receiving* agent's `receiveMsg_AgentMessage()`,
-so the guidance is always keyed to the intent that agent actually received:
+the reply-protocol prefix is added by the *delivered message itself*, when `act()` renders
+it on the receiving side, so the guidance is always keyed to the intent that agent actually
+received:
 
 ```python
-# In the receiver's receiveMsg_AgentMessage(), before the LLM turn:
-prompt = f"You received a request from @Manager. {reply_protocol}\n\n{message.content}"
+# AgentMessage.render_for_llm(), called once by act() before the LLM turn:
+return (
+    f"You received {article} {self.type} from {sender_name}. "
+    f"{REPLY_PROTOCOLS.get(self.type, '').format(sender=sender_name)}"
+    f"\n\n{self.content}"
+)
 ```
 
 `_route_output()` returns **whether anything was actually delivered**. That is what lets the
@@ -339,7 +347,7 @@ class CustomAgent(BaseAgent):
 
     @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
-        output = self.act(prompt, TriageOutput)
+        output = self.act(message, TriageOutput)
         self._route_triage(output)
 ```
 
@@ -388,9 +396,9 @@ human_proxy.process_human_input("My answer", original_message)
 
 ## Message Protocol
 
-The 5-type intent protocol controls conversation flow. When an incoming message is
-received, the matching `REPLY_PROTOCOLS` instruction is prepended to the **user prompt**
-(not the output schema), so the LLM reads the guidance inline with the content:
+The 5-type intent protocol controls conversation flow. `AgentMessage.render_for_llm()` puts
+the `REPLY_PROTOCOLS` instruction matching its own `type` into the **user prompt** (not the
+output schema), so the LLM reads the guidance inline with the content:
 
 | Intent | Receiver instruction (`REPLY_PROTOCOLS`) |
 |---|---|
@@ -640,9 +648,12 @@ Runtime state extending `BaseState`:
 
 `TeamTool` **and** `MailboxTool` are always prepended to `config.tools` if not already
 present, so every `BaseAgent` can hire and fire members (`TeamTool`) and carries the two
-mailbox surfaces — the **consuming** `read_mailbox` tool, which absorbs the mail it shows so
-that mail is not delivered again as its own turn, and `/stop` (`MailboxTool`). A cancel is
-never consumed by the read. A card already supplied in `config.tools` wins over the prepended
+mailbox surfaces — the `read_mailbox` tool, which takes the **id** of one waiting message and
+acknowledges it, and `/stop` (`MailboxTool`). The tool consumes nothing itself:
+`MailboxCapability.after_tool_execute` absorbs exactly the message the model named, so that
+one is not delivered again as its own turn, and injects that message's own
+`render_for_llm()`. Mail the model does not name stays queued, and a cancel is never offered
+and never absorbed. A card already supplied in `config.tools` wins over the prepended
 default, and `config.tools` itself is never mutated — `on_start()` copies the list.
 
 ### Assembly: what `on_start` collects
@@ -890,7 +901,9 @@ Separately from the command channel, `BaseAgent`'s own public methods are reacha
 ### Media Expansion
 
 When the registry carries an `_expand_media_refs` command — `WorkspaceTool` is what provides it —
-`act()` expands inline file references before the LLM call:
+`act()` expands inline file references before the LLM call. Expansion runs on the **rendered**
+string, after `message.render_for_llm()`, so a `!!glob` written anywhere in a message's own
+framing expands exactly as one written in its content does:
 
 ```
 !!file.png               → BinaryContent injected into the prompt
@@ -900,10 +913,10 @@ When the registry carries an `_expand_media_refs` command — `WorkspaceTool` is
 !!nonexistent.png        → "!!nonexistent.png[Error: no image found in the workspace]"
 ```
 
-Expansion happens in `act()` before `run_sync()`, and only when the expansion actually changed
-something: if the command returns the prompt unchanged, the plain string is sent as-is. Errors and
-document hints are forwarded to the LLM rather than silently dropped. Agents whose registry has no
-`_expand_media_refs` are unaffected — the block is a no-op.
+Expansion happens in `act()` between the render and `run_sync()`, and only when the expansion
+actually changed something: if the command returns the rendered string unchanged, that plain string
+is sent as-is. Errors and document hints are forwarded to the LLM rather than silently dropped.
+Agents whose registry has no `_expand_media_refs` are unaffected — the block is a no-op.
 
 ## Run Cancellation
 
@@ -920,7 +933,7 @@ A running turn can be interrupted. The design is **two surfaces, one predicate, 
   on an agent configured without `MailboxTool`. The agent owns *both* the vocabulary and the
   enforcement, and the first is a consequence of the second: a card-less agent has no card to
   borrow a predicate from, so a predicate that shipped with the card could not make that agent
-  interruptible. What the card still owns is its own surface — the consuming `read_mailbox`
+  interruptible. What the card still owns is its own surface — the id-taking `read_mailbox`
   tool and the `/stop` command registration whose string form `is_cancel` recognises without
   importing anything from the card.
 
@@ -968,11 +981,39 @@ event store as its own user-role message — that record **is** the audit trail 
 doorbell rang. When the run would otherwise end at that boundary, pydantic-ai's drain
 redirects through one final model request so an already-enqueued notice is delivered rather
 than lost — an occasional extra model call, by design. Announced-id tracking is run-local:
-`act()` resets it at each run start, so it dies with the run. A durable record exists either
-way, but which one depends on what the model does: if it calls `read_mailbox`, the read
-**absorbs** those messages and the tool return is their record — they are not delivered again
-as their own turn. Whatever it leaves unread stays queued and arrives as its own turn once the
-run ends. A cancel is never consumed by the read.
+`act()` resets it at each run start, so it dies with the run.
+
+**Every announced message is listed; only some carry an id.** A message this run can take on
+renders as its own `mailbox_preview()` followed by `(id: …)` — the only way the model can name
+it. Everything else renders as the fixed line `- Message cannot be handled in the run`, with no
+id and no content. That missing id *is* the constraint: such a message is **visible but
+unaskable** — not rejected, not validated, not refused. The affordance simply is not offered.
+
+A message is offered an id only when **all four** of these hold:
+
+1. **It can render a preview at all** — it satisfies `MailboxPreviewable`. A class that
+   declares no `mailbox_preview()` is never offered, which is what keeps a class carrying its
+   own fields out of a mid-run read instead of being handed an id it cannot honour.
+2. **The current handler's message class is whitelisted** — the `MailboxTool` card's
+   `mailbox_preview_handlers`. `None`, the default, admits every handler; `[]` is a different
+   value and admits none.
+3. **Its class is exactly the class of the message being handled.** Same class means same
+   handler means same output type, so an absorbed message is answered in the shape its own
+   handler would have produced. An exact class check, not `isinstance`.
+4. **It is not a cancel.** A `/stop` arrives as an ordinary `AgentMessage` and does have a
+   preview, so offering its id would let the model read its way out of being cancelled.
+
+The closing line follows the same rule. It points at `read_mailbox` "with one of the ids above"
+only when at least one id is on offer; otherwise it says only "Finish your current work first —
+you will get them just after", because promising a read for a listing that carries no id would
+be an instruction the model cannot follow.
+
+**Naming an id absorbs that one message.** `read_mailbox` takes the id and acknowledges it;
+`MailboxCapability.after_tool_execute` consumes exactly the message named and enqueues that
+message's own `render_for_llm()` at `"asap"`, so its content arrives as its own injected turn
+rather than as a tool result. An absent or unknown id is a silent no-op. Whatever the model
+leaves unnamed stays queued and arrives as its own turn once the run ends, and a cancel is
+never offered and never absorbed.
 
 ### Honest limitations
 
@@ -1079,6 +1120,18 @@ Because step 3 resolves the siblings from PyPI, a change that depends on an unre
 `akgentic-core`/`llm`/`tool` commit will be red here until that package ships, even when the
 workspace is green locally. That is a merge-order signal, not a defect in this package.
 
+**The id-based mailbox read is exactly that case, and it is worth stating plainly.** The two
+halves live in two packages — `read_mailbox(message_id)` in `akgentic-tool`, the absorption and
+injection in this one — and **neither may be released alone**. A tool that takes an id with no
+agent-side injection acknowledges and delivers nothing; an injection with no id-taking signature
+never receives an id. The order is `akgentic-tool` first, then this package **with its
+`akgentic-tool` floor raised** — a floor raise that is owed and deliberately not yet made, because
+the version to pin does not exist yet. In the gap, an agent running the older tool is told by the
+notice to call `read_mailbox` with an id the old signature does not accept, and burns retries on
+the rejected call: **inert but noisy**. Nothing is lost — the older tool consumes nothing, so
+unnamed mail stays queued and arrives as its own turn — and the noise stops of its own accord once
+this package's release lands on the raised floor.
+
 > **Note:** No pre-commit hooks are configured in this package. Quality checks run
 > exclusively in CI.
 
@@ -1086,12 +1139,17 @@ workspace is green locally. That is a merge-order signal, not a defect in this p
 
 ```
 src/akgentic/agent/
-    __init__.py          # Public API: BaseAgent, AgentConfig, HumanProxy, AgentMessage
+    __init__.py          # Public API: BaseAgent, AgentConfig, HumanProxy, AgentMessage,
+                         #   LlmRenderable, MailboxPreviewable, RunInterruptedError,
+                         #   MailboxRenderError
     agent.py             # BaseAgent — actor + LLM + tool composition, routing logic
+    capabilities/        # Capabilities the agent wires itself: MailboxCapability, is_cancel,
+                         #   render_arrival_notice, and the two mailbox error types
     config.py            # AgentConfig, AgentState
     custom_agent.py      # Worked example: a second agent class with its own schema
     human_proxy.py       # HumanProxy — human-in-the-loop bridge
-    messages.py          # AgentMessage with typed protocol
+    messages.py          # AgentMessage with typed protocol, and the two rendering
+                         #   Protocols: LlmRenderable, MailboxPreviewable
     output_models.py     # StructuredOutput, Request, REPLY_PROTOCOLS
     usage_limits.py      # guard_usage_limits decorator + the tier policy (no agent.py import)
     utils.py             # resolve_recipient — the team addressing convention
