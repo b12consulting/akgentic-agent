@@ -32,6 +32,12 @@ now rather than what ought to. They are what story 26-2's review found
 naming the requester in the conclusion prompt, refusing a sender-less message, and escalating when
 routing delivers nothing. The third fails **silently**. See the epic's ``## Deferred findings``.
 
+**Two of the three have since been accepted as losses; the third has not.** The silent one is
+being restored rather than dropped — ``akgentic-llm`` grows an ``is_conclusion_usable`` seam that
+``akgentic-agent`` overrides to report structured emptiness, and the human escalation comes back
+through it. So story 24-2 **inverts** that spec instead of deleting it, and cannot land until the
+llm half of that seam has shipped. Detail in the epic's ``## Deferred findings``.
+
 Assertions are **outcomes** — what the requester received, whether a human was notified, whether
 ``WarningError`` escaped — never merely that a mock was called, and never on the decorator's own
 call counts, which would not survive 24-2. The tiers are told apart by exception class; no spec
@@ -612,8 +618,15 @@ class TestTheLapsingBehaviours:
         *successful* output there, so it is returned from ``run()``, routed by the handler body,
         and delivers nothing.
 
-        The full silence is the assertion: nothing sent, nothing raised, nobody notified. After
-        24-2 there is no place left in this package to notice this at all.
+        The full silence is the assertion: nothing sent, nothing raised, nobody notified.
+
+        **This spec is 24-2's to invert, not to delete.** The silence was the finding this story
+        was written to surface, and it has since been ruled a defect rather than an accepted
+        loss: ``akgentic-llm`` grows an ``is_conclusion_usable`` seam, this package overrides it
+        to report that a ``StructuredOutput`` carrying no ``Request`` reached nobody, and the
+        original breach is raised so the existing escalation pages a human exactly as the
+        decorator did. ``escalate_usage_limit`` therefore survives 24-2. When that lands, the
+        three assertions below flip to: nothing sent, ``WarningError`` raised, human notified.
         """
         agent, _ = build_agent()
 
