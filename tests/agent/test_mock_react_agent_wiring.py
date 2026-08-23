@@ -44,7 +44,7 @@ def test_real_react_agent_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> Non
 
     agent = _make_agent()
     config = ReactAgentConfig()
-    result = agent._build_react_agent(config, [], [])
+    result = agent._build_react_agent(config, [], [], [])
 
     assert isinstance(result, _FakeReactAgent)
     assert captured["config"] is config  # not copied/mutated
@@ -68,7 +68,7 @@ def test_mock_react_agent_when_env_set(monkeypatch: pytest.MonkeyPatch) -> None:
 
     agent = _make_agent()
     config = ReactAgentConfig()  # model_cfg.model defaults to "gpt-5.2"
-    result = agent._build_react_agent(config, [], [])
+    result = agent._build_react_agent(config, [], [], [])
 
     assert isinstance(result, _FakeMockReactAgent)
     assert captured["observer"] is agent
@@ -93,7 +93,7 @@ def test_blank_env_falls_back_to_real(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agent_module, "ReactAgent", _FakeReactAgent)
 
     agent = _make_agent()
-    result = agent._build_react_agent(ReactAgentConfig(), [], [])
+    result = agent._build_react_agent(ReactAgentConfig(), [], [], [])
 
     assert isinstance(result, _FakeReactAgent)
     assert built == ["real"]
@@ -112,7 +112,7 @@ def test_real_path_omits_event_loop_kwarg(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(agent_module, "ReactAgent", _FakeReactAgent)
 
     agent = _make_agent()
-    agent._build_react_agent(ReactAgentConfig(), [], [])
+    agent._build_react_agent(ReactAgentConfig(), [], [], [])
 
     assert "event_loop" not in captured
 
@@ -132,6 +132,6 @@ def test_mock_path_omits_event_loop_kwarg(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setitem(sys.modules, "akgentic.llm.loadtest", fake_loadtest)
 
     agent = _make_agent()
-    agent._build_react_agent(ReactAgentConfig(), [], [])
+    agent._build_react_agent(ReactAgentConfig(), [], [], [])
 
     assert "event_loop" not in captured

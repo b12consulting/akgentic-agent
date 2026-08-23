@@ -15,7 +15,7 @@ These tests assert the observable behavior:
 
 The operator-action buffering that protects this empty run buffer now lives in
 ``akgentic-llm`` (the agent merely delegates via
-``context.record_operator_action``), so its buffer-vs-append behavior is
+``context.append_user_prompt``), so its buffer-vs-append behavior is
 unit-tested there rather than here.
 
 No assertion references any "ADR-NNN" string (Golden Rule #8).

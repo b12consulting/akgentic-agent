@@ -701,7 +701,8 @@ class AuditedAgent(BaseAgent):
 `AuditCapability` is yours to write — any `pydantic_ai.capabilities.AbstractCapability`
 subclass, or a plain capability function.
 
-`_build_react_agent` assembles the list once and hands the same object to both build sites:
+`_assemble_capabilities` builds the list once, and `on_start` hands it to whichever build
+site runs:
 
 ```python
 self._capabilities = [self._mailbox_capability, *self.extra_capabilities()]
@@ -717,13 +718,14 @@ Two things follow, and both are deliberate:
   order, so the cancel check runs before any custom capability's work: a run that is about
   to be cancelled does not first pay for a third party's `before_model_request`.
 
-`extra_capabilities()` is called from `_build_react_agent`, during `on_start` and *before*
+`extra_capabilities()` is called from `_assemble_capabilities`, during `on_start` and *before*
 `self._react_agent` exists — so an override may read `self.config`, but must not touch the
 ReactAgent or anything built later in `on_start`. `AgentCapability` is the union of
 `AbstractCapability` and a plain capability function, so either shape is accepted. There is
-no per-capability lifecycle: the framework resets its own capability by name at each run
-start and never iterates the list. `CustomAgent` in `custom_agent.py` carries a runnable
-version of the above.
+no per-capability lifecycle for the framework to drive: a capability that needs per-run state
+resets it in its own `before_run` hook, which is what `MailboxCapability` does for its
+announced-id set. The framework never iterates the list. `CustomAgent` in `custom_agent.py`
+carries a runnable version of the above.
 
 ### Context updates
 
@@ -738,7 +740,7 @@ built once by `ToolFactory.get_context_updater()` at `on_start()` and held for t
 — reads the state providers, diffs them against the baselines, composes the block and advances the
 counter; `akgentic-tool` owns those semantics along with the cards that produce the state.
 `BaseAgent` contributes only *when* — one delivery site, at the top of `act()`, before the run — and
-*how* — the append goes through `ContextManager.record_operator_action`, so a fresh agent's first
+*how* — the append goes through `ContextManager.append_user_prompt`, so a fresh agent's first
 block is folded into the first run's user prompt instead of suppressing system-prompt injection.
 
 The block opens with a marker line, `**Context update N**`, followed by one of two **fixed**

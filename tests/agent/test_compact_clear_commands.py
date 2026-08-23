@@ -170,7 +170,7 @@ class TestOperatorActionLogging:
         handled = agent._dispatch_command(message, _make_sender("@Human"))
 
         assert handled is True
-        record = agent._react_agent.context.record_operator_action  # type: ignore[attr-defined]
+        record = agent._react_agent.context.append_user_prompt  # type: ignore[attr-defined]
         record.assert_called_once()
         assert '"/compact"' in record.call_args[0][0]
         agent.send.assert_called_once()  # type: ignore[attr-defined]
@@ -185,7 +185,7 @@ class TestOperatorActionLogging:
         handled = agent._dispatch_command(message, _make_sender("@Human"))
 
         assert handled is True
-        record = agent._react_agent.context.record_operator_action  # type: ignore[attr-defined]
+        record = agent._react_agent.context.append_user_prompt  # type: ignore[attr-defined]
         record.assert_called_once()
         assert '"/clear"' in record.call_args[0][0]
         agent.send.assert_called_once()  # type: ignore[attr-defined]

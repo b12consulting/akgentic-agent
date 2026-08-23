@@ -825,7 +825,7 @@ The attempt returns `False` — nothing sent, nothing recorded, escalate — in 
   is treated as one.
 
 On success, one entry is written to the agent's own context through
-`_record_operator_action()`, stating that the turn hit its per-run limit and was concluded
+`_record_user_action()`, stating that the turn hit its per-run limit and was concluded
 early — so the next turn is not blind to the fact that work was left unfinished. It is
 deliberately *not* the human-attributed wording used for slash commands: nobody ran a
 command here.

@@ -54,7 +54,7 @@ class _CapturingReactAgent:
     def __init__(self, **kwargs: object) -> None:
         type(self).captured.append(kwargs)
         self.context = SimpleNamespace(
-            record_operator_action=type(self).recorded_blocks.append, messages=[]
+            append_user_prompt=type(self).recorded_blocks.append, messages=[]
         )
 
     def system_prompt(self, fn: Callable[..., Any]) -> Callable[..., Any]:

@@ -72,7 +72,7 @@ def _provider(name: str, holder: dict[str, ContextState | None]) -> Callable[[],
 def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     """Bare BaseAgent (no Pykka) with a stubbed ReactAgent and a real updater.
 
-    ``record_operator_action`` appends each block as a user-role message to a
+    ``append_user_prompt`` appends each block as a user-role message to a
     real ``messages`` list (the post-first-run shape), so the updater's
     reconciliation scans the same history it would against the real
     ``ContextManager``. The updater holds the agent weakly, so the caller must
@@ -82,7 +82,7 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
     messages: list[Any] = []
     agent._react_agent.context.messages = messages  # type: ignore[attr-defined]
-    agent._react_agent.context.record_operator_action.side_effect = (  # type: ignore[attr-defined]
+    agent._react_agent.context.append_user_prompt.side_effect = (  # type: ignore[attr-defined]
         lambda entry: messages.append(ModelRequest(parts=[UserPromptPart(content=entry)]))
     )
 
@@ -105,7 +105,7 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
 
 
 def _recorded_blocks(agent: BaseAgent) -> list[str]:
-    record = agent._react_agent.context.record_operator_action  # type: ignore[attr-defined]
+    record = agent._react_agent.context.append_user_prompt  # type: ignore[attr-defined]
     return [call.args[0] for call in record.call_args_list]
 
 

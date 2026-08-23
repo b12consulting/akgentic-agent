@@ -4,7 +4,7 @@ What ``BaseAgent`` still owns after Epic 21 is the *when* and the *how*: one
 ``ContextUpdater``, obtained from the factory at ``on_start`` and held for the
 agent's lifetime; ``_deliver_context_update`` as the single delivery site at the
 top of every ``act()`` turn; and the append through
-``ContextManager.record_operator_action`` rather than a bare ``ModelRequest``,
+``ContextManager.append_user_prompt`` rather than a bare ``ModelRequest``,
 so a fresh agent's first block is folded into the first run's prompt instead of
 suppressing system-prompt injection.
 
@@ -88,7 +88,7 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     """Bare BaseAgent (no Pykka) with a stubbed ReactAgent and a real updater.
 
     The stubbed context carries a real ``messages`` list, and its
-    ``record_operator_action`` appends each delivered block as a user-role
+    ``append_user_prompt`` appends each delivered block as a user-role
     message (the post-first-run shape) — so the updater's reconciliation finds
     the marker on later turns exactly as it would against the real
     ContextManager.
@@ -102,7 +102,7 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
     messages: list[Any] = []
     agent._react_agent.context.messages = messages  # type: ignore[attr-defined]
-    agent._react_agent.context.record_operator_action.side_effect = (  # type: ignore[attr-defined]
+    agent._react_agent.context.append_user_prompt.side_effect = (  # type: ignore[attr-defined]
         lambda entry: messages.append(ModelRequest(parts=[UserPromptPart(content=entry)]))
     )
 
@@ -125,7 +125,7 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
 
 
 def _recorded_blocks(agent: BaseAgent) -> list[str]:
-    record = agent._react_agent.context.record_operator_action  # type: ignore[attr-defined]
+    record = agent._react_agent.context.append_user_prompt  # type: ignore[attr-defined]
     return [call.args[0] for call in record.call_args_list]
 
 
@@ -186,7 +186,7 @@ class TestNoAgentSideBaselineState:
 
 
 class TestThinDelivery:
-    def test_a_composed_block_is_appended_through_record_operator_action(self) -> None:
+    def test_a_composed_block_is_appended_through_append_user_prompt(self) -> None:
         holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
         agent = _make_agent([_provider("team_roster_state", holder)])
 
@@ -243,7 +243,7 @@ class TestActDeliverySite:
         agent = _make_agent([_provider("team_roster_state", holder)])
 
         order: list[str] = []
-        record = agent._react_agent.context.record_operator_action  # type: ignore[attr-defined]
+        record = agent._react_agent.context.append_user_prompt  # type: ignore[attr-defined]
         record.side_effect = lambda entry: order.append("record")
         agent._react_agent.run_sync.side_effect = (  # type: ignore[attr-defined]
             lambda *a, **k: order.append("run_sync") or "response"
@@ -275,7 +275,7 @@ class TestFirstRunFold:
 
         # The block reaches the model folded into the run's user prompt, by the
         # real ReactAgent fold over the real buffer.
-        folded = ReactAgent._fold_pending_operator_actions(
+        folded = ReactAgent._fold_pending_user_prompts(
             SimpleNamespace(_context=context),  # type: ignore[arg-type]
             "hello",
         )
@@ -344,7 +344,7 @@ class TestOnStartWiring:
         class _CapturingReactAgent:
             def __init__(self, **kwargs: object) -> None:
                 self.context = SimpleNamespace(
-                    record_operator_action=recorded.append, messages=[]
+                    append_user_prompt=recorded.append, messages=[]
                 )
 
             def system_prompt(self, fn: object) -> object:

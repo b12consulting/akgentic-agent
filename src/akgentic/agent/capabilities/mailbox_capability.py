@@ -253,7 +253,7 @@ class MailboxCapability(AbstractCapability[Any]):
     turns an id the model names back into the message's own rendering.
 
     Announced-id tracking is run-local: the instance lives for the agent's
-    lifetime, so ``act()`` resets the set at each run start. A backlog
+    lifetime, so ``before_run`` clears the set at each run start. A backlog
     re-announced next run is acceptable; a leak of announced ids across runs
     is not. The preview whitelist is the opposite — resolved once from the
     card at agent init and constant for the agent's life.
@@ -264,8 +264,23 @@ class MailboxCapability(AbstractCapability[Any]):
         self._announced_ids: set[uuid.UUID] = set()
         self._preview_handlers = preview_handlers
 
-    def reset_run_tracking(self) -> None:
-        """Forget which arrivals this run announced (called at each run start)."""
+    async def before_run(self, ctx: RunContext[Any]) -> None:
+        """Forget which arrivals the previous run announced.
+
+        Announced-id tracking is run-local, and this instance lives for the
+        agent's lifetime — so the set must be cleared once per run. pydantic-ai
+        calls this hook exactly there, which is why the reset is not the agent's
+        job: ``act()`` used to call a public ``reset_run_tracking()`` before
+        ``run_sync``, an obligation invisible from this class and silently
+        droppable by any other caller that starts a run. Here it cannot be
+        skipped, because starting a run *is* what triggers it.
+
+        Observe-only by contract, which is all this needs — it mutates the
+        capability's own state and nothing pydantic-ai owns.
+
+        Args:
+            ctx: The run context. Unused: the reset is unconditional.
+        """
         self._announced_ids.clear()
 
     def offerable_ids(self, pending: list[Message]) -> set[uuid.UUID]:
