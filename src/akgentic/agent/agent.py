@@ -236,25 +236,20 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # Both intrinsic cards are hardcoded in akgentic-agent package; a card
         # already present in config.tools wins over the prepended default.
         tool_cards = list(self.config.tools)
-        if not any(isinstance(t, MailboxTool) for t in tool_cards):
-            tool_cards.insert(0, MailboxTool())
+        mailbox_card = next((t for t in tool_cards if isinstance(t, MailboxTool)), None)
+        if mailbox_card is None:
+            mailbox_card = MailboxTool()
+            tool_cards.insert(0, mailbox_card)
         if not any(isinstance(t, TeamTool) for t in tool_cards):
             tool_cards.insert(0, TeamTool())
 
         # ── The mid-run preview whitelist, read off the mailbox card ──────────
-        # Resolved here because _build_react_agent — which constructs the
-        # capability — runs further down, and the card list is only assembled
-        # above. Read with getattr: the param does not exist on older published
-        # versions of MailboxTool, and an agent pinned to one must keep running
-        # with every handler admitted rather than fail at init.
-        self._mailbox_preview_handlers = next(
-            (
-                getattr(card, "mailbox_preview_handlers", None)
-                for card in tool_cards
-                if isinstance(card, MailboxTool)
-            ),
-            None,
-        )
+        # Kept on the agent because _build_react_agent — which constructs the
+        # capability — runs further down and never sees the card list. Binding
+        # the card above instead of re-scanning here is what makes this a plain
+        # read with no fallback: by this line the card exists either way, the
+        # configured one or the default just inserted.
+        self._mailbox_preview_handlers = mailbox_card.mailbox_preview_handlers
 
         # ── ReactAgent: wraps model, http client, context, usage limits ──────
         # Tools come from ToolFactory (includes TeamTool hire/fire via factory pattern)

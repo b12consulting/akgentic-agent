@@ -317,19 +317,6 @@ class TestMailboxWiring:
 # =============================================================================
 
 
-class _WhitelistedMailboxCard(MailboxTool):
-    """A mailbox card declaring the preview whitelist itself.
-
-    The field is declared here rather than configured on a stock ``MailboxTool``
-    so these specs hold against every published ``akgentic-tool``, including the
-    ones predating it. What is under test is this package's half of the seam —
-    the attribute name ``on_start`` reads, the card filter it reads through, and
-    the argument it hands the capability — never the card's own surface.
-    """
-
-    mailbox_preview_handlers: list[str] | None = None
-
-
 def _wired_capability() -> MailboxCapability:
     """The MailboxCapability on_start handed to the ReactAgent it built."""
     capabilities = _CapturingReactAgent.captured[-1]["capabilities"]
@@ -347,12 +334,17 @@ class TestPreviewWhitelistReachesTheCapability:
     card filter that misses, or a dropped constructor argument would leave all
     of them green while every deployment fell back to admitting every handler —
     the permissive direction, and a silent one.
+
+    These specs configure a stock ``MailboxTool`` on purpose. Reading the field
+    off the real card is what makes them a guard on the seam rather than on this
+    package alone: a rename on the ``akgentic-tool`` side turns them red here,
+    which is the only place the mismatch is visible.
     """
 
     _HANDLER = "akgentic.agent.messages.AgentMessage"
 
     def test_the_cards_whitelist_is_what_the_capability_enforces(self) -> None:
-        card = _WhitelistedMailboxCard(mailbox_preview_handlers=[self._HANDLER])
+        card = MailboxTool(mailbox_preview_handlers=[self._HANDLER])
 
         _start_agent(_agent_config(tools=[card]))
 
@@ -360,14 +352,14 @@ class TestPreviewWhitelistReachesTheCapability:
 
     def test_an_empty_whitelist_survives_the_trip_as_itself(self) -> None:
         """``[]`` admits no handler and is never coerced to ``None`` on the way."""
-        card = _WhitelistedMailboxCard(mailbox_preview_handlers=[])
+        card = MailboxTool(mailbox_preview_handlers=[])
 
         _start_agent(_agent_config(tools=[card]))
 
         assert _wired_capability()._preview_handlers == []
 
     def test_a_card_declaring_no_whitelist_admits_every_handler(self) -> None:
-        """The default, and what a card too old to carry the field resolves to."""
+        """The card's own default, reached through the auto-inserted mailbox card."""
         _start_agent(_agent_config())
 
         assert _wired_capability()._preview_handlers is None
