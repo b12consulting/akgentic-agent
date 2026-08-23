@@ -43,6 +43,7 @@ from akgentic.llm import (
 from akgentic.tool.core import ToolCard, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.event import CommandsAnnouncedEvent
+from akgentic.tool.mailbox import MailboxTool
 from akgentic.tool.planning import GetPlanning, PlanningTool, UpdatePlanning
 from akgentic.tool.team import TeamTool
 from pydantic import BaseModel, ValidationError
@@ -590,7 +591,7 @@ class TestSlashDispatchFallback:
         message.sender = _make_address("@Human")
         agent._dispatch_command(message, _make_address("@Human"))
 
-        record = _react_agent_of(agent).context.record_operator_action
+        record = _react_agent_of(agent).context.append_user_prompt
         record.assert_called_once()
         assert '"/team_members"' in record.call_args[0][0]
 
@@ -604,7 +605,7 @@ class TestSlashDispatchFallback:
 
         assert handled is False
         cast(MagicMock, agent.send).assert_not_called()
-        _react_agent_of(agent).context.record_operator_action.assert_not_called()
+        _react_agent_of(agent).context.append_user_prompt.assert_not_called()
 
     @patch("akgentic.agent.agent.sleep", MagicMock())
     def test_an_unrecognised_slash_message_reaches_the_normal_llm_path(self) -> None:
@@ -653,7 +654,7 @@ class TestSlashDispatchFallback:
 
         assert handled is True
         cast(MagicMock, agent.send).assert_not_called()
-        _react_agent_of(agent).context.record_operator_action.assert_not_called()
+        _react_agent_of(agent).context.append_user_prompt.assert_not_called()
 
 
 class TestHireMemberSnippet:
@@ -866,8 +867,9 @@ class TestExtraCapabilitiesSnippet:
 
     The snippet is only honest if a subclass overriding nothing else really gets
     its capability into the ReactAgent, in that order, without touching
-    ``_build_react_agent``. ``ReactAgent`` is replaced with a recorder so the
-    assembly is observed at the build site the documentation names.
+    ``_assemble_capabilities``. ``ReactAgent`` is replaced with a recorder so the
+    list is observed where it actually reaches the LLM agent, rather than at the
+    assembly call the snippet does not mention.
     """
 
     @staticmethod
@@ -880,7 +882,9 @@ class TestExtraCapabilitiesSnippet:
                 captured.update(kwargs)
 
         monkeypatch.setattr(agent_module, "ReactAgent", _RecordingReactAgent)
-        agent._build_react_agent(MagicMock(), [], [])
+        # The two lines on_start runs, in its order — assemble, then build.
+        agent._capabilities = agent._assemble_capabilities(MailboxTool())
+        agent._build_react_agent(MagicMock(), agent._capabilities, [], [])
         return cast(list[Any], captured["capabilities"])
 
     def test_the_documented_subclass_gets_its_capability_wired(

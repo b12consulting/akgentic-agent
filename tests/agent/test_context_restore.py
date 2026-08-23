@@ -17,7 +17,7 @@ every call, never captured, so a delivery after ``init_state()`` follows the
 state that just arrived rather than the one it replaced.
 
 The agent under test is assembled the way ``test_context_self_healing.py``
-assembles one: no Pykka, a stubbed ``ReactAgent`` whose ``record_operator_action``
+assembles one: no Pykka, a stubbed ``ReactAgent`` whose ``append_user_prompt``
 appends a user-role message to a real history list, and a real ``ContextUpdater``
 so the reconciliation being exercised is the shipped one.
 """
@@ -73,7 +73,7 @@ def _make_agent(providers: list[Callable[[], Any]], history: list[Any]) -> BaseA
     agent: BaseAgent = object.__new__(BaseAgent)
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]
     agent._react_agent.context.messages = history  # type: ignore[attr-defined]
-    agent._react_agent.context.record_operator_action.side_effect = (  # type: ignore[attr-defined]
+    agent._react_agent.context.append_user_prompt.side_effect = (  # type: ignore[attr-defined]
         lambda entry: history.append(ModelRequest(parts=[UserPromptPart(content=entry)]))
     )
 
@@ -92,7 +92,7 @@ def _make_agent(providers: list[Callable[[], Any]], history: list[Any]) -> BaseA
 
 def _delivered_block(agent: BaseAgent) -> str:
     """The single block appended by this turn, or ``""`` when none was."""
-    calls = agent._react_agent.context.record_operator_action.call_args_list  # type: ignore[attr-defined]
+    calls = agent._react_agent.context.append_user_prompt.call_args_list  # type: ignore[attr-defined]
     assert len(calls) <= 1, f"expected at most one block, got {len(calls)}"
     return str(calls[0].args[0]) if calls else ""
 
@@ -209,7 +209,7 @@ class TestStateReplacedMidLife:
         # Held captive: the old slot's seq of 1 would number this one 2.
         blocks = [
             call.args[0]
-            for call in agent._react_agent.context.record_operator_action.call_args_list  # type: ignore[attr-defined]
+            for call in agent._react_agent.context.append_user_prompt.call_args_list  # type: ignore[attr-defined]
         ]
         assert blocks[1] == ("**Context update 1** — current state.\n\n**Team roster:**\n@Manager")
         assert agent.state.tool_state.context_update_seq == 1

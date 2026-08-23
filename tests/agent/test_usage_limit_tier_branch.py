@@ -177,7 +177,7 @@ class TestRunTierConcludes:
         Story 18.1 appended a synthetic entry saying the turn had concluded early.
         The reason handed to the conclusion already carries that fact, and the
         conclusion's own exchange lands in the context like any other turn, so the
-        entry restated what the history already said. ``_record_operator_action``
+        entry restated what the history already said. ``_record_user_action``
         is now reached only from ``_dispatch_command`` — a human's slash command,
         which is a genuinely out-of-band event.
         """
@@ -186,7 +186,7 @@ class TestRunTierConcludes:
 
         agent.receiveMsg_AgentMessage(_make_message(), _make_address(REQUESTER))
 
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
 
     @patch("akgentic.agent.agent.sleep")
     def test_the_reason_prompt_names_the_requester(self, mock_sleep: MagicMock) -> None:
@@ -235,7 +235,7 @@ class TestRunTierFallsThrough:
             agent.receiveMsg_AgentMessage(_make_message(), _make_address(REQUESTER))
 
         agent.send.assert_not_called()  # type: ignore[attr-defined]
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
         agent.notify_human.assert_called_once()  # type: ignore[attr-defined]
 
     @patch("akgentic.agent.agent.sleep")
@@ -254,7 +254,7 @@ class TestRunTierFallsThrough:
         assert "original run breach" in str(excinfo.value)
         assert "lifetime budget spent" not in str(excinfo.value)
         assert "original run breach" in agent.notify_human.call_args[0][0]  # type: ignore[attr-defined]
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
 
     @patch("akgentic.agent.agent.sleep")
     def test_a_second_run_tier_breach_does_not_recurse(self, mock_sleep: MagicMock) -> None:
@@ -293,7 +293,7 @@ class TestRunTierFallsThrough:
         agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
         agent.hire_member.assert_not_called()  # type: ignore[attr-defined]
         agent.send.assert_not_called()  # type: ignore[attr-defined]
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
         agent.notify_human.assert_called_once()  # type: ignore[attr-defined]
 
     @patch("akgentic.agent.agent.sleep")
@@ -311,7 +311,7 @@ class TestRunTierFallsThrough:
 
         assert "original run breach" in str(excinfo.value)
         agent.send.assert_not_called()  # type: ignore[attr-defined]
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
 
 
 # =============================================================================
@@ -333,7 +333,7 @@ class TestTerminalTiers:
             agent.receiveMsg_AgentMessage(_make_message(), _make_address(REQUESTER))
 
         agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
         agent.send.assert_not_called()  # type: ignore[attr-defined]
         notice = agent.notify_human.call_args[0][0]  # type: ignore[attr-defined]
         assert "@TestAgent" in notice

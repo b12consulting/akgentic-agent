@@ -36,12 +36,14 @@ import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.core.messages import CancelMessage, HandledMessage
 from akgentic.llm import ModelConfig, PromptTemplate, ReactAgent, ReactAgentConfig
-from pydantic_ai import AgentCapability
+from akgentic.tool import MailboxTool
+from pydantic_ai import Agent, AgentCapability
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     UserPromptPart,
 )
@@ -238,16 +240,48 @@ class TestArrivalNotice:
         assert growth_content == (render_arrival_notice([second], {second.id}),)
         assert growth_priority == "asap"
 
-    async def test_reset_run_tracking_forgets_the_announced_backlog(self) -> None:
+    async def test_before_run_forgets_the_announced_backlog(self) -> None:
+        """The run-start hook is what clears the set — no caller has to remember."""
         arrived = _pending_message()
         capability = MailboxCapability(observer=_MailboxDouble([arrived]))
         ctx = _CtxDouble()
 
         await capability.before_model_request(ctx, _context())
-        capability.reset_run_tracking()
+        await capability.before_run(ctx)
         await capability.before_model_request(ctx, _context())
 
         assert len(ctx.enqueue_calls) == 2  # the backlog re-announced after reset
+
+    async def test_without_before_run_the_backlog_stays_announced(self) -> None:
+        """The complement: nothing else clears the set, so the hook is load-bearing."""
+        arrived = _pending_message()
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        ctx = _CtxDouble()
+
+        await capability.before_model_request(ctx, _context())
+        await capability.before_model_request(ctx, _context())
+
+        assert len(ctx.enqueue_calls) == 1
+
+    async def test_a_real_run_calls_before_run(self) -> None:
+        """pydantic-ai drives the hook — the two specs above only prove it works.
+
+        Calling ``before_run`` by hand says nothing about whether anything ever
+        calls it, and that gap is the entire risk of moving the reset off
+        ``act()``: a hook the framework does not recognise fails silently and
+        permanently, leaking announced ids across every run for the agent's life
+        with no error anywhere. So this drives a real ``Agent.run`` and asserts
+        the set came back empty.
+        """
+        capability = MailboxCapability(observer=_MailboxDouble([]))
+        capability._announced_ids.add(uuid.uuid4())
+
+        def _reply(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            return ModelResponse(parts=[TextPart(content="done")])
+
+        await Agent(FunctionModel(_reply), capabilities=[capability]).run("anything")
+
+        assert capability._announced_ids == set()
 
     async def test_no_growth_enqueues_nothing(self) -> None:
         arrived = _pending_message()
@@ -285,7 +319,7 @@ class _InterruptibleReactAgent:
         self.kwargs = kwargs
         _InterruptibleReactAgent.captured.append(kwargs)
         self.context = SimpleNamespace(
-            record_operator_action=_InterruptibleReactAgent.recorded_blocks.append, messages=[]
+            append_user_prompt=_InterruptibleReactAgent.recorded_blocks.append, messages=[]
         )
 
     def system_prompt(self, fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -444,7 +478,34 @@ class TestCapabilityWiring:
         agent: BaseAgent = object.__new__(BaseAgent)
         assert agent.extra_capabilities() == []
 
-    def test_real_branch_builds_and_stores_the_capability(
+    def test_assembly_is_mailbox_first_then_the_subclass(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Order is mailbox-first: the cancel check precedes any custom work.
+
+        Asserted at ``_assemble_capabilities``, which is where the order is
+        decided. ``_build_react_agent`` only forwards what it is handed, so
+        asserting order there would pin the wrong method.
+        """
+        extra = _RecordingCapability()
+        monkeypatch.setattr(_AgentWithOneExtra, "extra", extra)
+        agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
+
+        capabilities = agent._assemble_capabilities(MailboxTool())
+
+        assert capabilities == [agent._mailbox_capability, extra]
+        assert isinstance(agent._mailbox_capability, MailboxCapability)
+
+    def test_assembly_reads_the_whitelist_off_the_card_it_is_given(self) -> None:
+        """The card is the argument, so the builder never has to know about cards."""
+        agent: BaseAgent = object.__new__(BaseAgent)
+        handler = "akgentic.agent.messages.AgentMessage"
+
+        agent._assemble_capabilities(MailboxTool(mailbox_preview_handlers=[handler]))
+
+        assert agent._mailbox_capability._preview_handlers == [handler]
+
+    def test_real_branch_forwards_a_copy_of_the_list_it_is_given(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delenv("AKGENTIC_MOCK_SCENARIO", raising=False)
@@ -456,21 +517,18 @@ class TestCapabilityWiring:
 
         monkeypatch.setattr(agent_module, "ReactAgent", _FakeReactAgent)
         agent: BaseAgent = object.__new__(BaseAgent)
+        given: list[AgentCapability[Any]] = [_RecordingCapability()]
 
-        agent._build_react_agent(ReactAgentConfig(), [], [])
+        agent._build_react_agent(ReactAgentConfig(), given, [], [])
 
         capabilities = captured["capabilities"]
-        # A copy, not the agent's own list: pydantic-ai injects its
+        # A copy, not the caller's own list: pydantic-ai injects its
         # auto-capabilities into whatever it is handed, and only its own
-        # (undocumented) copy keeps that off ``_capabilities`` today.
-        assert capabilities == agent._capabilities
-        assert capabilities is not agent._capabilities
-        assert isinstance(capabilities, list)
-        assert len(capabilities) == 1
-        assert capabilities[0] is agent._mailbox_capability
-        assert isinstance(agent._mailbox_capability, MailboxCapability)
+        # (undocumented) copy keeps that off the agent's list today.
+        assert capabilities == given
+        assert capabilities is not given
 
-    def test_mock_branch_receives_the_same_capability(
+    def test_mock_branch_forwards_a_copy_of_the_list_it_is_given(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("AKGENTIC_MOCK_SCENARIO", "/tmp/sandpile-research.yaml")
@@ -484,68 +542,14 @@ class TestCapabilityWiring:
         fake_loadtest.MockReactAgent = _FakeMockReactAgent  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "akgentic.llm.loadtest", fake_loadtest)
         agent: BaseAgent = object.__new__(BaseAgent)
+        given: list[AgentCapability[Any]] = [_RecordingCapability()]
 
-        agent._build_react_agent(ReactAgentConfig(), [], [])
+        agent._build_react_agent(ReactAgentConfig(), given, [], [])
 
         capabilities = captured["capabilities"]
         # A copy here too — drop-in parity extends to the copy.
-        assert capabilities == agent._capabilities
-        assert capabilities is not agent._capabilities
-        assert isinstance(capabilities, list)
-        assert len(capabilities) == 1
-        assert capabilities[0] is agent._mailbox_capability
-
-    def test_real_branch_puts_the_mailbox_capability_before_the_extra(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Order is mailbox-first: the cancel check precedes any custom work."""
-        monkeypatch.delenv("AKGENTIC_MOCK_SCENARIO", raising=False)
-        captured: dict[str, object] = {}
-
-        class _FakeReactAgent:
-            def __init__(self, **kwargs: object) -> None:
-                captured.update(kwargs)
-
-        monkeypatch.setattr(agent_module, "ReactAgent", _FakeReactAgent)
-        extra = _RecordingCapability()
-        monkeypatch.setattr(_AgentWithOneExtra, "extra", extra)
-        agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
-
-        agent._build_react_agent(ReactAgentConfig(), [], [])
-
-        assert captured["capabilities"] == [agent._mailbox_capability, extra]
-
-    def test_mock_branch_puts_the_mailbox_capability_before_the_extra(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The same order in the load-test branch — drop-in parity."""
-        monkeypatch.setenv("AKGENTIC_MOCK_SCENARIO", "/tmp/sandpile-research.yaml")
-        captured: dict[str, object] = {}
-
-        class _FakeMockReactAgent:
-            def __init__(self, **kwargs: object) -> None:
-                captured.update(kwargs)
-
-        fake_loadtest = types.ModuleType("akgentic.llm.loadtest")
-        fake_loadtest.MockReactAgent = _FakeMockReactAgent  # type: ignore[attr-defined]
-        monkeypatch.setitem(sys.modules, "akgentic.llm.loadtest", fake_loadtest)
-        extra = _RecordingCapability()
-        monkeypatch.setattr(_AgentWithOneExtra, "extra", extra)
-        agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
-
-        agent._build_react_agent(ReactAgentConfig(), [], [])
-
-        assert captured["capabilities"] == [agent._mailbox_capability, extra]
-
-    def test_act_resets_the_run_local_tracking_at_run_start(self) -> None:
-        with _running_agent() as (system, agent_addr, _):
-            capability = _InterruptibleReactAgent.captured[-1]["capabilities"][0]
-            capability._announced_ids.add(uuid.uuid4())
-
-            system.tell(agent_addr, AgentMessage(content="hello", type="request"))
-
-            assert _wait_until(lambda: _InterruptibleReactAgent.run_calls >= 1)
-            assert _wait_until(lambda: capability._announced_ids == set())
+        assert capabilities == given
+        assert capabilities is not given
 
 
 # =============================================================================
@@ -911,8 +915,8 @@ def _make_extension_point_agent() -> _AgentWithOneExtra:
     """An ``_AgentWithOneExtra`` assembled far enough to survive one real run.
 
     Same ``object.__new__`` shape as ``_make_cardless_agent``, but the
-    capability list is **not** set by hand: ``_build_react_agent`` assembles it,
-    which is the whole point — the spec must exercise the framework's own
+    capability list is **not** written by hand: ``_assemble_capabilities`` builds
+    it, which is the whole point — the spec must exercise the framework's own
     assembly, not a list the test wrote.
     """
     agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
@@ -954,10 +958,12 @@ class TestExtraCapabilityFires:
         monkeypatch.setattr(_AgentWithOneExtra, "extra", extra)
 
         agent = _make_extension_point_agent()
+        agent._capabilities = agent._assemble_capabilities(MailboxTool())
         react_agent = agent._build_react_agent(
             ReactAgentConfig(
                 model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
             ),
+            agent._capabilities,
             [],
             [],
         )

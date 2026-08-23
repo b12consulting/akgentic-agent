@@ -786,7 +786,7 @@ class TestDispatchCommandHelper:
 
         assert handled is True
         agent.send.assert_not_called()
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
 
     @patch("akgentic.agent.agent.sleep")
     def test_none_result_does_not_fall_through_to_the_llm(self, mock_sleep: MagicMock) -> None:
@@ -807,7 +807,7 @@ class TestDispatchCommandHelper:
 
         act.assert_not_called()
         agent.send.assert_not_called()
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
 
     def test_unknown_token_is_unchanged_by_the_none_contract(self) -> None:
         """CommandNotRecognized still means *not handled*, not *handled silently*."""
@@ -821,7 +821,7 @@ class TestDispatchCommandHelper:
 
         assert handled is False
         agent.send.assert_not_called()
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
 
 
 # =============================================================================
@@ -834,8 +834,8 @@ class TestOperatorActionInjection:
 
     The agent no longer owns the buffer-vs-append decision or pydantic-ai's
     first-run injection rule — ``_dispatch_command`` builds the canonical entry
-    string and hands it to ``_record_operator_action``, which forwards it to
-    ``context.record_operator_action``. The buffering itself is owned and
+    string and hands it to ``_record_user_action``, which forwards it to
+    ``context.append_user_prompt``. The buffering itself is owned and
     unit-tested in ``akgentic-llm``.
 
     A slash command is now the *only* thing that writes such an entry: the
@@ -852,10 +852,10 @@ class TestOperatorActionInjection:
         """
         agent = _make_minimal_agent()
 
-        agent._record_operator_action("[Operator action] anything at all")
+        agent._record_user_action("**User action** - anything at all")
 
-        agent._react_agent.context.record_operator_action.assert_called_once_with(  # type: ignore[attr-defined]
-            "[Operator action] anything at all"
+        agent._react_agent.context.append_user_prompt.assert_called_once_with(  # type: ignore[attr-defined]
+            "**User action** - anything at all"
         )
 
     def test_entry_is_human_subject_never_agent_first_person(self) -> None:
@@ -868,7 +868,7 @@ class TestOperatorActionInjection:
 
         agent._dispatch_command(message, _make_mock_sender("@Human"))
 
-        entry = agent._react_agent.context.record_operator_action.call_args[0][0]  # type: ignore[attr-defined]
+        entry = agent._react_agent.context.append_user_prompt.call_args[0][0]  # type: ignore[attr-defined]
         assert "The human ran" in entry
         assert "I ran" not in entry
         assert "I hired" not in entry
@@ -885,8 +885,8 @@ class TestOperatorActionInjection:
         handled = agent._dispatch_command(message, _make_mock_sender("@Human"))
 
         assert handled is True
-        agent._react_agent.context.record_operator_action.assert_called_once_with(  # type: ignore[attr-defined]
-            '[Operator action] The human ran "/hire Developer". \nResult:\nhired @Developer42'
+        agent._react_agent.context.append_user_prompt.assert_called_once_with(  # type: ignore[attr-defined]
+            '**User action** - The human ran "/hire Developer". \nResult:\nhired @Developer42'
         )
         agent.send.assert_called_once()
 
@@ -901,7 +901,7 @@ class TestOperatorActionInjection:
         handled = agent._dispatch_command(message, _make_mock_sender("@Human"))
 
         assert handled is False
-        agent._react_agent.context.record_operator_action.assert_not_called()  # type: ignore[attr-defined]
+        agent._react_agent.context.append_user_prompt.assert_not_called()  # type: ignore[attr-defined]
         agent.send.assert_not_called()
 
     def test_post_identification_failure_delegates_error_result(self) -> None:
@@ -916,8 +916,8 @@ class TestOperatorActionInjection:
         handled = agent._dispatch_command(message, _make_mock_sender("@Human"))
 
         assert handled is True
-        agent._react_agent.context.record_operator_action.assert_called_once_with(  # type: ignore[attr-defined]
-            '[Operator action] The human ran "/hire". \nResult:\nusage: /hire <role>'
+        agent._react_agent.context.append_user_prompt.assert_called_once_with(  # type: ignore[attr-defined]
+            '**User action** - The human ran "/hire". \nResult:\nusage: /hire <role>'
         )
         agent.send.assert_called_once()  # exactly one send to sender
 

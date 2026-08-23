@@ -184,21 +184,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       intact resumes delta delivery instead of re-snapshotting.
     - This class holds no baseline state of its own and composes no block text.
       It owns only the delivery: _deliver_context_update() at the top of act(),
-      appending through record_operator_action.
+      appending through append_user_prompt.
 
     Internal method (used by _route_output()):
     - hire_member(role) → ActorAddress. A failed hire raises ModelRetry; see
       hire_member() for where that retry is, and is not, honoured.
-    """
-
-    _mailbox_preview_handlers: list[str] | None = None
-    """Handler classes whose runs may be offered a mid-run mailbox read.
-
-    Resolved from the ``MailboxTool`` card in ``on_start``. The class-level
-    ``None`` is the meaningful default rather than a placeholder: no whitelist
-    means every handler is admitted, which is what an agent carrying no mailbox
-    card — or one built without ``on_start``, as the wiring specs do — must fall
-    back to.
     """
 
     def on_start(self) -> None:
@@ -242,14 +232,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             tool_cards.insert(0, mailbox_card)
         if not any(isinstance(t, TeamTool) for t in tool_cards):
             tool_cards.insert(0, TeamTool())
-
-        # ── The mid-run preview whitelist, read off the mailbox card ──────────
-        # Kept on the agent because _build_react_agent — which constructs the
-        # capability — runs further down and never sees the card list. Binding
-        # the card above instead of re-scanning here is what makes this a plain
-        # read with no fallback: by this line the card exists either way, the
-        # configured one or the default just inserted.
-        self._mailbox_preview_handlers = mailbox_card.mailbox_preview_handlers
 
         # ── ReactAgent: wraps model, http client, context, usage limits ──────
         # Tools come from ToolFactory (includes TeamTool hire/fire via factory pattern)
@@ -295,7 +277,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # akgentic-tool, which owns the semantics it encodes.
         self._context_updater: ContextUpdater = tool_factory.get_context_updater()
 
-        self._react_agent = self._build_react_agent(react_agent_config, tools, toolsets)
+        self._capabilities = self._assemble_capabilities(mailbox_card)
+
+        self._react_agent = self._build_react_agent(
+            react_agent_config, self._capabilities, tools, toolsets
+        )
 
         # ── Dynamic system prompts ────────────────────────────────────────────
         # ReactAgent registers none of its own: its system_prompt is a bare
@@ -344,10 +330,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
           is registration order, so a run that is about to be cancelled does not
           first pay for a third party's ``before_model_request``.
 
-        Called from ``_build_react_agent``, which runs during ``on_start``
-        before ``self._react_agent`` exists. ``self.config`` is assigned before
-        ``on_start`` and is safe to read; an override must not touch the
-        ReactAgent, and must not assume anything built later in ``on_start``.
+        Called from ``on_start``, before ``self._react_agent`` exists.
+        ``self.config`` is assigned before ``on_start`` and is safe to read; an
+        override must not touch the ReactAgent, and must not assume anything
+        built later in ``on_start``.
 
         Returns:
             Capabilities to append after the framework's own. Both an
@@ -356,8 +342,39 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """
         return []
 
+    def _assemble_capabilities(self, mailbox_card: MailboxTool) -> list[AgentCapability[Any]]:
+        """Build the run's capability stack: the framework's own, then the subclass's.
+
+        Separate from ``_build_react_agent`` because the two need different
+        things. This needs the ``MailboxTool`` card, to read the preview
+        whitelist off it; the builder needs only the finished list. Keeping them
+        apart is what lets the builder be a pure function of its arguments.
+
+        The mailbox capability is held on ``self`` as well as returned:
+        ``after_tool_execute`` and the cancel check must share one instance for
+        the agent's life, and ``act()``'s interruption handling looks it up by
+        name.
+
+        Args:
+            mailbox_card: The card the whitelist is read from — either the one
+                the config supplied or the auto-inserted default.
+
+        Returns:
+            ``[mailbox, *extra_capabilities()]``. Mailbox first because hook
+            order is registration order, so a run about to be cancelled does not
+            first pay for a third party's ``before_model_request``.
+        """
+        self._mailbox_capability = MailboxCapability(
+            observer=self, preview_handlers=mailbox_card.mailbox_preview_handlers
+        )
+        return [self._mailbox_capability, *self.extra_capabilities()]
+
     def _build_react_agent(
-        self, config: ReactAgentConfig, tools: list[Any], toolsets: list[Any]
+        self,
+        config: ReactAgentConfig,
+        capabilities: list[AgentCapability[Any]],
+        tools: list[Any],
+        toolsets: list[Any],
     ) -> ReactAgent:
         """Build the LLM agent for this BaseAgent.
 
@@ -366,35 +383,34 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         real ``ReactAgent``. The deferred import keeps the optional ``loadtest``
         extra off the normal runtime path.
 
-        Both branches receive the same list, ``self._capabilities``: the
-        framework's own ``MailboxCapability`` built here first, then whatever
-        ``extra_capabilities()`` contributes. The framework's own is built
-        unconditionally, on the agent and never on a card, so cancellation works
-        even when the config carries no ``MailboxTool`` (ADR-040 §5), and it is
-        first because hook order is registration order — a run about to be
-        cancelled should not first pay for a third party's
+        Both branches receive the same ``capabilities`` list, assembled by
+        ``on_start`` as ``[mailbox, *extra_capabilities()]``. It arrives as an
+        argument rather than being built here so this method only *builds*: the
+        mailbox capability needs the tool-card list to read its whitelist from,
+        and that list is on_start's, not this method's. The framework's own
+        capability is built unconditionally, on the agent and never on a card,
+        so cancellation works even when the config carries no ``MailboxTool``
+        (ADR-040 §5), and it is first because hook order is registration order —
+        a run about to be cancelled should not first pay for a third party's
         ``before_model_request``. The mock accepts and ignores
         ``capabilities=``; drop-in parity keeps this wiring identical.
 
         Each branch is handed a **copy** of that list. pydantic-ai happens to
         copy before injecting its own auto-capabilities today, but that is
-        undocumented upstream behaviour; copying here makes ``_capabilities``
+        undocumented upstream behaviour; copying here makes the caller's list
         an agent-side guarantee rather than an assumption to re-verify on every
         bump.
-        """
-        # Enforcement is agent-owned: held on self so act() can reset the
-        # run-local announced-id tracking at each run start.
-        self._mailbox_capability = MailboxCapability(
-            observer=self, preview_handlers=self._mailbox_preview_handlers
-        )
-        # The annotation is required: without it the list infers as
-        # list[MailboxCapability] from its first element and the splat below
-        # does not fit.
-        self._capabilities: list[AgentCapability[Any]] = [
-            self._mailbox_capability,
-            *self.extra_capabilities(),
-        ]
 
+        Args:
+            config: The ReactAgent configuration to build against.
+            capabilities: ``[mailbox, *extra_capabilities()]``, in hook order.
+            tools: Plain tool callables from the ToolFactory.
+            toolsets: Toolsets from the ToolFactory.
+
+        Returns:
+            The built ``ReactAgent``, or a ``MockReactAgent`` under
+            ``AKGENTIC_MOCK_SCENARIO``.
+        """
         # Env var name mirrors akgentic.llm.loadtest.SCENARIO_ENV_VAR.
         scenario = os.environ.get("AKGENTIC_MOCK_SCENARIO")
         if scenario:
@@ -413,7 +429,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                     tools=tools,
                     toolsets=toolsets,
                     observer=self,
-                    capabilities=list(self._capabilities),
+                    capabilities=list(capabilities),
                 ),
             )
         return ReactAgent(
@@ -422,7 +438,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             tools=tools,
             toolsets=toolsets,
             observer=self,
-            capabilities=list(self._capabilities),
+            capabilities=list(capabilities),
         )
 
     def init_llm_context(self, context: list[EventMessage]) -> None:
@@ -532,12 +548,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 this method neither notifies anyone nor wraps them, and it does
                 not tell the tiers apart — the decorator does all of it.
         """
-        # Run start: the mailbox capability's announced-id tracking is run-local
-        # by contract, and the instance lives for the agent's lifetime — reset
-        # here, before run_sync, so no cross-run state survives. The framework's
-        # own capability is reset by name; there is no per-capability lifecycle
-        # protocol and self._capabilities is not iterated here.
-        self._mailbox_capability.reset_run_tracking()
         self._deliver_context_update()
         rendered_message = message.render_for_llm()
         prompt = self._build_prompt_expanding_media_refs(rendered_message)
@@ -567,7 +577,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         What the agent still owns is the whole of this method: the *when* —
         this is the single delivery site, called at the top of ``act()`` before
         ``run_sync`` — and the *how* — the append goes through
-        ``ContextManager.record_operator_action``, never a bare
+        ``ContextManager.append_user_prompt``, never a bare
         ``ModelRequest``, so the buffer-vs-append decision stays with the
         context and a fresh agent's first block is folded into the first run's
         user prompt instead of suppressing system-prompt injection.
@@ -581,7 +591,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """
         block = self._context_updater.compose_update(self._react_agent.context.messages)
         if block is not None:
-            self._react_agent.context.record_operator_action(block)
+            self._react_agent.context.append_user_prompt(block)
 
     def _build_prompt_expanding_media_refs(self, rendered: str) -> UserPrompt:
         """Build the run's ``UserPrompt``, expanding any ``!!glob`` media references.
@@ -754,9 +764,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         ``dispatch`` and returned as a result string — handled here exactly like
         a success, never falling back to the LLM.
 
-        The operator-action entry is synthetic and human-attributed: it is
-        composed here and appended to the ReactAgent context via
-        :meth:`_record_operator_action`, so the agent reasons about the human's
+        The entry is synthetic and human-attributed: it is composed here and
+        appended to the ReactAgent context via
+        :meth:`_record_user_action`, so the agent reasons about the human's
         action (and its result) on its next turn without mistaking it for its
         own tool call.
 
@@ -786,12 +796,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             AgentMessage(content=result, type="notification", recipient=sender),
         )
 
-        self._record_operator_action(
-            f'[Operator action] The human ran "{message.content}". \nResult:\n{result}'
+        self._record_user_action(
+            f'**User action** - The human ran "{message.content}". \nResult:\n{result}'
         )
         return True
 
-    def _record_operator_action(self, entry: str) -> None:
+    def _record_user_action(self, entry: str) -> None:
         """Hand one out-of-band, user-role entry to the LLM ContextManager.
 
         One of two points where this class writes non-agent content into its own
@@ -804,7 +814,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Args:
             entry: The pre-composed entry text.
         """
-        self._react_agent.context.record_operator_action(entry)
+        self._react_agent.context.append_user_prompt(entry)
 
     def notify_human(self, message: str) -> None:
         """Notify the team's user-proxy member; log and return if there is none."""
