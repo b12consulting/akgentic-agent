@@ -38,11 +38,11 @@ Human
   ▼
 HumanProxy ──send()──► BaseAgent (Manager)
                              │
-                    receiveMsg_AgentMessage()   ← @guard_usage_limits(...)
+                    receiveMsg_AgentMessage()   ← no decorator; just the work
                              │  hands the message over unchanged — it composes
                              │  no prompt of its own
                              │
-                    act(message, StructuredOutput)
+                    act(message, StructuredOutput)   ← @guard_usage_limits()
                       │
                       ├─ append **Context update N** block (if shared state changed)
                       ├─ message.render_for_llm() — the message frames itself:
@@ -289,44 +289,48 @@ return (
 )
 ```
 
-`_route_output()` returns **whether anything was actually delivered**. That is what lets the
-usage-limit guard tell a real conclusion from one that resolved no recipient and sent
-nothing — it cannot inspect the output itself, since the schema belongs to the caller.
+`_route_output()` returns **whether anything was actually delivered**. Nothing reads that bool
+today — the guard that used to is retired — but it is what a caller would need to tell a real
+answer from one that resolved no recipient and sent nothing.
 
-A usage-limit breach is handled by **tier**, by the `@guard_usage_limits` decorator on the
-handler rather than by any code inside it. A run-tier breach — this turn ran out of its own
-budget — first gets one tool-free conclusion attempt, whose answer is delivered through this
-same `_route_output()` path, which is why a concluded answer is routed exactly like any other
-message. An agent-tier breach (the agent's lifetime budget is spent), or a conclusion attempt
-that produces no answer, escalates via `notify_human()` to the team's user-proxy member —
-found structurally through `ActorAddress.is_user_proxy`, so any role string works; when the
-team has none, the notice is logged and dropped. See
+A usage-limit breach escalates: `notify_human()` to the team's user-proxy member — found
+structurally through `ActorAddress.is_user_proxy`, so any role string works; when the team has
+none, the notice is logged and dropped — then `WarningError`. **Both tiers, identically**, and
+from the `@guard_usage_limits()` decorator on `act()` rather than from any handler.
+
+A run-tier breach that reaches that point has already had its second chance: `akgentic-llm`
+concludes a breached turn itself, and the conclusion returns through `act()` as an ordinary
+`StructuredOutput` that routes through this same `_route_output()`. There is nothing left for
+this package to attempt, and nothing to tell the tiers apart *for*. See
 [What happens when a limit is hit](#what-happens-when-a-limit-is-hit) and
 [Writing a second agent class](#writing-a-second-agent-class).
 
 ### Writing a second agent class
 
 `BaseAgent` handles one message type against one schema. A subclass that wants its own — its
-own structured output, its own `receiveMsg_*` — needs the usage-limit policy too, and must
-**not** copy it. The `except` ordering is load-bearing: `RunUsageLimitError` and
-`AgentUsageLimitError` both subclass `UsageLimitError`, so a base clause placed first catches
-both and the tier branch never runs. A wrong copy still compiles, still passes an ordinary
-test, and simply stops concluding on a run-tier breach.
+own structured output, its own `receiveMsg_*` — **declares nothing at all** for usage limits.
+`@guard_usage_limits()` sits on `BaseAgent.act` and `BaseAgent.compact`, the two methods that
+reach the model, so a subclass inherits the policy by calling `act()` — which is the only way
+it can reach the LLM in the first place.
 
-Two modules exist for exactly this, and neither imports `agent.py` — they are what a *new*
-agent class needs, so a dependency in that direction would make them unusable from the module
-that defines the base class. What each needs from an agent is stated as a `Protocol`:
+That placement is the point. While the decorator was on the handlers it was a caller
+obligation: invisible from `usage_limits.py`, and silently dropped by the one handler that
+forgot it. Now it cannot be skipped, because *making the LLM call* is what triggers it. (The
+one way to lose it is to override `act()` outright instead of calling `super().act()`.)
+
+Two modules exist for what a subclass *does* need, and neither imports `agent.py` — they are
+what a *new* agent class needs, so a dependency in that direction would make them unusable
+from the module that defines the base class. What each needs from an agent is stated as a
+`Protocol`:
 
 | module | holds |
 |---|---|
-| `usage_limits.py` | `AgentLike`, `guard_usage_limits`, `escalate_usage_limit`, `try_conclude_without_tools` |
+| `usage_limits.py` | `AgentLike`, `guard_usage_limits`, `escalate_usage_limit` |
 | `utils.py` | `TeamResolver`, `resolve_recipient` — the team addressing convention (`@member` vs role to hire) |
 
-Apply the decorator to every `receiveMsg_*` that can reach the LLM, handing it *your* schema
-and *your* router:
+So the subclass is only its own work:
 
 ```python
-from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 
 
@@ -345,7 +349,6 @@ class CustomAgent(BaseAgent):
             delivered = True
         return delivered
 
-    @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
         output = self.act(message, TriageOutput)
         self._route_triage(output)
@@ -353,24 +356,25 @@ class CustomAgent(BaseAgent):
 
 Four things follow, and they are the whole point:
 
-- **The handler carries no usage-limit handling of its own.** The tier policy is entirely the
-  decorator's; the body reads as just the work.
-- **A run-tier breach concludes in `TriageOutput`**, delivered by `_route_triage` — because
-  the schema and the routing are decorator *arguments*, not overrides. `CustomAgent` overrides
-  nothing.
-- **The router returns `bool`.** The guard is handed a schema it cannot inspect — `TriageOutput`
-  has no `.messages` — so "did anything actually go out?" is the router's answer to give, and
-  it is what separates a real conclusion from one that routed nothing.
-- **The handler carries no `except` at all — not even for cancellation.** The cancel
-  capability is unconditional on every `BaseAgent` subclass, so every run is interruptible,
-  but the interruption never reaches the handler: `act()` absorbs `RunInterruptedError`
-  itself, notifies the human once, and returns a default `TriageOutput()`. `_route_triage`
-  then delivers nothing and the handler returns normally (see
+- **The handler is undecorated, and carries no usage-limit handling.** The policy arrives with
+  the `act()` call; the body reads as just the work.
+- **A breached turn still concludes in `TriageOutput`** — because `akgentic-llm` reuses the
+  `output_type` this body already passes to `act()`. The subclass declares no schema for the
+  conclusion because it already declared one for the turn.
+- **A concluded turn is indistinguishable from an ordinary one.** It comes back from `act()`
+  as a `TriageOutput` and goes through `_route_triage` like anything else. Nothing branches.
+- **The handler carries no `except` at all — not for cancellation, not for budget.** The
+  cancel capability is unconditional on every `BaseAgent` subclass, so every run is
+  interruptible, but the interruption never reaches the handler: `act()` absorbs
+  `RunInterruptedError` itself, notifies the human once, and returns a default
+  `TriageOutput()`. A usage breach is absorbed in the same place, by the guard (see
   [Run Cancellation](#run-cancellation)).
 
-`_route_triage` is defined **before** the handler: the decorator names it as an argument, which
-is evaluated while the class body runs. The requester is lifted off the handler's own message
-argument, so nothing is threaded through the signature.
+**Known gap.** A conclusion that hands off to nobody is silent: an ordinary success that routes
+nothing and notifies no one. `akgentic-llm` cannot see it (`TriageOutput` has no `.messages`,
+and it receives the output as `Any`) and the guard never sees the output at all. Tracked as
+ADR-021 §Q2, and pinned by
+`test_custom_agent.py::TestCustomAgentUsageBreach::test_a_triage_with_no_handoffs_is_silent`.
 
 The runnable version is `src/akgentic/agent/custom_agent.py`.
 
@@ -561,33 +565,31 @@ three classes are `akgentic-llm`'s.
 
 ##### What happens when a limit is hit
 
-The `@guard_usage_limits` decorator reacts differently to each tier, on behalf of whichever
-handler carries it. The exception class decides; the message text is never parsed.
+**Every usage-limit error that reaches this package produces the same thing: the human is
+notified and the turn ends.** The `@guard_usage_limits()` decorator on `act()` catches the
+**base** `UsageLimitError`, so both tiers — and any tier added later — take that one path.
 
-| tier | class raised | reaction | human notified? |
-|---|---|---|---|
-| run | `RunUsageLimitError` | one **tool-free conclusion** attempt — the agent is asked to answer the requester with what it has already gathered, delivered through the ordinary routing path | no, when the attempt produces an answer |
-| agent | `AgentUsageLimitError` | terminal and unchanged: `notify_human()`, then `WarningError` | yes |
+That is not the whole story of a breached turn, though: most run-tier breaches never reach this
+package at all.
 
-A run-tier breach means *this turn* ran out of requests, tool calls or tokens. The agent
-itself usually still has lifetime budget, and by that point usually has most of what it was
-asked for: it can no longer call a tool, but it can still answer — so it is asked to, once.
-The prompt for that final call tells the model it has no tools left, to answer the named
-requester now, and to **state explicitly which parts it could not check or finish**. An
-answer produced this way is expected to be incomplete and to say so; read it as a partial
-result, not a finished one. Nothing extra is written to the agent's own context: the
-conclusion's own exchange lands in the history like any other turn, and the prompt above
-already says the turn was cut short.
+| where | what happens |
+|---|---|
+| `akgentic-llm`, run-tier breach | `LimitRecoveryCapability` decides whether the turn degrades, and by default drives one **tool-free conclusion** through the `output_type` this agent already asked for |
+| conclusion succeeds | returns through `act()` as an ordinary output, routes through the normal path — **nothing here notices, and no human is told** |
+| conclusion declined or failed | `akgentic-llm` re-raises the **ORIGINAL** breach as `RunUsageLimitError` → notify, `WarningError` |
+| `akgentic-llm`, agent-tier breach | raised pre-flight as `AgentUsageLimitError`, terminal → notify, `WarningError` |
 
-That attempt is exactly one attempt, and it can fail. It is skipped altogether when the
-incoming message carried no sender — there is nobody to answer — and it falls through to the
-escalation above when the call raises (including on a second breach) or returns no message at
-all. In each of those cases the human is notified and `WarningError` is raised, reporting the
-**original** run-tier breach rather than any secondary failure. So a run-tier breach
-*attempts* a conclusion; it does not guarantee a reply — a `@recipient` the model names but
-the team does not have is skipped at routing time, as always, and an answer addressed that way
-still counts as a conclusion, so no one is notified about it either. **The human is therefore
-notified only when the lifetime budget is spent, or when the conclusion attempt failed.**
+A run-tier breach means *this turn* ran out of requests, tool calls or tokens. The agent itself
+usually still has lifetime budget, and by that point usually has most of what it was asked for:
+it can no longer call a tool, but it can still answer — so `akgentic-llm` asks it to, once. The
+prompt for that final call tells the model to answer now and to **state explicitly which parts
+it could not check or finish**. An answer produced this way is expected to be incomplete and to
+say so; read it as a partial result, not a finished one.
+
+An agent-tier breach means the *lifetime* budget is spent — the budget that would pay for a
+closing call is exactly what ran out — so there is no conclusion to attempt. That is terminal
+by construction rather than by policy, which is a known limitation (ADR-021 §Q1): an exhausted
+agent stops mid-conversation with no final word.
 
 There is no retry counter, and none is needed *where a lifetime budget is set*: the agent tier
 is consumed before every call, the conclusion call included, so an agent that keeps breaching
@@ -596,13 +598,20 @@ budget behind it — the default `AgentUsageLimits()` is all-`None` and never bl
 left on the defaults breaches, concludes and breaches again with nothing to stop it and no one
 told. Set `agent_usage_limits` if you want that backstop.
 
-**Who owns what.** `UsageLimitError`, `RunUsageLimitError`, `AgentUsageLimitError` and the
-conclusion mechanism (`ReactAgent.conclude_without_tools()` and its `_sync` bridge) belong to
-**`akgentic-llm`** — this package imports them and never redefines them. *Which tier gets
-which reaction*, the fall-through cases and the routing of the answer belong to
-**`akgentic-agent`**, in `usage_limits.py` — not in any agent class. Change enforcement in
-`akgentic-llm`; change policy there. To apply that policy to a handler of your own, see
-[Writing a second agent class](#writing-a-second-agent-class).
+**Known gap: a conclusion that succeeds emptily is silent.** A `StructuredOutput` with no
+requests is an ordinary success — nothing raises, nothing is routed, nobody is notified.
+`akgentic-llm` cannot judge it (it sees the output as `Any`) and the guard never sees the output
+at all. Tracked as ADR-021 §Q2; today's behaviour is pinned by
+`test_usage_limit_handling.py::TestARescuedTurnIsIndistinguishable::test_a_conclusion_that_routes_nothing_is_silent`
+so the day it changes is visible in the diff.
+
+**Who owns what.** `UsageLimitError`, `RunUsageLimitError`, `AgentUsageLimitError`, and the
+whole of degradation — whether a breached turn concludes, with what prompt, and whether the
+result was worth returning — belong to **`akgentic-llm`**. This package imports the classes and
+never redefines them, and it no longer concludes anything. What belongs to **`akgentic-agent`**,
+in `usage_limits.py`, is one response to an error that has already exhausted its options:
+notify, then stop. Change enforcement *and* degradation policy in `akgentic-llm` — the seam for
+the latter is `LimitRecoveryCapability.handle_limit_exceeded`.
 
 ##### Migrating from `usage_limits`
 
@@ -1031,13 +1040,13 @@ never offered and never absorbed.
   uninterruptible from inside. A tool-free single completion has no step boundary at all, so
   it can neither be cancelled nor see mid-run mail — accepted, since that run is ending
   anyway.
-- **A cancel pending during a run-tier-breach conclusion escalates the breach.** When the
-  `@guard_usage_limits` tool-free conclusion is running (see
-  [What happens when a limit is hit](#what-happens-when-a-limit-is-hit)), a pending cancel
-  is caught by `try_conclude_without_tools`'s blanket `except` and **escalates the original
-  breach** rather than reading as an interruption — a safe, known, accepted outcome: the turn
-  ends either way. The cancel is still purged before the raise, whoever ends up catching it,
-  so it does not survive to be dispatched afterwards.
+- **A cancel pending during a run-tier-breach conclusion escalates the breach.** The
+  tool-free conclusion is `akgentic-llm`'s now (see
+  [What happens when a limit is hit](#what-happens-when-a-limit-is-hit)), but the outcome is
+  unchanged: its blanket `except` treats a pending cancel as a failed conclusion and re-raises
+  the **original** breach rather than reading it as an interruption. The guard on `act()` then
+  notifies. A safe, known, accepted outcome — the turn ends either way — and the cancel is
+  still purged before the raise, so it does not survive to be dispatched afterwards.
 
 ## Examples
 
@@ -1154,7 +1163,7 @@ src/akgentic/agent/
     messages.py          # AgentMessage with typed protocol, and the two rendering
                          #   Protocols: LlmRenderable, MailboxPreviewable
     output_models.py     # StructuredOutput, Request, REPLY_PROTOCOLS
-    usage_limits.py      # guard_usage_limits decorator + the tier policy (no agent.py import)
+    usage_limits.py      # guard_usage_limits decorator + escalation (no agent.py import)
     utils.py             # resolve_recipient — the team addressing convention
 examples/                # Runnable examples with README
 tests/                   # Tests organised by module

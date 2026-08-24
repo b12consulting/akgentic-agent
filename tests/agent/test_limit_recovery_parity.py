@@ -1,12 +1,12 @@
 """Parity of ``akgentic-llm``'s ``LimitRecoveryCapability`` against ``@guard_usage_limits``.
 
-Story 24-1 exists so that story 24-2 deletes the decorator on **evidence** rather than on the
-assumption that the replacement is equivalent. Nothing here deletes anything:
-``@guard_usage_limits`` stays mounted on both handlers throughout, and every spec below describes
-the **capability's** behaviour with the decorator still in place. That is what makes them valid
-before and after the removal — with the capability live, the breach no longer escapes
-``ReactAgent.run()``, so the decorator's ``except RunUsageLimitError`` never fires and the
-decorator is inert on the recovered path.
+Story 24-1 exists so that story 24-2 retires the decorator's conclusion helper on **evidence**
+rather than on the assumption that the replacement is equivalent. Nothing here deletes anything:
+every spec below describes the **capability's** behaviour, and describes it in outcomes the
+guard does not participate in. That is what makes them valid before and after — with the
+capability live, the breach no longer escapes ``ReactAgent.run()``, so the guard never fires and
+is inert on the recovered path, wherever it happens to be mounted. It sat on both handlers when
+this file was written; 24-2 moved it onto ``act()`` and these specs did not move with it.
 
 **The breach is real.** The subject of this file is the seam between two packages, so a mocked
 breach would only test the mock. Every spec drives a real ``ReactAgent`` — a real capability
@@ -32,11 +32,12 @@ now rather than what ought to. They are what story 26-2's review found
 naming the requester in the conclusion prompt, refusing a sender-less message, and escalating when
 routing delivers nothing. The third fails **silently**. See the epic's ``## Deferred findings``.
 
-**Two of the three have since been accepted as losses; the third has not.** The silent one is
-being restored rather than dropped — ``akgentic-llm`` grows an ``is_conclusion_usable`` seam that
-``akgentic-agent`` overrides to report structured emptiness, and the human escalation comes back
-through it. So story 24-2 **inverts** that spec instead of deleting it, and cannot land until the
-llm half of that seam has shipped. Detail in the epic's ``## Deferred findings``.
+**All three have since been accepted as losses, the silent one knowingly.** An earlier plan had
+the third restored through an ``is_conclusion_usable`` seam in ``akgentic-llm``, which would have
+gated story 24-2 on an llm release; ADR-021 deferred that seam to its ``§Q2`` and dropped the
+dependency. So the three specs below stand as written — they are the record of what was given up,
+and the equivalent pins for the post-24-2 world live in ``test_usage_limit_handling.py`` and
+``test_custom_agent.py``.
 
 Assertions are **outcomes** — what the requester received, whether a human was notified, whether
 ``WarningError`` escaped — never merely that a mock was called, and never on the decorator's own
@@ -315,10 +316,11 @@ def _message(sender: str | None = REQUESTER) -> AgentMessage:
 def _no_decorator_conclusion(agent: BaseAgent) -> MagicMock:
     """Spy on the DECORATOR's entry point, so a spec can prove it was never taken.
 
-    ``try_conclude_without_tools`` reaches the LLM through
+    ``try_conclude_without_tools`` reached the LLM through
     ``ReactAgent.conclude_without_tools_sync``; the capability's own recovery drives the async
     ``conclude_without_tools`` from inside ``run()`` and never touches the sync bridge. The two
-    paths are therefore distinguishable at this one method.
+    paths were therefore distinguishable at this one method, which is what let this suite prove
+    — while both existed — that the recovery came from the capability.
     """
     spy = MagicMock(side_effect=AssertionError("the decorator's conclusion path must not run"))
     agent._react_agent.conclude_without_tools_sync = spy  # type: ignore[attr-defined, method-assign]
@@ -542,9 +544,10 @@ class TestTheOriginalBreachIsWhatSurfaces:
 class TestTheLapsingBehaviours:
     """What ``try_conclude_without_tools`` did beyond catching the error, and what is left.
 
-    Each of the three is defensible to drop, but dropping one by accident is not the same as
-    deciding to. These specs pin the live behaviour so 24-2 removes the decorator against a
-    written record rather than an assumption. Tracked as ``b12consulting/akgentic-agent#119``.
+    Each of the three was defensible to drop, but dropping one by accident is not the same as
+    deciding to. These specs pinned the live behaviour so 24-2 removed the decorator against a
+    written record rather than an assumption. All three were then accepted as losses — the
+    third, silent one as ADR-021 ``§Q2``. Tracked as ``b12consulting/akgentic-agent#119``.
     """
 
     @patch("akgentic.agent.agent.sleep")

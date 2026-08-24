@@ -1,17 +1,27 @@
 """Direct coverage of the usage-limit policy in ``usage_limits.py``.
 
-The 18.1 tests reach this code only through ``BaseAgent.receiveMsg_AgentMessage``,
-which proves the policy works *for that handler with that schema*. The whole point
-of extracting it is that a new agent class gets it without inheriting anything, so
-everything here is exercised against a fake that satisfies ``AgentLike`` and
-nothing else — no BaseAgent, no actor system, no ReactAgent.
+The policy this package applies is now one sentence — notify the team's human and
+end the turn — for every tier. Degradation belongs to ``akgentic-llm``: by the
+time an error arrives here its ``LimitRecoveryCapability`` has already decided
+whether the turn concludes, and a conclusion that succeeded never raises at all.
 
-The clause ordering inside ``guard_usage_limits`` is the load-bearing part.
-``RunUsageLimitError`` and ``AgentUsageLimitError`` both subclass
-``UsageLimitError``, so a base clause placed first catches both and the tier
-branch never runs — silently, since a wrong order still compiles and an
-agent-tier test still passes. ``TestClauseOrderIsLoadBearing`` below is the test
-that goes red for it; its docstring records the mutation that was run.
+Everything here is exercised against a fake that satisfies ``AgentLike`` and
+nothing else — no BaseAgent, no actor system, no live ReactAgent — because the
+whole point of extracting the policy is that a new agent class gets it without
+inheriting anything.
+
+**The guard wraps the LLM call, not a message handler.** The fake below therefore
+decorates a method shaped like ``BaseAgent.act`` — arguments the policy never
+reads, and a return value it must hand back untouched. Three properties are
+pinned by mutation rather than by assertion:
+
+- **the single ``except`` is on the base class**, so a tier nobody enumerated is
+  still handled (``TestOneClauseCoversEveryTier``);
+- **nothing in this package attempts a conclusion any more**
+  (``TestTheDecoratorNeverReachesTheLlm``);
+- **the wrapper returns the value** — a guard written for a ``None``-returning
+  handler swallows every ordinary turn's output while every escalation test
+  stays green (``test_the_output_of_an_uneventful_call_is_returned``).
 """
 
 import inspect
@@ -24,31 +34,24 @@ from akgentic.core.agent import WarningError
 from akgentic.core.messages import Message
 from akgentic.llm import AgentUsageLimitError, ReactAgent, RunUsageLimitError
 from akgentic.llm import UsageLimitError as LLMUsageLimitError
-from pydantic import BaseModel
 
-from akgentic.agent.usage_limits import (
-    escalate_usage_limit,
-    guard_usage_limits,
-    try_conclude_without_tools,
-)
+from akgentic.agent.usage_limits import escalate_usage_limit, guard_usage_limits
 
 REQUESTER = "@Requester"
+
+
+class _FutureTierError(LLMUsageLimitError):
+    """A usage-limit tier ``usage_limits.py`` has never heard of.
+
+    Nothing in the package refers to this class. It exists so the ``except`` can
+    be proved to be on the base rather than on a list of today's subclasses — the
+    same reason Golden Rule #12's guard uses a subclass carrying an unknown field.
+    """
 
 
 # =============================================================================
 # A second "agent class" that owes the policy nothing but the Protocol
 # =============================================================================
-
-
-class Answer(BaseModel):
-    """A structured output that is deliberately NOT StructuredOutput.
-
-    ``try_conclude_without_tools`` must never inspect the schema — it cannot, since
-    the schema belongs to the caller. Using a type with no ``.messages`` at all is
-    what makes that provable rather than asserted.
-    """
-
-    text: str = ""
 
 
 class _FakeAgent:
@@ -69,34 +72,28 @@ class _FakeAgent:
 
 
 class _GuardedAgent(_FakeAgent):
-    """A fake agent whose one handler carries the decorator.
+    """A fake agent whose LLM call carries the decorator.
 
-    Nothing here overrides any policy: the schema and the router are decorator
-    arguments, so this class supplies only its own work.
+    ``act`` is shaped like ``BaseAgent.act``: a positional argument, a keyword
+    one, and a real return value. None of the three matters to the policy, which
+    is exactly what has to be provable — the guard reads no argument and must
+    hand the return value straight back.
     """
 
     def __init__(self, name: str = "@Guarded") -> None:
         super().__init__(name)
         self.turns: list[str] = []
-        self.senders: list[Any] = []
-        self.routed: list[Answer] = []
+        self.prompts: list[Any] = []
         self.turn_raises: Exception | None = None
-        self.delivers = True
 
-    def _route_answer(self, output: Answer) -> bool:
-        """Deliver an Answer; report whether anything actually went out."""
-        self.routed.append(output)
-        return self.delivers
-
-    @guard_usage_limits(output_type=Answer, route=_route_answer)
-    def receiveMsg_Ask(  # noqa: N802
-        self, message: Message, sender: ActorAddress | None = None, *, note: str = ""
-    ) -> None:
+    @guard_usage_limits()
+    def act(self, message: Message, output_type: type[str] = str, *, note: str = "") -> str:
         """One turn of work, and no error handling of its own."""
         self.turns.append(note)
-        self.senders.append(sender)
+        self.prompts.append(message)
         if self.turn_raises is not None:
             raise self.turn_raises
+        return "the answer"
 
 
 def _address(name: str) -> MagicMock:
@@ -112,278 +109,211 @@ def _message(sender: str | None = REQUESTER) -> Message:
     return message
 
 
-def _breaching(error: Exception, *, delivers: bool = True) -> _GuardedAgent:
+def _breaching(error: Exception) -> _GuardedAgent:
     agent = _GuardedAgent()
     agent.turn_raises = error
-    agent.delivers = delivers
-    agent._react_agent.conclude_without_tools_sync.return_value = Answer(text="partial")
     return agent
 
 
 # =============================================================================
-# guard_usage_limits — the clause order
+# One clause, every tier
 # =============================================================================
 
 
-class TestClauseOrderIsLoadBearing:
-    """The one property a hand-copied ladder loses silently.
+class TestOneClauseCoversEveryTier:
+    """Both tiers, and any tier added later, end the same way.
 
-    **Verified by mutation.** Moving the ``LLMUsageLimitError`` clause to the front
-    of the ladder in ``guard_usage_limits`` turns
-    ``test_a_run_tier_breach_is_concluded_before_anyone_is_paged`` red — the base
-    clause swallows the run tier and the conclusion is never attempted. The
-    agent-tier and backstop tests below stay green under that mutation, which is
-    exactly why the run-tier case has to be asserted here rather than assumed from
-    them.
+    **Verified by mutation.** Replacing the single ``except LLMUsageLimitError``
+    with the per-tier ladder this module used to carry — ``except
+    RunUsageLimitError`` then ``except AgentUsageLimitError``, both escalating —
+    turns ``test_a_tier_this_module_never_heard_of_is_still_caught`` red, along
+    with every spec in the suite that raises the base class itself: the ``[base]``
+    parametrisation here, its twin in ``test_usage_limit_handling.py``, and the
+    three ``LLMUsageLimitError`` specs in ``test_agent_coverage.py`` — six in all.
+    Nothing that raises a *subclass* moves, which is the point: the ladder is
+    correct on the day it is written and silently incomplete afterwards, and only
+    the unenumerated tier exposes it.
     """
 
-    def test_a_run_tier_breach_is_concluded_before_anyone_is_paged(self) -> None:
-        agent = _breaching(RunUsageLimitError("run request limit"))
-
-        agent.receiveMsg_Ask(_message())
-
-        agent._react_agent.conclude_without_tools_sync.assert_called_once()
-        assert [answer.text for answer in agent.routed] == ["partial"]
-        assert agent.notified == []
-
-    def test_an_agent_tier_breach_escalates_with_no_attempt(self) -> None:
-        agent = _breaching(AgentUsageLimitError("lifetime budget spent"))
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RunUsageLimitError("run request limit"),
+            AgentUsageLimitError("lifetime budget spent"),
+            LLMUsageLimitError("token limit"),
+        ],
+        ids=["run-tier", "agent-tier", "base"],
+    )
+    def test_every_tier_notifies_once_and_raises(self, error: LLMUsageLimitError) -> None:
+        agent = _breaching(error)
 
         with pytest.raises(WarningError, match="LLM usage limit exceeded"):
-            agent.receiveMsg_Ask(_message())
+            agent.act(_message())
 
-        agent._react_agent.conclude_without_tools_sync.assert_not_called()
-        assert agent.routed == []
+        assert len(agent.notified) == 1
+        assert str(error) in agent.notified[0]
+
+    def test_a_tier_this_module_never_heard_of_is_still_caught(self) -> None:
+        """The clause is on the base, so a future subclass needs no edit here."""
+        agent = _breaching(_FutureTierError("a limit invented after this code was written"))
+
+        with pytest.raises(WarningError, match="LLM usage limit exceeded"):
+            agent.act(_message())
+
         assert len(agent.notified) == 1
 
-    def test_the_base_class_is_caught_by_the_backstop_clause(self) -> None:
-        """An akgentic-llm raising the base directly must still be handled."""
-        agent = _breaching(LLMUsageLimitError("token limit"))
+    def test_the_tiers_are_no_longer_told_apart_at_all(self) -> None:
+        """Identical text, identical outcome — the distinction was spent inside the LLM.
 
-        with pytest.raises(WarningError, match="token limit"):
-            agent.receiveMsg_Ask(_message())
-
-        agent._react_agent.conclude_without_tools_sync.assert_not_called()
-        assert len(agent.notified) == 1
-
-    def test_the_two_tiers_are_told_apart_by_class_never_by_text(self) -> None:
-        """Identical message text, opposite outcomes."""
+        Its predecessor asserted the opposite (same text, opposite outcomes) and
+        was the reason the ladder had to stay ordered. Recording the reversal here
+        keeps the next reader from restoring a branch this package cannot act on.
+        """
         text = "usage limit exceeded"
 
         run_tier = _breaching(RunUsageLimitError(text))
-        run_tier.receiveMsg_Ask(_message())
-        assert run_tier.notified == []
+        with pytest.raises(WarningError):
+            run_tier.act(_message())
 
         agent_tier = _breaching(AgentUsageLimitError(text))
         with pytest.raises(WarningError):
-            agent_tier.receiveMsg_Ask(_message())
-        assert len(agent_tier.notified) == 1
+            agent_tier.act(_message())
+
+        assert run_tier.notified == agent_tier.notified
 
 
 # =============================================================================
-# guard_usage_limits — what it does and does not touch
+# The conclusion is gone from this package
 # =============================================================================
 
 
-class TestGuardLeavesTheHandlerAlone:
-    """The decorator adds the policy and changes nothing else about the handler."""
+class TestTheDecoratorNeverReachesTheLlm:
+    """No breach, of any tier, makes this package call the model.
 
-    def test_an_uneventful_turn_passes_straight_through(self) -> None:
+    **Verified by mutation.** Restoring any call to
+    ``_react_agent.conclude_without_tools_sync`` in the ``except`` turns both
+    tests below red — and seven more that assert the same thing from the real
+    ``BaseAgent`` and ``CustomAgent``, and against a live ReactAgent in
+    ``test_limit_recovery_parity.py``. Without them the retirement is invisible: a
+    reinstated conclusion would satisfy every escalation assertion above, because
+    it also escalates whenever it fails.
+    """
+
+    @pytest.mark.parametrize(
+        "error",
+        [RunUsageLimitError("run request limit"), AgentUsageLimitError("spent")],
+        ids=["run-tier", "agent-tier"],
+    )
+    def test_no_conclusion_is_attempted(self, error: LLMUsageLimitError) -> None:
+        agent = _breaching(error)
+
+        with pytest.raises(WarningError):
+            agent.act(_message())
+
+        agent._react_agent.conclude_without_tools_sync.assert_not_called()
+
+    def test_the_module_does_not_touch_the_react_agent_at_all(self) -> None:
+        """``AgentLike`` no longer declares ``_react_agent``, and nothing reads it.
+
+        The Protocol shrank with the helper it existed for. Asserting on the
+        Protocol rather than on a call keeps this true for a policy that grows a
+        new branch later.
+        """
+        from akgentic.agent.usage_limits import AgentLike
+
+        assert "_react_agent" not in AgentLike.__annotations__
+
+
+# =============================================================================
+# What the decorator does not touch
+# =============================================================================
+
+
+class TestGuardLeavesTheCallAlone:
+    """The decorator adds the policy and changes nothing else about the method."""
+
+    def test_the_output_of_an_uneventful_call_is_returned(self) -> None:
+        """The property a handler-shaped guard did not have to have.
+
+        **Verified by mutation.** Dropping the ``return`` from the wrapper —
+        ``method(self, *args, **kwargs)`` on its own, which is exactly what the
+        previous handler-shaped guard did — turns this test red, and 34 others
+        with it across five files: every ordinary turn in the package silently
+        returns ``None``, so ``_route_output`` and ``_route_triage`` blow up on
+        ``NoneType`` and ``compact()`` hands back nothing. Every *breach* test
+        stays green, which is the trap this spec exists for — the escalation path
+        never returns, so it cannot notice a missing ``return``. This is the one
+        spec that fails on the value rather than on a downstream ``AttributeError``,
+        and it is the one that says why.
+        """
         agent = _GuardedAgent()
 
-        agent.receiveMsg_Ask(_message(), _address("@Someone"), note="work")
-
+        assert agent.act(_message(), note="work") == "the answer"
         assert agent.turns == ["work"]
-        agent._react_agent.conclude_without_tools_sync.assert_not_called()
         assert agent.notified == []
 
-    def test_positional_and_keyword_arguments_reach_the_handler(self) -> None:
-        """The wrapper forwards everything after the message untouched.
+    def test_positional_and_keyword_arguments_reach_the_method(self) -> None:
+        """The wrapper forwards everything after ``self`` untouched.
 
-        Both halves are asserted: the ``sender`` the wrapper passes on positionally
-        through ``*args``, and the keyword-only ``note`` through ``**kwargs``. The
-        handler has to record the sender for that first half to be provable —
-        asserting only on ``note`` would leave the positional path untested while
-        reading as though it were covered.
+        Both halves are asserted: the message the wrapper passes on positionally
+        through ``*args``, and the keyword-only ``note`` through ``**kwargs``.
+        Asserting only on ``note`` would leave the positional path untested while
+        reading as though it were covered — and the positional path is the one
+        that changed, because the guard no longer names ``message`` at all.
         """
         agent = _GuardedAgent()
-        sender = _address("@Someone")
+        message = _message()
 
-        agent.receiveMsg_Ask(_message(), sender, note="kw")
+        agent.act(message, str, note="kw")
 
         assert agent.turns == ["kw"]
-        assert agent.senders == [sender]
+        assert agent.prompts == [message]
 
-    def test_the_handler_keeps_its_identity(self) -> None:
-        """``@wraps`` — dispatch finds handlers by name, so the name must survive."""
-        assert _GuardedAgent.receiveMsg_Ask.__name__ == "receiveMsg_Ask"
-        assert _GuardedAgent.receiveMsg_Ask.__doc__ is not None
+    def test_the_method_keeps_its_identity(self) -> None:
+        """``@wraps`` — the guarded method must still look like itself."""
+        assert _GuardedAgent.act.__name__ == "act"
+        assert _GuardedAgent.act.__doc__ is not None
 
-    def test_the_signature_actor_dispatch_reads_is_the_handlers_own(self) -> None:
-        """``sender`` must stay visible through the wrapper, or it stops arriving.
+    def test_the_signature_is_the_methods_own(self) -> None:
+        """The wrapper declares only ``(self, /, *args, **kwargs)``.
 
-        ``Akgent._receiveMessage`` decides how to call a handler by inspecting its
-        signature: ``"sender" in inspect.signature(method).parameters`` selects
-        ``method(self, message, sender)`` over ``method(self, message)``. The
-        wrapper declares ``(self, message, /, *args, **kwargs)`` and has no
-        ``sender`` of its own — dispatch keeps working only because ``@wraps`` sets
-        ``__wrapped__`` and ``inspect.signature`` follows it.
-
-        Swap ``@wraps`` for a hand-assigned ``__name__`` and every other test in
-        this file stays green while every decorated handler in the package loses
-        its sender argument the first time a live actor delivers a message. Same
-        shape of failure as the clause order, so it is pinned the same way.
+        Anything that introspects a guarded method — and ``Akgent._receiveMessage``
+        does exactly this to decide whether to pass ``sender`` — would see that
+        useless signature were it not for ``@wraps`` setting ``__wrapped__``, which
+        ``inspect.signature`` follows. No handler is decorated today, so nothing
+        depends on it right now; it is pinned because the cost of losing it is a
+        failure that appears only in a live actor, and only for whoever decorates
+        a handler next.
         """
-        parameters = inspect.signature(_GuardedAgent.receiveMsg_Ask).parameters
+        parameters = inspect.signature(_GuardedAgent.act).parameters
 
         assert "message" in parameters
-        assert "sender" in parameters
+        assert "output_type" in parameters
+        assert "note" in parameters
 
     def test_a_non_usage_error_propagates_untouched(self) -> None:
         """Usage-limit errors are the only ones the guard is for."""
         agent = _breaching(RuntimeError("something else entirely"))
 
         with pytest.raises(RuntimeError, match="something else entirely"):
-            agent.receiveMsg_Ask(_message())
+            agent.act(_message())
 
-        agent._react_agent.conclude_without_tools_sync.assert_not_called()
         assert agent.notified == []
 
-    def test_a_conclusion_that_routes_nothing_escalates(self) -> None:
-        """The router's answer, not the schema, decides whether anything went out."""
-        agent = _breaching(RunUsageLimitError("original run breach"), delivers=False)
+    def test_nothing_is_read_off_the_arguments(self) -> None:
+        """A sender-less message is ordinary, because no argument is inspected.
 
-        with pytest.raises(WarningError, match="original run breach"):
-            agent.receiveMsg_Ask(_message())
-
-        assert len(agent.routed) == 1
-        assert len(agent.notified) == 1
-
-    def test_the_requester_is_read_off_the_handlers_own_message(self) -> None:
-        """The guard lifts it from the message argument — handlers thread nothing."""
+        Its predecessor refused to act without a requester to name, because the
+        conclusion prompt had to address someone. There is no prompt here now, and
+        no argument the policy reads — which is what let the guard move off the
+        handler and onto ``act()`` in the first place.
+        """
         agent = _breaching(RunUsageLimitError("run request limit"))
 
-        agent.receiveMsg_Ask(_message("@Ada"))
+        with pytest.raises(WarningError, match="LLM usage limit exceeded"):
+            agent.act(_message(sender=None))
 
-        reason = agent._react_agent.conclude_without_tools_sync.call_args[0][0]
-        assert "@Ada" in reason
-
-
-# =============================================================================
-# try_conclude_without_tools — against a schema that is not StructuredOutput
-# =============================================================================
-
-
-class TestConcludeWithoutToolsOnACustomSchema:
-    """The claim the extraction rests on: the policy never knows the schema."""
-
-    def _route(self, delivered: bool) -> Any:
-        route = MagicMock(return_value=delivered)
-        return route
-
-    def test_it_asks_for_the_output_type_it_was_given(self) -> None:
-        agent = _FakeAgent()
-        agent._react_agent.conclude_without_tools_sync.return_value = Answer(text="ok")
-        route = self._route(True)
-
-        # A delivered conclusion ends the turn quietly: the requester has their
-        # answer, so there is nothing left to escalate.
-        try_conclude_without_tools(
-            agent,
-            RunUsageLimitError("run request limit"),
-            REQUESTER,
-            output_type=Answer,
-            route=route,
-        )
-
-        call = agent._react_agent.conclude_without_tools_sync.call_args
-        assert call.kwargs["output_type"] is Answer
-        assert call.kwargs["deps"] is agent
-        assert REQUESTER in call[0][0]
-        route.assert_called_once()
-        assert route.call_args[0][0] is agent
-        assert isinstance(route.call_args[0][1], Answer)
-
-    def test_a_route_reporting_nothing_delivered_is_a_failure(self) -> None:
-        agent = _FakeAgent()
-        agent._react_agent.conclude_without_tools_sync.return_value = Answer()
-
-        with pytest.raises(WarningError):
-            try_conclude_without_tools(
-                agent,
-                RunUsageLimitError("run request limit"),
-                REQUESTER,
-                output_type=Answer,
-                route=self._route(False),
-            )
-
-        assert agent.notified, "a breach nobody could answer must still page the human"
-
-    def test_no_requester_means_no_attempt_at_all(self) -> None:
-        """A placeholder would be echoed back as a recipient, and hired as a role."""
-        agent = _FakeAgent()
-        route = self._route(True)
-
-        with pytest.raises(WarningError):
-            try_conclude_without_tools(
-                agent,
-                RunUsageLimitError("run request limit"),
-                None,
-                output_type=Answer,
-                route=route,
-            )
-
-        agent._react_agent.conclude_without_tools_sync.assert_not_called()
-        route.assert_not_called()
-
-    def test_an_attempt_that_raises_is_a_failure_whatever_it_raised(self) -> None:
-        agent = _FakeAgent()
-        agent._react_agent.conclude_without_tools_sync.side_effect = RuntimeError("closed")
-
-        with pytest.raises(WarningError) as caught:
-            try_conclude_without_tools(
-                agent,
-                RunUsageLimitError("run request limit"),
-                REQUESTER,
-                output_type=Answer,
-                route=self._route(True),
-            )
-
-        # The ORIGINAL breach is reported, never the secondary failure: "closed"
-        # would send whoever reads the log chasing the wrong thing.
-        assert "run request limit" in str(caught.value)
-        assert "closed" not in str(caught.value)
-
-    def test_a_route_that_raises_is_a_failure_too(self) -> None:
-        agent = _FakeAgent()
-        agent._react_agent.conclude_without_tools_sync.return_value = Answer(text="ok")
-        route = MagicMock(side_effect=RuntimeError("delivery blew up"))
-
-        with pytest.raises(WarningError):
-            try_conclude_without_tools(
-                agent,
-                RunUsageLimitError("run request limit"),
-                REQUESTER,
-                output_type=Answer,
-                route=route,
-            )
-
-    def test_the_reason_forbids_further_tools_and_promises_no_follow_up(self) -> None:
-        """The prompt is the whole mechanism — there is no tool-free flag to set."""
-        agent = _FakeAgent()
-        agent._react_agent.conclude_without_tools_sync.return_value = Answer(text="ok")
-
-        try_conclude_without_tools(
-            agent,
-            RunUsageLimitError("run request limit"),
-            REQUESTER,
-            output_type=Answer,
-            route=self._route(True),
-        )
-
-        reason = agent._react_agent.conclude_without_tools_sync.call_args[0][0]
-        assert "cannot" in reason and "tool" in reason
-        assert "do not promise follow-up work" in reason
+        assert len(agent.notified) == 1
 
 
 # =============================================================================
@@ -404,16 +334,18 @@ class TestEscalateUsageLimit:
         assert "@Breacher" in agent.notified[0]
         assert "token limit" in agent.notified[0]
 
-    def test_the_original_breach_is_what_the_run_tier_reports(self) -> None:
-        """A failed conclusion must not overwrite the breach that started the turn."""
+    def test_the_breach_reported_is_the_one_that_arrived(self) -> None:
+        """Whatever ``akgentic-llm`` re-raised is what the human is told, verbatim.
+
+        On a run-tier breach that is the ORIGINAL breach — the capability's
+        conclusion may have failed with something else entirely, and llm surfaces
+        the original rather than the secondary. This package simply does not
+        rewrite it.
+        """
         agent = _breaching(RunUsageLimitError("original run breach"))
-        agent._react_agent.conclude_without_tools_sync.side_effect = AgentUsageLimitError(
-            "lifetime budget spent"
-        )
 
         with pytest.raises(WarningError) as excinfo:
-            agent.receiveMsg_Ask(_message())
+            agent.act(_message())
 
         assert "original run breach" in str(excinfo.value)
-        assert "lifetime budget spent" not in str(excinfo.value)
         assert "original run breach" in agent.notified[0]

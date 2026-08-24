@@ -231,10 +231,27 @@ def _stub_act(agent: BaseAgent, **kwargs: Any) -> MagicMock:
     Defaults to returning an empty ``StructuredOutput`` so ``_route_output`` runs
     for real on it and routes nothing, leaving the test's own assertions as the
     only thing under examination.
+
+    **Not for usage-limit specs.** ``@guard_usage_limits`` sits on ``act``, so
+    replacing ``act`` replaces the guard too and a planted breach escapes raw.
+    Use :func:`_stub_llm_run` for those.
     """
     kwargs.setdefault("return_value", StructuredOutput())
     stub = MagicMock(**kwargs)
     agent.act = stub  # type: ignore[method-assign]
+    return stub
+
+
+def _stub_llm_run(agent: BaseAgent, **kwargs: Any) -> MagicMock:
+    """Stub ``ReactAgent.run_sync``, leaving the real guarded ``act`` in place.
+
+    One level deeper than :func:`_stub_act`, and the only correct depth for a
+    usage-limit spec: the breach then travels out through ``@guard_usage_limits``
+    exactly as it does in production.
+    """
+    kwargs.setdefault("return_value", StructuredOutput())
+    stub = MagicMock(**kwargs)
+    agent._react_agent.run_sync = stub  # type: ignore[attr-defined]
     return stub
 
 
@@ -275,7 +292,7 @@ class TestReceiveAgentMessage:
         from akgentic.llm import UsageLimitError as LLMUsageLimitError
 
         agent = _make_minimal_agent()
-        _stub_act(agent, side_effect=LLMUsageLimitError("token limit"))
+        _stub_llm_run(agent, side_effect=LLMUsageLimitError("token limit"))
         agent.notify_human = MagicMock()  # type: ignore[method-assign]
 
         message = AgentMessage(content="do something")
@@ -305,7 +322,7 @@ class TestReceiveAgentMessage:
         suffix = " (see the usage-limits documentation for details)"
 
         agent = _make_minimal_agent()
-        _stub_act(agent, side_effect=LLMUsageLimitError(base + suffix))
+        _stub_llm_run(agent, side_effect=LLMUsageLimitError(base + suffix))
         agent.notify_human = MagicMock()  # type: ignore[method-assign]
 
         message = AgentMessage(content="do something")
@@ -510,7 +527,7 @@ class TestNotifyHuman:
         from akgentic.llm import UsageLimitError as LLMUsageLimitError
 
         agent = _make_minimal_agent()
-        _stub_act(agent, side_effect=LLMUsageLimitError("token limit"))
+        _stub_llm_run(agent, side_effect=LLMUsageLimitError("token limit"))
 
         message = AgentMessage(content="do something")
 

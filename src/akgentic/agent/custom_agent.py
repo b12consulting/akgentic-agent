@@ -10,12 +10,11 @@ Reused unchanged from BaseAgent:
   subclass can have its own schema at all. It takes the *message*, not a string:
   framing is the message's own ``render_for_llm()``, so a handler composes no
   prompt and there is no second way in that could bypass it.
-- ``@guard_usage_limits(output_type=..., route=...)`` — the usage-limit tier
-  policy. Decorate every ``receiveMsg_*`` that can reach the LLM; never copy the
-  clause ladder into a new handler, because the ordering is load-bearing and a
-  wrong copy compiles, passes an ordinary test, and silently stops concluding.
-  Because the schema and the routing are arguments, a run-tier breach concludes
-  in THIS agent's schema with nothing overridden.
+- The usage-limit policy — **nothing to declare, and nothing to remember**. It
+  is applied inside ``act()`` itself, so it arrives with the LLM call. A breach
+  that akgentic-llm could not degrade notifies the human and ends the turn; one
+  it could comes back from ``act()`` as an ordinary ``TriageOutput``, concluded
+  in THIS agent's schema because ``act()`` was asked for that schema.
 - ``notify_human``, ``send``, ``get_team_member``, ``hire_member`` — no schema in
   their signatures.
 - ``MailboxCapability`` (``akgentic.agent.capabilities``) — built
@@ -33,8 +32,10 @@ Supplied here:
 - ``TriageMessage`` — the message type, with its own ``receiveMsg_`` handler and
   its own ``render_for_llm()``. It declares no ``mailbox_preview``, which is
   what keeps it out of mid-run mailbox reads.
-- ``_route_triage`` — how a TriageOutput is delivered. Passed to the decorator,
-  so it serves the normal turn and the interrupted one alike.
+- ``_route_triage`` — how a TriageOutput is delivered. Called from the handler
+  body, and that one call serves the normal turn, the interrupted one, and the
+  turn ``akgentic-llm`` concluded after a run-tier breach: all three arrive back
+  from ``act()`` as an ordinary ``TriageOutput``.
 - ``extra_capabilities`` — one pydantic-ai capability of this agent's own,
   ``TriageAuditCapability``. The framework prepends its own, so the list the
   ReactAgent receives is ``[mailbox, audit]``: the cancel check still runs
@@ -51,7 +52,6 @@ from pydantic_ai.models import ModelRequestContext
 
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.messages import AgentMessage
-from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 from akgentic.core import ActorAddress
 from akgentic.core.messages import Message
@@ -199,19 +199,21 @@ class CustomAgent(BaseAgent):
 
         return delivered
 
-    @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(  # noqa: N802
         self, message: TriageMessage, sender: ActorAddress
     ) -> None:
         """Handle one incident.
 
-        The decorator owns the usage-limit policy, reads the requester off
-        ``message``, and — because it was given this agent's schema and routing —
-        concludes a breached turn in TriageOutput without this class overriding
-        anything. This body carries no ``try``/``except``: a queued cancel is
-        absorbed by ``act()``, which tells the human and hands back an empty
-        ``TriageOutput``, so ``_route_triage`` delivers nothing and the handler
-        returns normally — exactly as ``receiveMsg_AgentMessage`` does.
+        The decorator owns the usage-limit policy — notify the human, end the
+        turn — and needs nothing from this agent to do it. Concluding a breached
+        turn is ``akgentic-llm``'s, and it too needs nothing declared here: it
+        reuses the ``output_type`` this body already asks ``act()`` for, so the
+        conclusion comes back as a ``TriageOutput`` and routes below.
+
+        This body carries no ``try``/``except``: a queued cancel is absorbed by
+        ``act()``, which tells the human and hands back an empty ``TriageOutput``,
+        so ``_route_triage`` delivers nothing and the handler returns normally —
+        exactly as ``receiveMsg_AgentMessage`` does.
 
         Args:
             message: The incident to triage.
