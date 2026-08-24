@@ -5,7 +5,7 @@ class needs, so a dependency in that direction would make them unusable from the
 module that defines the base class. What each needs from an agent is stated
 structurally, as a Protocol, never by naming a class.
 
-The usage-limit tier policy lives in ``usage_limits.py``, not here.
+The usage-limit policy lives in ``usage_limits.py``, not here.
 """
 
 from typing import Protocol

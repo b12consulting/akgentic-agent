@@ -36,9 +36,10 @@ Architecture:
 - Custom capabilities: extra_capabilities() is the subclass override. The
   framework prepends its own capability, so self._capabilities is always
   [mailbox, *extra_capabilities()] and cancellation cannot be de-configured
-- The usage-limit tier policy is applied, not written here: the handler carries
-  @guard_usage_limits(output_type=..., route=...) from usage_limits.py. See
-  custom_agent.py for a second agent class doing the same with its own schema
+- The usage-limit policy is applied, not written here, and not by any handler:
+  @guard_usage_limits() from usage_limits.py sits on act() and compact() — the
+  two methods that reach the model — so a subclass gets it by calling act()
+  rather than by declaring anything. See custom_agent.py, which declares nothing
 - Delegation is a plain send per Request in the LLM's StructuredOutput. Each hop
   is an independent turn — no call stack, no automatic return path
 """
@@ -141,11 +142,14 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       AgentMessage per Request. A recipient starting with "@" resolves to an
       existing member; anything else is hired by role. A recipient that resolves
       to None is skipped.
-    - A usage breach is branched on by tier (never on message text), by the
-      @guard_usage_limits decorator rather than by this class: a run-tier breach
-      gets one tool-free conclusion, delivered through that same _route_output();
-      an agent-tier breach, or a conclusion that delivers nothing, notifies the
-      human and raises WarningError.
+    - A usage breach that reaches this class has already exhausted its second
+      chance: akgentic-llm's LimitRecoveryCapability drives one tool-free
+      conclusion on a run-tier breach, and that conclusion — when it succeeds —
+      returns through act() as an ordinary StructuredOutput and routes through
+      that same _route_output(). Only a declined or failed conclusion, and every
+      agent-tier breach, surfaces as an error; the @guard_usage_limits decorator
+      then notifies the human and raises WarningError. No tier branch is left in
+      this package.
 
     Structured Output:
     - One type: StructuredOutput (output_models.py), a list of Request, each
@@ -493,6 +497,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """
         return self._current_message
 
+    @guard_usage_limits()
     def act(self, message: LlmRenderable, output_type: type[T]) -> T:
         """Execute one LLM REACT loop against the output type the caller names.
 
@@ -539,14 +544,18 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 cannot be default-constructed — a model with at least one
                 required field. The original interruption is then re-raised
                 unchanged, never a ValidationError and never a wrapped exception.
-            RunUsageLimitError: The turn exhausted its own budget. Recoverable —
-                the @guard_usage_limits decorator on the calling handler answers
-                it with a tool-free conclusion.
-            AgentUsageLimitError: The agent's lifetime budget is spent. Terminal.
-            LLMUsageLimitError: Base of both, if akgentic-llm raises it directly.
-                All three are propagated unchanged from ReactAgent.run_sync():
-                this method neither notifies anyone nor wraps them, and it does
-                not tell the tiers apart — the decorator does all of it.
+            WarningError: **Raised here, in place of any usage-limit error** —
+                @guard_usage_limits wraps this method, so a RunUsageLimitError,
+                an AgentUsageLimitError or the base UsageLimitError never leaves
+                it. The human is notified first, with the breach that arrived.
+                Callers therefore need no try/except for a budget any more than
+                for a cancel: both end the turn here.
+
+                A run-tier breach only gets this far when akgentic-llm's own
+                recovery declined or failed. A conclusion that *succeeded* is
+                returned below as an ordinary output, indistinguishable from a
+                turn that never breached, which is why nothing in this package
+                tells the tiers apart any more.
         """
         self._deliver_context_update()
         rendered_message = message.render_for_llm()
@@ -636,12 +645,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         resolves to ``None`` is skipped, so the model naming someone who does not
         exist costs a delivery, not an exception.
 
-        Extracted so the normal turn and the tool-free conclusion of an interrupted
-        turn deliver through exactly the same code: ``receiveMsg_AgentMessage``
-        calls it directly, and hands it to ``@guard_usage_limits`` as the ``route``
-        argument so a breached turn is delivered the same way. The name matches
-        ADR-008 §1 so the dev-overridable usage-limit capability merges with this
-        extraction rather than renaming it.
+        Extracted so every turn delivers through exactly the same code, and there
+        is now only one caller: ``receiveMsg_AgentMessage``. An interrupted turn
+        and a turn ``akgentic-llm`` concluded after a run-tier breach both come
+        back from ``act()`` as an ordinary ``StructuredOutput``, so neither needs
+        a second delivery path — the empty one routes nothing, the concluded one
+        routes its requests.
 
         Args:
             output: The StructuredOutput whose Requests are to be delivered.
@@ -669,7 +678,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         return delivered
 
-    @guard_usage_limits(output_type=StructuredOutput, route=_route_output)
     def receiveMsg_AgentMessage(self, message: AgentMessage, sender: ActorAddress) -> None:  # noqa: N802
         """Handle an incoming AgentMessage — the agent's only message handler.
 
@@ -684,21 +692,23 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         ``CancelMessage`` is absorbed inside ``act()``, which notifies the human
         and returns an empty ``StructuredOutput``; ``_route_output`` then
         delivers nothing and the handler returns normally — the run dies, the
-        agent survives. The usage-limit tier policy is likewise the decorator's
-        (see ``usage_limits.guard_usage_limits``), whose ``except`` ordering is
-        load-bearing and owns usage-limit errors only.
+        agent survives. A usage breach is likewise the decorator's (see
+        ``usage_limits.guard_usage_limits``), and it owns usage-limit errors only.
+
+        A run-tier breach that ``akgentic-llm`` recovered never reaches the
+        decorator: the tool-free conclusion returns from ``act()`` as an ordinary
+        ``StructuredOutput`` and routes below like any other turn.
 
         Args:
             message: The AgentMessage instance containing the message content and recipient.
             sender: The ActorAddress of the sender of the message.
 
         Raises:
-            WarningError: Raised by the decorator when the turn exceeds a usage
-                limit and no conclusion was delivered. notify_human() runs first —
-                a no-op with a log line when the team has no user-proxy member. A
-                run-tier breach that concluded successfully raises nothing.
-                Usage-limit errors are the only ones the decorator catches, so
-                anything else propagates out of the handler untouched.
+            WarningError: Raised by the decorator when a usage-limit error escapes
+                the LLM — either tier, since both are now handled identically.
+                notify_human() runs first — a no-op with a log line when the team
+                has no user-proxy member. Usage-limit errors are the only ones the
+                decorator catches, so anything else propagates out untouched.
         """
 
         logger.info(
@@ -848,9 +858,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         A failed hire raises ``ModelRetry``: the registry retry-wraps every command,
         converting the tool layer's ``RetriableError``. **On this path nothing
         honours that retry.** ``_route_output`` runs after ``act()`` has already
-        returned, so the REACT loop is over, and the usage-limit guard around the
-        handler catches only usage-limit errors — so the exception leaves the actor
-        message handler. It is deliberately not swallowed. Retry *is* honoured on
+        returned, so the REACT loop is over and the routing is outside the
+        usage-limit guard as well — that guard is on ``act()`` and catches
+        usage-limit errors only, which this is not. The exception therefore leaves
+        the actor message handler, deliberately unswallowed. Retry *is* honoured on
         the other path: when the model calls the ``hire_members`` tool
         mid-reasoning, pydantic-ai is still inside the loop and retries there.
 
@@ -871,6 +882,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         hire = self._command_registry.callable("hire_member")
         return cast(ActorAddress, hire(role))
 
+    @guard_usage_limits()
     def compact(self) -> str:
         """Compact this agent's conversation history into a summary, preserving system prompts."""
         return self._react_agent.compact()

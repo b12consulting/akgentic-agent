@@ -1,9 +1,15 @@
 """``CustomAgent`` — the claim the whole extraction rests on, asserted.
 
 A second agent class, with its own structured output and its own message type,
-must get the usage-limit tier policy **without overriding anything**: the schema
-and the router are decorator arguments, so a run-tier breach in ``CustomAgent``
-concludes in ``TriageOutput`` and is delivered by ``_route_triage``.
+must get the usage-limit policy **without overriding anything, and without
+declaring anything**. It now declares even less than when this file was written:
+the decorator asks for no schema and no router, because concluding a breached
+turn is ``akgentic-llm``'s and it reuses the ``output_type`` the handler already
+passes to ``act()``.
+
+So a rescued turn reaches ``_route_triage`` as an ordinary ``TriageOutput``, and
+a breach that escapes the LLM pages the human — the same two outcomes
+``BaseAgent`` gets, from the same one decorator.
 
 Nothing here touches ``BaseAgent``'s own handler or ``StructuredOutput``. If the
 policy had stayed a clause ladder inside ``receiveMsg_AgentMessage``, every test
@@ -114,10 +120,9 @@ class TestCustomAgentNormalTurn:
     def test_a_handoff_to_a_name_the_team_does_not_have_is_skipped(self) -> None:
         """An ``@name`` matching nobody costs a delivery, not an exception.
 
-        The rule ``_route_output`` applies, applied by ``_route_triage`` — and the
-        reason it returns a bool at all: with its only handoff skipped, the turn
-        delivered nothing, which is what the guard would have to escalate on had
-        this been a breached turn.
+        The rule ``_route_output`` applies, applied by ``_route_triage``. The bool
+        it returns is now read by nobody — the guard that consumed it is retired —
+        but the skip itself is the behaviour under test.
         """
         agent = _make_custom_agent()
         agent.act = MagicMock(return_value=_triage(recipient="@Ghost"))  # type: ignore[method-assign]
@@ -129,80 +134,94 @@ class TestCustomAgentNormalTurn:
         agent.hire_member.assert_not_called()  # type: ignore[attr-defined]
 
 
-class TestCustomAgentRunTierBreach:
-    """AC-5: a run-tier breach concludes in TriageOutput, routed by _route_triage."""
+class TestCustomAgentUsageBreach:
+    """AC-5, restated: a breach that reaches this subclass pages the human.
 
-    def test_the_conclusion_is_asked_for_this_agents_schema(self) -> None:
+    Concluding is ``akgentic-llm``'s, and it needs nothing declared here — it
+    reuses the ``output_type`` the handler already asked ``act()`` for, so a
+    rescued turn arrives back as an ordinary ``TriageOutput``. The class the
+    subclass used to need was the *decorator's* schema argument, and that is gone.
+    """
+
+    def test_a_rescued_turn_arrives_as_an_ordinary_triage_output(self) -> None:
+        """No subclass declaration, no branch: the conclusion just routes.
+
+        Standing in for what ``akgentic-llm`` returns after it degrades a run-tier
+        breach — the handler cannot tell this from a turn that never breached, and
+        that indistinguishability is what let the decorator's schema argument go.
+        """
         agent = _make_custom_agent()
-        agent.act = MagicMock(side_effect=RunUsageLimitError("run request limit"))  # type: ignore[method-assign]
-        agent._react_agent.conclude_without_tools_sync.return_value = _triage()  # type: ignore[attr-defined]
-
-        agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
-
-        call = agent._react_agent.conclude_without_tools_sync.call_args  # type: ignore[attr-defined]
-        assert call.kwargs["output_type"] is TriageOutput
-        assert call.kwargs["deps"] is agent
-        # The recipient is model-chosen, so the reason has to name who to answer.
-        assert REQUESTER in call[0][0]
-
-    def test_the_requester_receives_the_handoff_and_no_human_is_paged(self) -> None:
-        agent = _make_custom_agent()
-        agent.act = MagicMock(side_effect=RunUsageLimitError("run request limit"))  # type: ignore[method-assign]
-        agent._react_agent.conclude_without_tools_sync.return_value = _triage(  # type: ignore[attr-defined]
-            task="Partial triage: node 3 is out of disk, cause not yet identified."
+        agent.act = MagicMock(  # type: ignore[method-assign]
+            return_value=_triage(
+                task="Partial triage: node 3 is out of disk, cause not yet identified."
+            )
         )
 
         agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
 
         agent.get_team_member.assert_called_once_with(REQUESTER)  # type: ignore[attr-defined]
-        agent.send.assert_called_once()  # type: ignore[attr-defined]
         target, sent = agent.send.call_args[0]  # type: ignore[attr-defined]
         assert target.name == REQUESTER
         assert isinstance(sent, AgentMessage)
         assert sent.content.startswith("Partial triage:")
-
         agent.notify_human.assert_not_called()  # type: ignore[attr-defined]
 
-    def test_a_conclusion_with_no_handoffs_escalates(self) -> None:
-        """_route_triage's bool is the only thing that can tell the guard.
+    @pytest.mark.parametrize(
+        "error",
+        [RunUsageLimitError("run request limit"), AgentUsageLimitError("lifetime budget spent")],
+        ids=["run-tier", "agent-tier"],
+    )
+    def test_a_breach_that_escapes_the_llm_pages_the_human(
+        self, error: Exception
+    ) -> None:
+        """Both tiers, one outcome — and no conclusion attempted from this package.
 
-        ``TriageOutput`` has no ``.messages``, so the guard cannot inspect it —
-        "did anything go out?" is the router's answer to give, and an empty triage
-        is a failure exactly as an empty StructuredOutput is.
+        The breach is planted on ``run_sync``, not on ``act``: the guard lives on
+        ``act()`` now, so mocking ``act`` away would remove the thing under test.
         """
         agent = _make_custom_agent()
-        agent.act = MagicMock(side_effect=RunUsageLimitError("original run breach"))  # type: ignore[method-assign]
-        agent._react_agent.conclude_without_tools_sync.return_value = TriageOutput(  # type: ignore[attr-defined]
-            severity="low", summary="nothing conclusive"
-        )
-
-        with pytest.raises(WarningError, match="original run breach"):
-            agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
-
-        agent.send.assert_not_called()  # type: ignore[attr-defined]
-        agent.notify_human.assert_called_once()  # type: ignore[attr-defined]
-
-    def test_an_agent_tier_breach_is_terminal_here_too(self) -> None:
-        agent = _make_custom_agent()
-        agent.act = MagicMock(side_effect=AgentUsageLimitError("lifetime budget spent"))  # type: ignore[method-assign]
+        agent._react_agent.run_sync.side_effect = error  # type: ignore[attr-defined]
 
         with pytest.raises(WarningError, match="LLM usage limit exceeded"):
             agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
 
         agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
         agent.send.assert_not_called()  # type: ignore[attr-defined]
+        agent.notify_human.assert_called_once()  # type: ignore[attr-defined]
 
-    def test_an_incident_with_no_sender_is_not_concluded_to(self) -> None:
+    def test_a_triage_with_no_handoffs_is_silent(self) -> None:
+        """The gap the retired helper used to close, pinned as today's behaviour.
+
+        ``TriageOutput`` has no ``.messages``, so ``akgentic-llm`` could not judge
+        this even if it wanted to, and the decorator never sees the output. A
+        rescued turn that hands off to nobody therefore ends quietly. Open question
+        ``§Q2`` on the degradation-boundary decision (ADR-021); recorded here so the
+        day it changes shows up in the diff.
+        """
         agent = _make_custom_agent()
-        agent.act = MagicMock(side_effect=RunUsageLimitError("original run breach"))  # type: ignore[method-assign]
+        agent.act = MagicMock(  # type: ignore[method-assign]
+            return_value=TriageOutput(severity="low", summary="nothing conclusive")
+        )
+
+        agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
+
+        agent.send.assert_not_called()  # type: ignore[attr-defined]
+        agent.notify_human.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_an_incident_with_no_sender_is_handled_like_any_other(self) -> None:
+        """Nothing is read off the message any more, so a sender-less one is ordinary."""
+        agent = _make_custom_agent()
+        agent._react_agent.run_sync.side_effect = RunUsageLimitError(  # type: ignore[attr-defined]
+            "original run breach"
+        )
         senderless = _incident(sender=None)
         assert senderless.sender is None
 
         with pytest.raises(WarningError, match="original run breach"):
             agent.receiveMsg_TriageMessage(senderless, _address(REQUESTER))
 
-        agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
         agent.hire_member.assert_not_called()  # type: ignore[attr-defined]
+        agent.notify_human.assert_called_once()  # type: ignore[attr-defined]
 
 
 class TestCustomAgentRunInterruption:
@@ -279,19 +298,22 @@ class TestCustomAgentOverridesNothing:
         }
         assert own == {"_route_triage", "receiveMsg_TriageMessage", "extra_capabilities"}
 
-    def test_the_handler_itself_carries_no_error_handling(self) -> None:
-        """Undecorated, the same breach escapes — so the guard is what catches it.
+    def test_the_handler_carries_no_error_handling_and_no_decorator(self) -> None:
+        """The handler is only the work — bypass ``act()`` and the breach escapes raw.
 
-        ``@wraps`` keeps the original reachable, which makes the two halves
-        separable: the handler is only the work, and the policy is only the
-        decorator. A handler that had kept its own ``except`` would swallow this.
+        The guard used to sit on this handler, and this spec unwrapped it through
+        ``__wrapped__`` to show the two halves were separable. It sits on ``act()``
+        now, so the handler is undecorated outright and the separation is shown by
+        stubbing ``act`` away instead: nothing between ``run_sync`` and the caller
+        catches anything, so the same breach comes straight out.
         """
         agent = _make_custom_agent()
         agent.act = MagicMock(side_effect=RunUsageLimitError("run request limit"))  # type: ignore[method-assign]
-        undecorated = CustomAgent.receiveMsg_TriageMessage.__wrapped__  # type: ignore[attr-defined]
+
+        assert not hasattr(CustomAgent.receiveMsg_TriageMessage, "__wrapped__")
 
         with pytest.raises(RunUsageLimitError):
-            undecorated(agent, _incident(), _address(REQUESTER))
+            agent.receiveMsg_TriageMessage(_incident(), _address(REQUESTER))
 
         agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
         agent.notify_human.assert_not_called()  # type: ignore[attr-defined]

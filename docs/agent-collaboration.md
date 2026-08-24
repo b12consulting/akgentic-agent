@@ -152,11 +152,12 @@ index pointer, no framework-managed stack.
    └──────────┬──────────┘
               │
    ┌────────────────────────────┐
-   │  receiveMsg_AgentMessage() │  ← @guard_usage_limits(...)
+   │  receiveMsg_AgentMessage() │  ← no decorator; just the work
    └──────────┬─────────────────┘
               │
    ┌──────────▼──────────┐
-   │  act()              │  ← ReactAgent.run_sync(StructuredOutput)
+   │  act()              │  ← @guard_usage_limits()
+   │                     │    ReactAgent.run_sync(StructuredOutput)
    └──────────┬──────────┘
               │
    ┌──────────▼──────────────────────────────────────────────────┐
@@ -478,11 +479,10 @@ sequenceDiagram
 
 ### 4. _route_output() Decision Tree
 
-The routing loop is `_route_output()`'s body. Two callers reach it: a normal turn inside
-`receiveMsg_AgentMessage()`, and the tool-free conclusion of a turn cut short by a run-tier
-usage limit — which reaches it because `_route_output` was handed to `@guard_usage_limits` as
-its `route` argument. Both deliver through exactly the same code, which is why a concluded
-answer arrives at the requester like any other message.
+The routing loop is `_route_output()`'s body, and it has exactly one caller:
+`receiveMsg_AgentMessage()`. The tool-free conclusion of a turn cut short by a run-tier usage
+limit needs no second path — `akgentic-llm` returns it through `act()` as an ordinary
+`StructuredOutput`, so it arrives at the requester like any other message.
 
 ```mermaid
 flowchart TD
@@ -614,8 +614,9 @@ output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 ```
 
 `receiveMsg_AgentMessage()` passes `StructuredOutput`, so the delegation path above reasons
-against the **static** schema. It is also the type handed to `@guard_usage_limits`, so a
-turn cut short reasons against the same schema by construction.
+against the **static** schema. It is also the type `akgentic-llm` reuses when it concludes a
+turn cut short by a run-tier breach, so that turn reasons against the same schema by
+construction — the caller declares it once, for both.
 
 The reply-protocol guidance is carried in the **prompt**, not the output schema. The handler
 composes none of it: it hands the message over, and the message frames itself when `act()`
@@ -736,119 +737,86 @@ human_addr.send(manager_addr, AgentMessage(content="/hire_member DevOpsEngineer"
 
 ### 5. Usage Limit Protection
 
-The policy branches on the **tier** of the breach. The two tiers are two distinct exception
-classes — `RunUsageLimitError` and `AgentUsageLimitError`, both `akgentic-llm`'s and both
-subclasses of `UsageLimitError` — and they are told apart by class, never by reading the
-message text.
+**The policy no longer branches on the tier — and this package no longer degrades anything.**
+Both are `akgentic-llm`'s: `LimitRecoveryCapability` decides whether a breached turn concludes,
+drives the conclusion through the `output_type` the caller already asked for, and re-raises the
+**ORIGINAL** breach when it declines or fails.
 
-**It is a decorator, not code inside the handler.** `receiveMsg_AgentMessage` carries no
-`try`/`except` of its own at all — run cancellation is absorbed inside `act()` (see
-[Mailbox Visibility](#5-mailbox-visibility)), and the usage-limit ladder is entirely the
-decorator's:
-
-```python
-@guard_usage_limits(output_type=StructuredOutput, route=_route_output)
-def receiveMsg_AgentMessage(self, message: AgentMessage, sender: ActorAddress) -> None:
-    ...
-```
-
-and the ladder lives once, in `usage_limits.py`:
+So an error that arrives here has already exhausted its options, and there is exactly one
+response left:
 
 ```python
 try:
-    handler(self, message, *args, **kwargs)
-
-except RunUsageLimitError as e:
-    # Recoverable: the turn is out of budget, the agent may not be.
-    if not try_conclude_without_tools(
-        self, requester, output_type=output_type, route=route
-    ):
-        escalate_usage_limit(self, e)
-
-except AgentUsageLimitError as e:
-    escalate_usage_limit(self, e)
-
+    return method(self, *args, **kwargs)
 except LLMUsageLimitError as e:
-    # Backstop, LAST.
     escalate_usage_limit(self, e)
 ```
 
-**The clause order carries the behaviour, and that is why it is a decorator.** Both tiers
-subclass the base (`LLMUsageLimitError` is that module's alias for
-`akgentic.llm.UsageLimitError`), so a base clause written first would catch them both and the
-branch would never run — silently, with every test still green if the tests only raise the
-base. The subclasses come first and the base stays last as a backstop, for an `akgentic-llm`
-that raises it directly. Written once here, a second handler cannot get it wrong by copying
-it; before the extraction, every new `receiveMsg_*` had to reproduce the ladder and the trap
-with it.
+**The `except` is on the base, deliberately.** `RunUsageLimitError` and `AgentUsageLimitError`
+both subclass it (`LLMUsageLimitError` is that module's alias for `akgentic.llm.UsageLimitError`)
+and both take this path. The per-tier ladder that used to live here was correct on the day it
+was written and silently incomplete afterwards: it only worked while its clauses stayed ordered
+most-specific-first, and a wrong copy compiled, passed an ordinary test, and stopped concluding.
 
-The requester is lifted off the handler's own `message` argument by the decorator, so no
-handler threads it through its signature.
+**It is a decorator on `act()`, not on the handler.** `receiveMsg_AgentMessage` carries no
+`try`/`except` of its own at all, and no decorator either:
+
+```python
+class BaseAgent(Akgent[AgentConfig, AgentState]):
+    @guard_usage_limits()
+    def act(self, message: LlmRenderable, output_type: type[T]) -> T:
+        ...
+```
+
+That placement is what makes the policy unskippable. On a handler it was a caller obligation —
+invisible from `usage_limits.py`, and silently dropped by the one handler that forgot it. On
+`act()` it arrives with the LLM call, because *making the call* is what triggers it. It also
+puts the two ways a turn can end early in one place: `act()` already absorbs
+`RunInterruptedError` and hands back a default output (see
+[Mailbox Visibility](#5-mailbox-visibility)), and a usage breach is the other one. `compact()`
+carries the guard too — it is the other path to the model, through the summarizer sub-run.
+
+The decorator takes **no arguments and reads none**: no `output_type`, no `route`, no requester
+lifted off a message. It preserves the guarded method's signature and hands its return value
+straight back.
 
 `escalate_usage_limit()` is the unchanged escalation: `notify_human()` to the team's first
-user-proxy member — found structurally through `ActorAddress.is_user_proxy`, so any role
-string works; when the team has none, the notice is logged and dropped — then
-`raise WarningError(f"LLM usage limit exceeded: {error}")`.
+user-proxy member — found structurally through `ActorAddress.is_user_proxy`, so any role string
+works; when the team has none, the notice is logged and dropped — then
+`raise WarningError(f"LLM usage limit exceeded: {error}")`. It reports the error it was handed,
+which on a run-tier breach is the original one, never the secondary failure.
 
-`try_conclude_without_tools()` runs **one** tool-free conclusion through
-`ReactAgent.conclude_without_tools_sync()`, on the actor's own thread like every other LLM
-call, asks for the `output_type` the decorator was given, and delivers it through that
-decorator's `route`. The prompt names the requester, tells the model it has no tools left,
-and asks it to say explicitly which parts it could not check or finish — so an answer
-produced this way is expected to be incomplete and to admit it. It writes nothing extra to
-the agent's own context: the reason already says the turn was cut short, and the conclusion's
-exchange lands in the history like any other turn.
-
-Neither `usage_limits.py` nor `utils.py` imports `agent.py`. That is deliberate: they are
-what a *new* agent class needs, so a dependency in that direction would make them unusable
-from the module that defines the base class. What each needs from an agent is stated
-structurally — `AgentLike` and `TeamResolver` are `Protocol`s — never by naming a class. See
-[Writing a second agent class](#6-writing-a-second-agent-class).
+Neither `usage_limits.py` nor `utils.py` imports `agent.py`. That is deliberate: they are what a
+*new* agent class needs, so a dependency in that direction would make them unusable from the
+module that defines the base class. What each needs from an agent is stated structurally —
+`AgentLike` and `TeamResolver` are `Protocol`s — never by naming a class.
 
 There is deliberately **no retry and no counter**. `akgentic-llm` consumes agent-tier budget
 before every call, the conclusion call included, so repeated run-tier breaches walk the agent
 into its terminal tier by construction; a counter would only duplicate a bound that already
-exists. That bound is only as real as the budget behind it: the default `AgentUsageLimits()`
-is all-`None` and never blocks, so an agent left on the defaults breaches, concludes and
-breaches again indefinitely — see ❌ DON'T #3.
+exists. That bound is only as real as the budget behind it: the default `AgentUsageLimits()` is
+all-`None` and never blocks, so an agent left on the defaults breaches, concludes and breaches
+again indefinitely — see ❌ DON'T #3.
 
-The attempt returns `False` — nothing sent, nothing recorded, escalate — in three cases:
+Invalid `@member` recipients are handled gracefully at routing time: `get_team_member()` returns
+`None` and delivery is skipped rather than raising. That applies to a conclusion as much as to a
+normal turn, which is why this document says the LLM **attempts** a conclusion — never that the
+requester is guaranteed a reply.
 
-- **the message carried no sender**, so there is no requester to name. The attempt is not
-  made at all: a placeholder such as `"unknown"` would not stay prose, because the model
-  would echo it as the `Request.recipient` and `_route_output()` treats any recipient without
-  a leading `@` as a role to **hire**;
-- **the call raised** — an `AgentUsageLimitError` from the conclusion's own pre-flight, a
-  second `RunUsageLimitError`, or anything else;
-- **`StructuredOutput.messages` came back empty.** A successful call that produces no
-  `Request` leaves the requester with nothing, which is the same outcome as an exception and
-  is treated as one.
-
-On success, one entry is written to the agent's own context through
-`_record_user_action()`, stating that the turn hit its per-run limit and was concluded
-early — so the next turn is not blind to the fact that work was left unfinished. It is
-deliberately *not* the human-attributed wording used for slash commands: nobody ran a
-command here.
-
-Invalid `@member` recipients are handled gracefully at routing time: `get_team_member()`
-returns `None` and delivery is skipped rather than raising. That applies to a conclusion as
-much as to a normal turn, which is why the code and this document say the agent **attempts**
-a conclusion — never that the requester is guaranteed a reply.
-
-Success is measured on **the send, not on the `Request` the model produced**. `_route_output()`
-returns whether anything actually went out, so a conclusion addressed to a name the team does
-not have routes nothing, is treated as a failed attempt, and escalates like any other. The
-guard could not make that distinction itself: it is handed a schema it cannot inspect, so
-only the router knows whether a message left.
+**Known gap.** Two of those cases are now silent. A conclusion that resolves no recipient, or
+that comes back with an empty `StructuredOutput.messages`, is an ordinary success: nothing
+raises, nothing is sent, and no human is told. The retired helper caught both through
+`_route_output()`'s bool. `akgentic-llm` cannot — it receives the output as `Any` — and the
+guard never sees the output at all. Tracked as ADR-021 §Q2, and pinned by
+`test_usage_limit_handling.py::TestARescuedTurnIsIndistinguishable::test_a_conclusion_that_routes_nothing_is_silent`.
 
 ### 6. Writing a second agent class
 
-A subclass with its own structured output and its own `receiveMsg_*` gets the tier policy by
-**applying** it, never by copying it — see the clause-order trap above. Apply the decorator
-with *your* schema and *your* router:
+A subclass with its own structured output and its own `receiveMsg_*` **declares nothing** for
+usage limits. The guard is on `BaseAgent.act`, so the subclass inherits it by calling `act()` —
+which is the only way it can reach the LLM at all:
 
 ```python
-from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 
 
@@ -856,8 +824,8 @@ class CustomAgent(BaseAgent):
     def _route_triage(self, output: TriageOutput) -> bool:
         """Act on a TriageOutput: log the assessment, deliver the handoffs.
 
-        Defined BEFORE the handler: the decorator names it as an argument, which is
-        evaluated while the class body runs.
+        Called from the handler body — and that one call serves the normal turn, the
+        interrupted one, and the turn akgentic-llm concluded after a breach.
         """
         delivered = False
         for handoff in output.handoffs:
@@ -871,9 +839,8 @@ class CustomAgent(BaseAgent):
             delivered = True
         return delivered
 
-    @guard_usage_limits(output_type=TriageOutput, route=_route_triage)
     def receiveMsg_TriageMessage(self, message: TriageMessage, sender: ActorAddress) -> None:
-        """Handle one incident. No try/except: act() owns the interruption."""
+        """Handle one incident. No try/except and no decorator: act() owns both."""
         output = self.act(message, TriageOutput)
         self._route_triage(output)
 ```
@@ -882,17 +849,15 @@ What the subclass gets, and what it must supply:
 
 | | |
 |---|---|
-| **Reused unchanged** | `act(message, output_type)` — renders the message you hand it and forwards the type you name to the REACT loop, so a custom output model needs no plumbing, and absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`), so no handler writes a catch; `@guard_usage_limits` — the tier policy; `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
+| **Reused unchanged** | `act(message, output_type)` — renders the message you hand it and forwards the type you name to the REACT loop, so a custom output model needs no plumbing; absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`); and carries `@guard_usage_limits()`, so the usage-limit policy arrives with the call rather than being declared. `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
 | **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first |
 
-A run-tier breach in `CustomAgent` therefore concludes in **`TriageOutput`** and is delivered
-by **`_route_triage`**, with `CustomAgent` overriding nothing — because the schema and the
-routing are decorator *arguments*. `TriageMessage` subclasses `Message` rather than
-`AgentMessage`, and dispatch walks the message class MRO looking for `receiveMsg_<Type>`, so
-the handler is found with no registration step.
-
-The router returns `bool` for the reason given above: `TriageOutput` has no `.messages`, so
-"did anything actually go out?" is the router's answer to give.
+A run-tier breach in `CustomAgent` still concludes in **`TriageOutput`** and is still delivered
+by **`_route_triage`**, with `CustomAgent` overriding *and declaring* nothing — because
+`akgentic-llm` reuses the `output_type` the handler already passed to `act()`, and the
+conclusion comes back out through `act()` like an ordinary turn. `TriageMessage` subclasses
+`Message` rather than `AgentMessage`, and dispatch walks the message class MRO looking for
+`receiveMsg_<Type>`, so the handler is found with no registration step.
 
 The runnable version is `src/akgentic/agent/custom_agent.py`.
 
@@ -1343,6 +1308,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         There is no string overload — passing a str is a type error.
         receiveMsg_AgentMessage passes StructuredOutput, which is why the
         delegation path is schema-driven.
+        Decorated with @guard_usage_limits(), so the usage-limit policy arrives
+        with the LLM call rather than being declared by a handler: a breach that
+        akgentic-llm could not degrade notifies the human and raises
+        WarningError, both tiers alike. compact() carries the same decorator —
+        it is the other path to the model.
 
     _route_output(output) -> bool
         Core routing engine. Delivers a StructuredOutput: one AgentMessage per
@@ -1350,29 +1320,24 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         recipient starting with "@" resolves to an existing member and one that
         does not is hired by role; a recipient that resolves to nothing is
         skipped. It does not enrich the content — the delivered message adds its
-        own reply protocol. Returns whether anything was actually delivered, which is what
-        the usage-limit guard asks to tell a real conclusion from an empty one.
+        own reply protocol. Returns whether anything was actually delivered; no
+        caller reads that bool today, the guard that used to having been retired.
 
     receiveMsg_AgentMessage(message, sender) -> None
-        Pykka message handler, decorated with
-        @guard_usage_limits(output_type=StructuredOutput, route=_route_output).
-        Entry point for all incoming messages. Intercepts "/"-prefixed content as
-        a command; otherwise runs one act() turn on the message — whose own
-        render_for_llm() carries the REPLY_PROTOCOLS line for message.type — and
-        routes the result. It carries no try/except of
-        its own: a queued /stop or CancelMessage is absorbed inside act(), which
-        notifies the human and returns an empty StructuredOutput, so the routing
-        delivers nothing and the handler returns normally. The decorator owns
-        the usage-limit policy.
-        A breach is handled by tier, told apart by exception class and never by
-        message text. A run-tier breach (RunUsageLimitError — this turn ran out of
-        its own budget) first attempts one tool-free conclusion, delivered to the
-        requester through the same routing; it raises nothing when that succeeds
-        and writes nothing extra to the agent's context. An agent-tier breach
-        (AgentUsageLimitError — the lifetime budget is spent) is terminal: no
-        attempt, notify_human(), then WarningError. A conclusion that delivers
-        nothing falls through to the same escalation, reporting the original
-        breach. Usage-limit errors are the only ones the decorator catches.
+        Pykka message handler, undecorated. Entry point for all incoming
+        messages. Intercepts "/"-prefixed content as a command; otherwise runs
+        one act() turn on the message — whose own render_for_llm() carries the
+        REPLY_PROTOCOLS line for message.type — and routes the result. It
+        carries no try/except of its own: a queued /stop or CancelMessage is
+        absorbed inside act(), which notifies the human and returns an empty
+        StructuredOutput, so the routing delivers nothing and the handler
+        returns normally.
+        A usage breach is absorbed in that same place, by the guard on act().
+        Both tiers end identically — notify_human(), then WarningError — because
+        by the time an error reaches this package akgentic-llm has already
+        decided whether the turn degrades. A run-tier breach it concluded comes
+        back through act() as an ordinary StructuredOutput and routes below with
+        nothing here knowing it was a rescue.
 
     receiveMsg_CancelMessage(message, sender) -> None
         Acknowledge a CancelMessage dequeued while the agent is idle — a logged
@@ -1465,7 +1430,7 @@ When extending the collaboration system:
 
 1. **Maintain `AgentMessage` as the sole inter-agent message type** — do not introduce new types without strong justification
 2. **Keep routing validation in `_route_output()`** — recipient validity is enforced at routing time, not in the output schema; the `Request.recipient` field stays a plain string
-3. **Apply `@guard_usage_limits` to every new `receiveMsg_*` that can reach the LLM** — never copy the clause ladder into a handler; the `except` ordering is load-bearing and a wrong copy fails silently
+3. **Leave the usage-limit policy where it is — on `act()`** — a new `receiveMsg_*` declares nothing and decorates nothing; it inherits the guard by calling `act()`. Overriding `act()` without calling `super().act()` is the one way to lose it
 4. **Document prompt patterns** — add examples to this document when new routing patterns are validated
 5. **Performance test fan-out** — benchmark with large `StructuredOutput` lists to detect delivery bottlenecks
 
