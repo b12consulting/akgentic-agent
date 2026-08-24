@@ -238,7 +238,7 @@ class TestGuardLeavesTheCallAlone:
         **Verified by mutation.** Dropping the ``return`` from the wrapper —
         ``method(self, *args, **kwargs)`` on its own, which is exactly what the
         previous handler-shaped guard did — turns this test red, and 34 others
-        with it across five files: every ordinary turn in the package silently
+        with it across nine files: every ordinary turn in the package silently
         returns ``None``, so ``_route_output`` and ``_route_triage`` blow up on
         ``NoneType`` and ``compact()`` hands back nothing. Every *breach* test
         stays green, which is the trap this spec exists for — the escalation path

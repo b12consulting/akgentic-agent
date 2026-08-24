@@ -858,9 +858,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         A failed hire raises ``ModelRetry``: the registry retry-wraps every command,
         converting the tool layer's ``RetriableError``. **On this path nothing
         honours that retry.** ``_route_output`` runs after ``act()`` has already
-        returned, so the REACT loop is over, and the usage-limit guard around the
-        handler catches only usage-limit errors — so the exception leaves the actor
-        message handler. It is deliberately not swallowed. Retry *is* honoured on
+        returned, so the REACT loop is over and the routing is outside the
+        usage-limit guard as well — that guard is on ``act()`` and catches
+        usage-limit errors only, which this is not. The exception therefore leaves
+        the actor message handler, deliberately unswallowed. Retry *is* honoured on
         the other path: when the model calls the ``hire_members`` tool
         mid-reasoning, pydantic-ai is still inside the loop and retries there.
 
