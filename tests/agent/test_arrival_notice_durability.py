@@ -40,6 +40,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from akgentic.core import ActorAddress
+from akgentic.core.messages import CancelMessage, Message
 from akgentic.llm import LlmMessageEvent, ModelConfig, ReactAgent, ReactAgentConfig
 from pydantic_ai import AgentCapability, RunContext
 from pydantic_ai.capabilities import AbstractCapability
@@ -53,7 +54,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from akgentic.agent.agent import BaseAgent, MailboxCapability
+from akgentic.agent.agent import BaseAgent, MailboxCapability, RunInterruptedError
 from akgentic.agent.capabilities import render_arrival_notice
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
@@ -441,3 +442,120 @@ class TestArrivalNoticeDurability:
         # Our own notice was still withdrawn, and the mail still untouched.
         assert _notice_count_in_history(react_agent.context.messages, notice) == 0
         assert mailbox.pending == [arrived]
+
+
+class _CancelDouble(AgentMessage):
+    """An ordinary message whose content is a ``/stop`` — the everyday cancel."""
+
+
+class TestArrivalNoticeIsGatedOnTheReadTool:
+    """Story 26-2: no doorbell when the model has no way to answer it.
+
+    Two halves, and the second is the one that matters. Suppressing the notice
+    is the feature; **still being cancellable while suppressed** is the
+    invariant, because the gate sits one line away from the purge-and-raise that
+    enforces it.
+    """
+
+    def test_a_suppressed_run_announces_nothing_and_still_returns_its_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the notice off, mail is neither rendered nor enqueued.
+
+        The run also keeps its own output — trivially, since nothing was queued
+        for the drain to redirect on. Asserted anyway: it stops a later refactor
+        from re-coupling suppression and withdrawal.
+        """
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+        arrived = _pending_message("late news", "@Bob")
+        handled = _pending_message("wrap up", "@Human")
+        notice = render_arrival_notice([arrived], {arrived.id})
+        mailbox = _MailboxDouble([arrived], current=handled)
+
+        agent = _make_minimal_agent(mailbox)
+        agent._mailbox_capability = MailboxCapability(observer=mailbox, arrival_notice=False)
+        recorder = _EventRecorder()
+        react_agent = _build_react_agent(agent, recorder)
+
+        model_call_count = 0
+
+        def stub_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal model_call_count
+            model_call_count += 1
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=info.output_tools[0].name,
+                        args={
+                            "messages": [
+                                {
+                                    "message_type": "response",
+                                    "message": f"answer from turn {model_call_count}",
+                                    "recipient": "@Human",
+                                }
+                            ]
+                        },
+                        tool_call_id=f"out-{model_call_count}",
+                    )
+                ]
+            )
+
+        try:
+            with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+                output = agent.act(handled, StructuredOutput)
+        finally:
+            react_agent.close()
+
+        assert model_call_count == 1
+        assert [m.message for m in output.messages] == ["answer from turn 1"]
+        assert _notice_count_in_history(react_agent.context.messages, notice) == 0
+        assert _notice_events(recorder.events, notice) == []
+        # Untouched: suppressing the doorbell must not consume anyone's mail.
+        assert mailbox.pending == [arrived]
+        assert mailbox.consumed == []
+
+    @pytest.mark.parametrize(
+        "cancel",
+        [
+            pytest.param(CancelMessage(), id="CancelMessage"),
+            pytest.param(_CancelDouble(content="/stop", type="request"), id="slash-stop"),
+        ],
+    )
+    def test_a_suppressed_run_is_still_cancellable(
+        self, cancel: Message, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate silences the doorbell; it must not disarm the cancel.
+
+        MUTATION — move the ``if not self._arrival_notice`` gate ABOVE the cancel
+        block in ``before_model_request`` and both parameters go red: the run
+        completes normally instead of raising. That is the mutation a reader
+        would actually make, because the gate reads like a cheap early-out for
+        the whole method, and it is why this spec exists.
+
+        ``is_cancel`` recognises two forms and only one is a ``CancelMessage``,
+        so both are driven — a gate that happened to special-case the class
+        would still be caught by the ``/stop`` parameter.
+        """
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+        handled = _pending_message("wrap up", "@Human")
+        mailbox = _MailboxDouble(current=handled)
+        mailbox.pending = [cancel]  # type: ignore[list-item]
+
+        agent = _make_minimal_agent(mailbox)
+        agent._mailbox_capability = MailboxCapability(observer=mailbox, arrival_notice=False)
+        react_agent = _build_react_agent(agent, _EventRecorder())
+
+        def stub_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            raise AssertionError("the cancel must fire before any model request")
+
+        try:
+            with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+                with pytest.raises(RunInterruptedError):
+                    react_agent.run_sync("anything", deps=agent, output_type=StructuredOutput)
+        finally:
+            react_agent.close()
+
+        # Recognising the cancel and consuming it are one act.
+        assert mailbox.consumed == [cancel.id]

@@ -983,6 +983,23 @@ at recognition, so a cancel can never go stale and cancel the next run.
 
 ### The mid-run arrival notice
 
+**`read_mailbox=False` turns it off completely.** The notice exists to offer the model a way to
+take a waiting message on now, so without that tool it is an instruction the model cannot
+follow, rendered on every step boundary of every run. `BaseAgent` reads the card at wiring time
+and hands `MailboxCapability` the answer; with reads disabled nothing is rendered and nothing is
+enqueued. Mail is not lost — it still arrives as its own turn, which is the fallback the design
+already specifies. **Cancellation is unaffected**: the purge-and-raise runs *ahead* of the
+notice and is not configurable from any card, so a `/stop` or `CancelMessage` still ends the run
+— including for an agent carrying no `MailboxTool` at all.
+
+> This is a **behaviour change** for a deployment already running `read_mailbox=False`: it loses
+> the informational "1 new message arrived — finish your current work first" notice. Deliberate.
+> That signal is not worth a render on every step boundary when the run cannot act on it.
+>
+> `mailbox_preview_handlers: []` is **not** the same switch and is not a substitute. It
+> withholds every *id* but still renders, so every line becomes "Message cannot be handled in
+> the run" — a doorbell that announces something and then says nothing can be done about it.
+
 The same hook, after the cancel check, announces mail that arrived during the run: new
 pending messages are announced **once**, by a **durable** notice (rendered by
 `render_arrival_notice`) delivered through `ctx.enqueue(notice, priority="asap")` —
@@ -1035,7 +1052,9 @@ A message is offered an id only when **all four** of these hold:
 The closing line follows the same rule. It points at `read_mailbox` "with one of the ids above"
 only when at least one id is on offer; otherwise it says only "Finish your current work first —
 you will get them just after", because promising a read for a listing that carries no id would
-be an instruction the model cannot follow.
+be an instruction the model cannot follow. The card-level gate above is that same principle one
+step earlier: a notice that cannot name an id is degraded, and a notice whose *tool* does not
+exist is not rendered at all.
 
 **Naming an id absorbs that one message.** `read_mailbox` takes the id and acknowledges it;
 `MailboxCapability.after_tool_execute` consumes exactly the message named and enqueues that

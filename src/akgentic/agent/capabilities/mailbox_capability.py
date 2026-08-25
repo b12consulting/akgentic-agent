@@ -276,11 +276,33 @@ class MailboxCapability(AbstractCapability[Any]):
     card at agent init and constant for the agent's life.
     """
 
-    def __init__(self, observer: MailboxAccess, preview_handlers: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        observer: MailboxAccess,
+        preview_handlers: list[str] | None = None,
+        arrival_notice: bool = True,
+    ) -> None:
+        """Wire the capability to one agent's mailbox.
+
+        Args:
+            observer: The agent whose mailbox this reads.
+            preview_handlers: Dotted paths of the handler message classes whose
+                runs may be offered an id. ``None`` admits every handler.
+            arrival_notice: Whether a run announces mail that lands mid-flight.
+                ``False`` suppresses the notice **entirely** — nothing rendered,
+                nothing enqueued — which is what a run with no ``read_mailbox``
+                tool needs: a doorbell it cannot answer would be an instruction
+                the model cannot follow, offered on every step boundary.
+                Defaults to ``True`` so a directly-constructed capability behaves
+                as it always has. **Cancellation ignores this flag entirely**:
+                the purge-and-raise runs ahead of the notice and is not
+                configurable from any card.
+        """
         self._observer = observer
         self._announced_ids: set[uuid.UUID] = set()
         self._notice_enqueue_ids: set[str] = set()
         self._preview_handlers = preview_handlers
+        self._arrival_notice = arrival_notice
 
     async def before_run(self, ctx: RunContext[Any]) -> None:
         """Forget which arrivals the previous run announced.
@@ -378,6 +400,13 @@ class MailboxCapability(AbstractCapability[Any]):
             raise RunInterruptedError(
                 "The current run was cancelled by a queued /stop or CancelMessage."
             )
+        # The doorbell is configurable; cancellation is not. This gate sits BELOW
+        # the purge-and-raise deliberately — an agent that never announces mail is
+        # still interruptible by a queued /stop or CancelMessage. Moving it above
+        # would turn a notice setting into "this agent cannot be cancelled", and
+        # no notice-shaped test would catch that.
+        if not self._arrival_notice:
+            return request_context
         new_messages = [m for m in pending if m.id not in self._announced_ids]
         if new_messages:
             notice = render_arrival_notice(new_messages, self.offerable_ids(new_messages))

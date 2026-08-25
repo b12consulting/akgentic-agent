@@ -26,10 +26,11 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import MagicMock, patch
 
+import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.llm import ModelConfig, PromptTemplate
 from akgentic.tool.core import CommandRegistry, ContextState, ToolCard, ToolFactory
-from akgentic.tool.mailbox import MailboxTool
+from akgentic.tool.mailbox import MailboxTool, ReadMailbox
 from akgentic.tool.team import TeamTool
 
 import akgentic.agent.agent as agent_module
@@ -363,3 +364,59 @@ class TestPreviewWhitelistReachesTheCapability:
         _start_agent(_agent_config())
 
         assert _wired_capability()._preview_handlers is None
+
+
+class TestTheNoticeIsGatedOnTheReadTool:
+    """Story 26-2: `read_mailbox=False` turns the doorbell off.
+
+    The notice tells the model to call `read_mailbox`. With that capability
+    removed the notice is an instruction the model cannot follow, offered on
+    every step boundary of every run — so `BaseAgent` reads the card and hands
+    `MailboxCapability` the answer.
+
+    These specs go through the **real** `on_start` and read the capability off
+    the `capabilities=` kwarg the ReactAgent was built with. An earlier version
+    asserted `bool(card.read_mailbox)` instead, which tested Python rather than
+    the wiring: hardcoding `arrival_notice=True` at the call site left the whole
+    suite green.
+    """
+
+    @pytest.mark.parametrize(
+        ("card", "announces"),
+        [
+            pytest.param(MailboxTool(), True, id="default"),
+            pytest.param(MailboxTool(read_mailbox=True), True, id="true"),
+            pytest.param(MailboxTool(read_mailbox=ReadMailbox()), True, id="param-instance"),
+            pytest.param(MailboxTool(read_mailbox=False), False, id="false"),
+        ],
+    )
+    def test_the_card_decides_whether_a_run_announces_mail(
+        self, card: MailboxTool, announces: bool
+    ) -> None:
+        """MUTATION — hardcode `arrival_notice=True` at the wiring site in
+        `_assemble_capabilities` and the `false` parameter goes red on its own.
+        Every other parameter stays green, because they all expect the doorbell
+        to ring, and no spec outside this class touches the flag.
+        """
+        with _running_agent(_agent_config(tools=[card])):
+            capability = _CapturingReactAgent.captured[-1]["capabilities"][0]  # type: ignore[index]
+
+        assert isinstance(capability, MailboxCapability)
+        assert capability._arrival_notice is announces
+
+    def test_a_card_without_reads_still_registers_stop(self) -> None:
+        """Turning the doorbell off must not take the cancel surface with it.
+
+        They are separate capabilities on separate channels, and a deployment
+        that wants no mid-run reads still wants `/stop`. The capability is built
+        unconditionally either way, so the run stays interruptible even for an
+        agent carrying no `MailboxTool` at all.
+        """
+        card = MailboxTool(read_mailbox=False, stop=True)
+
+        with _running_agent(_agent_config(tools=[card])):
+            capability = _CapturingReactAgent.captured[-1]["capabilities"][0]  # type: ignore[index]
+
+        assert isinstance(capability, MailboxCapability)
+        assert capability._arrival_notice is False
+        assert card.get_commands(), "the /stop command must survive read_mailbox=False"
