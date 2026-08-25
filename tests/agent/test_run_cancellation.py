@@ -472,8 +472,11 @@ class TestRunEndWithdrawal:
             result=_end(),
         )
 
+        # The absorbed entry survives, carrying the message's own rendering
+        # inside the added-work framing the injection wraps it in.
         remaining = [_queued_text(pending) for pending in ctx.pending_messages]
-        assert remaining == [absorbed.render_for_llm()]
+        assert len(remaining) == 1
+        assert absorbed.render_for_llm() in remaining[0]
 
     async def test_before_run_forgets_which_notices_it_could_withdraw(self) -> None:
         """AC-6 — the tracking set is run-local, so a stale id withdraws nothing.

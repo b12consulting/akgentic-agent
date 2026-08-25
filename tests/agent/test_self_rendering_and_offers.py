@@ -458,7 +458,13 @@ class TestAfterToolExecuteInjection:
 
         assert mailbox.consume_calls == [[named.id]]
         assert mailbox.pending == [other]
-        assert ctx.enqueue_calls == [((named.render_for_llm(),), "asap")]
+        # The rendering is wrapped in the added-work framing, and carried whole:
+        # the hook delivers, and framing a delivery is part of delivering it.
+        (enqueued,), priority = ctx.enqueue_calls[0]
+        assert len(ctx.enqueue_calls) == 1
+        assert priority == "asap"
+        assert named.render_for_llm() in enqueued
+        assert "does NOT replace" in enqueued
         assert result == "Acknowledged."
 
     async def test_another_tool_is_left_entirely_alone(self) -> None:
@@ -565,4 +571,37 @@ class TestTheToolContractIsReadByName:
         await _after_read(capability, ctx, {argument_name: str(named.id)})
 
         assert mailbox.consume_calls == [[named.id]]
-        assert ctx.enqueue_calls == [((named.render_for_llm(),), "asap")]
+        # The rendering is wrapped in the added-work framing, and carried whole:
+        # the hook delivers, and framing a delivery is part of delivering it.
+        (enqueued,), priority = ctx.enqueue_calls[0]
+        assert len(ctx.enqueue_calls) == 1
+        assert priority == "asap"
+        assert named.render_for_llm() in enqueued
+        assert "does NOT replace" in enqueued
+
+
+class TestAnAbsorbedMessageIsFramedAsAddedWork:
+    """An absorbed message must not read as a replacement for the current one.
+
+    ``render_for_llm()`` renders a message the way its own handler receives it —
+    imperative and self-contained. Injected mid-run that reads as a fresh
+    assignment, and the model answers it *instead of* what it was already doing.
+    Observed in the field: an agent that had just written a report answered only
+    the newer question, and the report answer reached nobody.
+    """
+
+    async def test_the_injection_says_additional_and_carries_the_rendering_whole(self) -> None:
+        """MUTATION — enqueue ``message.render_for_llm()`` bare, as it was before,
+        and the first two assertions go red. Nothing else in the suite moves.
+        """
+        absorbed = _agent_message("what is the colour of the sky?", "@Human")
+        capability = MailboxCapability(observer=_MailboxDouble([absorbed]))
+        ctx = _CtxDouble()
+
+        await _after_read(capability, ctx, {MESSAGE_ID_ARG: str(absorbed.id)})
+
+        (enqueued,), priority = ctx.enqueue_calls[0]
+        assert "does NOT replace" in enqueued
+        assert "answer both" in enqueued
+        assert absorbed.render_for_llm() in enqueued
+        assert priority == "asap"
