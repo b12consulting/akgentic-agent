@@ -315,8 +315,35 @@ it can reach the LLM in the first place.
 
 That placement is the point. While the decorator was on the handlers it was a caller
 obligation: invisible from `usage_limits.py`, and silently dropped by the one handler that
-forgot it. Now it cannot be skipped, because *making the LLM call* is what triggers it. (The
-one way to lose it is to override `act()` outright instead of calling `super().act()`.)
+forgot it. Now it cannot be skipped, because *making the LLM call* is what triggers it.
+
+#### `act()` is not an override point
+
+**Do not override `act()`.** It is `@final`, so mypy rejects an override in any package that
+type-checks. It is the framework's, and the mechanism it carries grows with the
+framework — today the context-update delivery, the message's own framing, media-reference
+expansion, the usage-limit guard and the interruption absorption; tomorrow whatever the next
+capability needs threaded through a turn. An override written against today's body silently
+stops performing whichever of those is added next, and nothing fails loudly when it does: the
+turn still runs, it has just quietly lost a behaviour. Even `super().act(...)` only postpones
+the problem, because the override still owns the code around the call.
+
+**To extend a turn, wrap it.** Write your own method that calls `act()` and does its work
+around the result:
+
+```python
+def act_with_source_tracking(self, message: LlmRenderable, output_type: type[T]) -> T:
+    output = self.act(message, output_type)
+    logger.info("answered from sources: %s", output.sources)
+    return output
+```
+
+A wrapper composes with every future change to `act()`; an override races it. The runnable
+version is `CustomAgent.act_with_source_tracking`.
+
+For the two things subclasses legitimately vary there are real hooks, and neither needs
+`act()` touched: **`output_type` is an argument**, so a custom schema needs no subclassing at
+all, and **`extra_capabilities()`** is the override point for behaviour *inside* the run.
 
 Two modules exist for what a subclass *does* need, and neither imports `agent.py` — they are
 what a *new* agent class needs, so a dependency in that direction would make them unusable
@@ -492,6 +519,106 @@ class MessagePrinter(EventSubscriber):
 
 orchestrator_proxy.subscribe(MessagePrinter())
 ```
+
+### Team metadata
+
+Per-team values an agent reads at runtime — a case id, a tenant — supplied by whoever created
+the team rather than written into the code. The same agent class then serves many teams and
+gets different values in each.
+
+> **This package cannot read team metadata yet.** The platform half described below is built;
+> the agent-side accessor is not. `Orchestrator.get_metadata()` exists in `akgentic-core` and
+> returns `SerializableBaseModel | None`, so an agent that needs a value today reaches it
+> through the orchestrator proxy and narrows for itself. ADR-27 replaces that with
+> `Akgent.get_metadata()` and `Orchestrator.get_metadata_type()`, and `custom_agent.py` gets a
+> worked example when it lands.
+
+**The TeamCard is what switches the feature on.** Declaring a `TeamMetadata` subclass does
+nothing on its own — and note `TeamMetadata` lives in `akgentic-team`, which this package does
+not depend on, so the class itself is declared in your own code, not here:
+
+```python
+from akgentic.team import TeamMetadata
+from pydantic import Field
+
+class SupportCaseMetadata(TeamMetadata):
+    case_id: str = Field(description="CaseId", json_schema_extra={"indexed": True})
+    tenant_id: str = Field(description="TenantId")
+
+TeamCard(..., metadata_type=SupportCaseMetadata)
+```
+
+or, in catalog YAML, where a type serialises as a dotted path:
+
+```yaml
+metadata_type:
+  __type__: acme.support.SupportCaseMetadata
+```
+
+With no declaration on the card there is no form to fill and nothing is persisted. That is
+the entire switch.
+
+#### The loop
+
+| # | where | what happens |
+|---|---|---|
+| 1 | catalog | projects the class into a form contract — one descriptor per field, carrying key, description, mandatory, regex pattern, and whether it is indexed |
+| 2 | frontend | opens a modal **before** creating the team, and only when there is something to ask (see the gate below). Every field renders as free text |
+| 3 | infra | `POST /teams` validates the submitted values against the declared class, before the team is placed |
+| 4 | team store | persists the values with the team, plus a derived array of `"key\|value"` entries — one per *set* indexed field |
+| 5 | orchestrator | is handed the metadata after the write, and holds it for the running team to read |
+
+**`indexed` is not a hint.** That derived array is what each backend actually indexes, and what
+a metadata filter queries. Derivation and query build the entry through the same function, so
+the two sides cannot drift. An unindexed field is stored and returned, but cannot be filtered on.
+
+Only scalars may be indexed — `str`, `bool`, `int`, `UUID`, `Enum`, `date`, `datetime`. `float`
+is excluded because float equality is not a sound index key. This is enforced when the class is
+*defined*, so a mistake is an import error rather than a field that silently never indexes. The
+model may hold nested models, lists and dicts freely; they just cannot be marked indexed.
+
+#### Reading it in an agent, today
+
+`Orchestrator.get_metadata()` is typed `SerializableBaseModel | None` — `akgentic-core`
+deliberately knows nothing about any one deployment's metadata class — so an agent reaches
+through the orchestrator proxy and narrows for itself, once. ADR-27 moves this into the
+framework; until then, it is yours to write:
+
+```python
+def get_metadata(self) -> SupportCaseMetadata:
+    metadata = self.orchestrator_proxy_ask.get_metadata()
+    if not isinstance(metadata, SupportCaseMetadata):
+        raise RuntimeError("this agent needs SupportCaseMetadata; set metadata_type on the TeamCard")
+    return metadata
+```
+
+**Narrow with `isinstance`, not `cast`.** A `cast` compiles away both failure modes — a card
+declaring nothing, and a card declaring a *different* class — and hands them to the caller as an
+`AttributeError` several frames later. Neither is exotic: the card, not the code, decides.
+
+Two properties worth knowing before relying on it:
+
+- **The orchestrator's copy is a cache, not the record.** The persisted team entry is
+  authoritative; the in-memory copy is pushed to it and can lag.
+- **It is returned by reference**, as the declared subclass. Do not mutate it — every reader in
+  the process shares that object, and a change made there is written nowhere.
+
+#### Three things that are not what they look like
+
+- **The modal's gate is not "is `metadata_type` set?"** It is *"is there a contract with at least
+  one field?"*. A declared-but-fieldless class, and a declaration the catalog cannot resolve, both
+  collapse to no-ask — silently, and identically to declaring nothing.
+- **The "filterable" badge in the modal points at a filter that has no UI.** `GET /teams?meta.k=v`
+  is fully implemented and backed by real indexes, but nothing in the frontend sends it. The badge
+  is honest about the backend and misleading about the product.
+- **`TeamCard.metadata_type` is typed `type[SerializableBaseModel]`, not `type[TeamMetadata]`.**
+  Declaring a plain model is legal and silently non-indexable — if it marks fields `indexed`,
+  nothing warns at any layer and the fields simply never index.
+
+> **Layering note.** `TeamMetadata` lives in `akgentic-team`, which `akgentic-agent` does **not**
+> depend on, so nothing in this package imports it. Your metadata class subclasses it from your
+> own code, where that dependency is yours to declare. An agent that only *reads* metadata needs
+> nothing from `akgentic-team` — the value arrives as a `SerializableBaseModel`.
 
 ## Configuration
 

@@ -67,7 +67,12 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig
-from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
+from akgentic.agent.custom_agent import (
+    CustomAgent,
+    CustomMetaData,
+    TriageMessage,
+    TriageOutput,
+)
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
 
@@ -296,6 +301,12 @@ def build_agent(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Any]]
         )
         agent.hire_member = MagicMock(  # type: ignore[method-assign]
             side_effect=AssertionError("a tool-free conclusion must not hire anyone")
+        )
+        # CustomAgent reads per-team metadata through the orchestrator proxy on
+        # every turn. Harmless for BaseAgent, which never asks.
+        agent.orchestrator_proxy_ask = MagicMock()  # type: ignore[attr-defined]
+        agent.orchestrator_proxy_ask.get_metadata.return_value = CustomMetaData(  # type: ignore[attr-defined]
+            case_id="inc-2026-0042", tenant_id="acme"
         )
         return agent, requester
 

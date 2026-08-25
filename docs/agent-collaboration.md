@@ -849,8 +849,37 @@ What the subclass gets, and what it must supply:
 
 | | |
 |---|---|
-| **Reused unchanged** | `act(message, output_type)` — renders the message you hand it and forwards the type you name to the REACT loop, so a custom output model needs no plumbing; absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`); and carries `@guard_usage_limits()`, so the usage-limit policy arrives with the call rather than being declared. `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
-| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first |
+| **Reused unchanged** | `act(message, output_type)` — **call it, never override it** (see below): renders the message you hand it and forwards the type you name to the REACT loop, so a custom output model needs no plumbing; absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`); and carries `@guard_usage_limits()`, so the usage-limit policy arrives with the call rather than being declared. `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
+| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first; optionally a **wrapper** around `act()` for per-turn work of your own |
+
+#### `act()` is not an override point
+
+`act()` is the framework's, and what it carries grows with the framework: today the
+context-update delivery, the message's own framing, media-reference expansion, the usage-limit
+guard and the interruption absorption — tomorrow whatever the next capability needs threaded
+through a turn. **An override written against today's body silently stops performing whichever
+of those is added next.** Nothing fails loudly: the turn still runs, it has just lost a
+behaviour. `super().act(...)` only narrows the window, because the override still owns the code
+around the call.
+
+Extend a turn by **wrapping** it instead. `CustomAgent.act_with_source_tracking` is the worked
+example:
+
+```python
+def act_with_source_tracking(self, message: LlmRenderable, output_type: type[T]) -> T:
+    output = self.act(message, output_type)
+    logger.info("case %s answered from sources: %s", self.get_metadata().case_id, output.sources)
+    return output
+```
+
+Two things it deliberately does not do, and both are what an override would have had to
+reimplement: it never touches the `ReactAgent`, and it writes no `try`/`except` — a queued
+cancel and a usage breach are both already handled inside `act()`.
+
+`T` there is bound to `TrackingOutput`, the shared base carrying `sources`. That bound is what
+makes the field read type-safe; with a `BaseModel` bound the only defence is a runtime
+`assert issubclass(...)`, which mypy cannot see, fires at call time rather than at the call
+site, and disappears under `python -O`.
 
 A run-tier breach in `CustomAgent` still concludes in **`TriageOutput`** and is still delivered
 by **`_route_triage`**, with `CustomAgent` overriding *and declaring* nothing — because

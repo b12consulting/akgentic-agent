@@ -1073,6 +1073,9 @@ class TestNoCatchSubclassSurvives:
             patch.object(BaseAgent, "notify_human") as notify,
             patch.object(BaseAgent, "_handle_failure") as failure,
             patch.object(CustomAgent, "_route_triage") as route,
+            # The exemplar reads per-team metadata between act() and the route.
+            # This team declares none, and that is not what this spec is about.
+            patch.object(CustomAgent, "get_metadata"),
             _running_agent(interrupts=1, agent_class=CustomAgent) as (system, agent_addr, _),
         ):
             system.tell(agent_addr, TriageMessage(incident="disk full on node 3"))

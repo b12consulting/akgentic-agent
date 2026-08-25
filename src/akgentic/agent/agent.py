@@ -49,7 +49,7 @@ import os
 import random
 from datetime import datetime, timezone
 from time import sleep
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar, cast, final
 
 from pydantic_ai import AgentCapability, BinaryContent, ModelRetry, RunContext
 
@@ -501,9 +501,21 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """
         return self._current_message
 
+    @final
     @guard_usage_limits()
     def act(self, message: LlmRenderable, output_type: type[T]) -> T:
         """Execute one LLM REACT loop against the output type the caller names.
+
+        **Not an override point** — ``@final``, so mypy rejects an override in any
+        package that type-checks. The mechanism this method carries grows with the
+        framework (context-update delivery, framing, media expansion, the
+        usage-limit guard, interruption absorption), and an override written
+        against today's body silently stops performing whatever is threaded
+        through it next: the turn still runs, it just loses a behaviour. To extend
+        a turn, **wrap** the call — ``CustomAgent.act_with_source_tracking`` is the
+        worked example. The two things subclasses legitimately vary already have
+        hooks: ``output_type`` is an argument, and ``extra_capabilities()`` is the
+        override point for behaviour inside the run.
 
         Takes the **message**, not a prompt. Framing is
         ``message.rendering()`` — one definition per message class, living

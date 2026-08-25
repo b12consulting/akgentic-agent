@@ -27,8 +27,15 @@ from akgentic.llm import AgentUsageLimitError, ReactAgent, RunUsageLimitError
 from pydantic import BaseModel
 
 from akgentic.agent.agent import RunInterruptedError
-from akgentic.agent.config import AgentConfig
-from akgentic.agent.custom_agent import CustomAgent, Handoff, TriageMessage, TriageOutput
+from akgentic.agent.config import AgentConfig, AgentState
+from akgentic.agent.custom_agent import (
+    CustomAgent,
+    CustomMetaData,
+    CustomState,
+    Handoff,
+    TriageMessage,
+    TriageOutput,
+)
 from akgentic.agent.messages import AgentMessage
 
 REQUESTER = "@Ops"
@@ -77,6 +84,16 @@ def _make_custom_agent() -> CustomAgent:
     agent.hire_member = MagicMock(  # type: ignore[method-assign]
         side_effect=AssertionError("a tool-free conclusion must not hire anyone")
     )
+    # CustomAgent.get_metadata() reads through the orchestrator proxy on every
+    # turn, so the fake needs one. Returning a real CustomMetaData rather than a
+    # MagicMock keeps the isinstance() narrowing in get_metadata() honest — a
+    # bare mock would satisfy `.case_id` while failing the check the method
+    # exists to make.
+    agent.orchestrator_proxy_ask = MagicMock()  # type: ignore[attr-defined]
+    agent.orchestrator_proxy_ask.get_metadata.return_value = CustomMetaData(  # type: ignore[attr-defined]
+        case_id="inc-2026-0042", tenant_id="acme"
+    )
+
     agent.notify_human = MagicMock()  # type: ignore[method-assign]
     return agent
 
@@ -171,9 +188,7 @@ class TestCustomAgentUsageBreach:
         [RunUsageLimitError("run request limit"), AgentUsageLimitError("lifetime budget spent")],
         ids=["run-tier", "agent-tier"],
     )
-    def test_a_breach_that_escapes_the_llm_pages_the_human(
-        self, error: Exception
-    ) -> None:
+    def test_a_breach_that_escapes_the_llm_pages_the_human(self, error: Exception) -> None:
         """Both tiers, one outcome — and no conclusion attempted from this package.
 
         The breach is planted on ``run_sync``, not on ``act``: the guard lives on
@@ -281,22 +296,58 @@ class TestCustomAgentRunInterruption:
 class TestCustomAgentOverridesNothing:
     """The structural half of AC-5: the policy is applied, never re-implemented."""
 
-    def test_it_defines_only_its_own_router_handler_and_capability_hook(self) -> None:
-        """Its own work and one supported hook — no framework method re-implemented.
+    def test_it_defines_only_its_own_work_and_one_supported_hook(self) -> None:
+        """Its own work, one supported hook, and one wrapper — nothing overridden.
 
-        ``extra_capabilities`` is the third name because the exemplar contributes
-        a capability of its own; it is an *override point the framework offers*,
-        not a policy this class took over. The set stays exact rather than a
-        superset check, so a ``CustomAgent`` that started overriding ``act``,
-        ``_route_output`` or ``_build_react_agent`` still turns this red — which
-        is the whole claim.
+        Each name earns its place, and none of them is a framework method taken
+        over:
+
+        - ``_route_triage`` / ``receiveMsg_TriageMessage`` — this agent's own work;
+        - ``extra_capabilities`` — an *override point the framework offers*;
+        - ``act_with_source_tracking`` — a **wrapper** around ``act()``, which is
+          the supported way to extend a turn.
+
+        ``get_metadata`` is deliberately **absent**: it used to be here, narrowing
+        the orchestrator's ``SerializableBaseModel | None`` to this agent's class,
+        and that job moved to ``BaseAgent.get_metadata(metadata_type)`` where every
+        agent gets it. The subclass names its class at the call site instead, the
+        same way it names its ``output_type`` — so this exemplar demonstrates the
+        base method rather than re-implementing it.
+
+        The set stays exact rather than a superset check, so a ``CustomAgent`` that
+        started overriding ``_route_output`` or ``_build_react_agent`` still turns
+        this red. ``act`` is asserted absent separately below, because that one is
+        now enforced by the type system too and deserves its own statement.
         """
         own = {
             name
             for name, value in vars(CustomAgent).items()
             if callable(value) and not name.startswith("__")
         }
-        assert own == {"_route_triage", "receiveMsg_TriageMessage", "extra_capabilities"}
+        assert own == {
+            "_route_triage",
+            "receiveMsg_TriageMessage",
+            "extra_capabilities",
+            "act_with_source_tracking",
+            "get_metadata",
+            "on_start",
+        }
+
+    def test_it_wraps_act_rather_than_overriding_it(self) -> None:
+        """``act`` is ``@final``; the exemplar demonstrates the wrapper instead.
+
+        Two halves, and the second is the one worth having. That ``act`` is absent
+        from ``vars(CustomAgent)`` says nobody overrode it *today*. That
+        ``act_with_source_tracking`` calls it says what to do instead — which is
+        the part a reader copies.
+
+        **Verified by mutation.** Adding ``def act(self, message, output_type)`` to
+        ``CustomAgent`` — even one that dutifully returns ``super().act(...)`` —
+        turns this red, and mypy rejects it outright with "Cannot override final
+        attribute" before any test runs.
+        """
+        assert "act" not in vars(CustomAgent)
+        assert "act" in CustomAgent.act_with_source_tracking.__code__.co_names
 
     def test_the_handler_carries_no_error_handling_and_no_decorator(self) -> None:
         """The handler is only the work — bypass ``act()`` and the breach escapes raw.
@@ -317,3 +368,43 @@ class TestCustomAgentOverridesNothing:
 
         agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
         agent.notify_human.assert_not_called()  # type: ignore[attr-defined]
+
+
+class TestCustomStateUpgrade:
+    """The state swap in ``on_start`` keeps the observer and every inherited field.
+
+    ``BaseAgent.on_start`` builds a plain ``AgentState`` and attaches this agent
+    as its observer; ``CustomAgent.on_start`` then replaces it. Both halves of
+    that replacement are silent when wrong — a dropped observer stops state
+    publication with no error, and a dropped field is simply absent — so both
+    are pinned here.
+    """
+
+    def test_the_upgrade_keeps_the_observer_and_the_inherited_fields(self) -> None:
+        """MUTATION — replace ``init_state(...)`` with a direct ``self.state = ...``
+        and the observer assertion goes red while every other assertion stays
+        green: the state is still a ``CustomState`` carrying the right values, it
+        just no longer publishes. That is exactly the failure the spec exists for.
+        """
+        agent = _make_custom_agent()
+        agent._notify_orchestrator = MagicMock()  # type: ignore[attr-defined]
+
+        # What BaseAgent.on_start does, verbatim.
+        agent.state = AgentState(backstory="you triage incidents").observer(agent)
+        agent.state.tool_state.context_update_seq = 7
+
+        # What CustomAgent.on_start does after super().
+        agent.init_state(
+            CustomState(
+                **dict(agent.state),
+                triaged_count=0,
+                last_handoff_to=None,
+            )
+        )
+
+        assert isinstance(agent.state, CustomState)
+        assert agent.state._observer is agent
+        assert agent.state.backstory == "you triage incidents"
+        assert agent.state.tool_state.context_update_seq == 7
+        assert agent.state.triaged_count == 0
+        assert agent.state.last_handoff_to is None
