@@ -38,6 +38,7 @@ from akgentic.core.messages import CancelMessage, HandledMessage
 from akgentic.llm import ModelConfig, PromptTemplate, ReactAgent, ReactAgentConfig
 from akgentic.tool import MailboxTool
 from pydantic_ai import Agent, AgentCapability
+from pydantic_ai._enqueue import PendingMessage
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     ModelMessage,
@@ -49,12 +50,15 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.result import FinalResult
+from pydantic_graph import End
 
 import akgentic.agent
 import akgentic.agent.agent as agent_module
 from akgentic.agent import RunInterruptedError
 from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.capabilities import is_cancel, render_arrival_notice
+from akgentic.agent.capabilities.mailbox_capability import MESSAGE_ID_ARG, READ_MAILBOX_TOOL
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
@@ -125,6 +129,52 @@ class _CtxDouble:
     def enqueue(self, *content: Any, priority: Any = "asap") -> str:
         self.enqueue_calls.append((content, priority))
         return f"enqueue-{len(self.enqueue_calls)}"
+
+
+class _QueueCtxDouble:
+    """RunContext double carrying a real ``pending_messages`` queue.
+
+    ``enqueue`` builds its entry through pydantic-ai's own
+    ``PendingMessage.from_content`` and returns *that entry's* ``enqueue_id``,
+    which is what makes the withdrawal specs mean anything: a double handing out
+    ids of its own invention would let a withdrawal keyed on the wrong thing
+    pass, because the id the capability recorded and the id sitting on the queue
+    entry would agree only by construction of the double.
+    """
+
+    def __init__(self) -> None:
+        self.pending_messages: list[PendingMessage] = []
+
+    def enqueue(self, *content: Any, priority: Any = "asap") -> str | None:
+        pending = PendingMessage.from_content(*content, priority=priority)
+        if pending is None:
+            return None
+        self.pending_messages.append(pending)
+        return pending.enqueue_id
+
+
+def _queued_text(pending: PendingMessage) -> str:
+    """The user-prompt text one queue entry would deliver, concatenated."""
+    return "".join(
+        part.content
+        for message in pending.messages
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+    )
+
+
+def _end() -> End[FinalResult[str]]:
+    """The graph result that ends a run — what the withdrawal keys on."""
+    return End(FinalResult(output="the answer the run already produced"))
+
+
+_MID_RUN_NODE = object()
+"""Stand-in for a node result that is not an ``End``.
+
+The hook reads nothing off it — ``isinstance(result, End)`` is the whole test —
+so anything that is not an ``End`` exercises the mid-run branch exactly.
+"""
 
 
 # =============================================================================
@@ -293,6 +343,161 @@ class TestArrivalNotice:
         await capability.before_model_request(ctx, _context())
 
         assert ctx.enqueue_calls == []
+
+
+# =============================================================================
+# FR4d — the run-end withdrawal (#123)
+# =============================================================================
+
+
+class TestRunEndWithdrawal:
+    """``after_node_run`` — the notice is withdrawn once the run has ended.
+
+    Hook arithmetic only: which entries leave the queue, and which stay. That
+    the withdrawal actually **defeats** pydantic-ai's end-of-run redirect is a
+    separate claim, and one these specs cannot make — they drive the hook by
+    hand, with no drain in the picture. It is pinned by the real-chain specs in
+    ``test_arrival_notice_durability.py``, which assert on the value ``act()``
+    returns.
+    """
+
+    async def test_the_notice_is_withdrawn_when_the_run_has_ended(self) -> None:
+        """AC-1, AC-3 — the entry the hook enqueued leaves; the result does not change."""
+        arrived = _pending_message("news", "@Alice")
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        ctx = _QueueCtxDouble()
+        await capability.before_model_request(ctx, _context())
+        assert len(ctx.pending_messages) == 1
+
+        result = _end()
+        returned = await capability.after_node_run(
+            ctx,  # type: ignore[arg-type]
+            node=_MID_RUN_NODE,  # type: ignore[arg-type]
+            result=result,
+        )
+
+        # Never converted, never created, never redirected.
+        assert returned is result
+        assert ctx.pending_messages == []
+
+    async def test_a_result_that_is_not_an_end_leaves_the_queue_untouched(self) -> None:
+        """AC-2 — the doorbell still rings mid-run; only the run's end withdraws.
+
+        MUTATION — drop the ``isinstance(result, End)`` condition and the notice
+        is withdrawn at every node boundary, so this spec goes red on a queue
+        that has been emptied one step after it was filled. The real-chain
+        ``test_notice_lands_in_durable_history_and_event_stream_exactly_once``
+        goes red with it; nothing else in the suite does.
+        """
+        arrived = _pending_message("news", "@Alice")
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        ctx = _QueueCtxDouble()
+        await capability.before_model_request(ctx, _context())
+        queued = list(ctx.pending_messages)
+
+        await capability.after_node_run(
+            ctx,  # type: ignore[arg-type]
+            node=_MID_RUN_NODE,  # type: ignore[arg-type]
+            result=_MID_RUN_NODE,  # type: ignore[arg-type]
+        )
+
+        assert ctx.pending_messages == queued
+
+    async def test_another_producers_entry_is_left_in_the_queue(self) -> None:
+        """AC-5 — withdrawal is ours alone, so the drain still redirects for the rest.
+
+        Anything this capability did not enqueue is none of its business: the
+        redirect is right for content with no other delivery path, and only the
+        arrival notice has one.
+        """
+        arrived = _pending_message("news", "@Alice")
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        ctx = _QueueCtxDouble()
+        await capability.before_model_request(ctx, _context())
+        ctx.enqueue("a note from somewhere else entirely", priority="asap")
+        foreign = ctx.pending_messages[-1]
+
+        await capability.after_node_run(
+            ctx,  # type: ignore[arg-type]
+            node=_MID_RUN_NODE,  # type: ignore[arg-type]
+            result=_end(),
+        )
+
+        assert ctx.pending_messages == [foreign]
+
+    async def test_an_absorbed_messages_rendering_is_never_withdrawn(self) -> None:
+        """AC-4 — an **invariant**, not a path the graph can reach today.
+
+        A step that called a tool returns a ``ModelRequestNode`` and never an
+        ``End``, so content ``after_tool_execute`` enqueued is always drained
+        normally and this arrangement — an absorbed rendering still queued at an
+        ``End`` — is one no run produces. It is pinned anyway, because the code
+        that guarantees it is not the code that will be edited next, and the cost
+        of losing it is total: the message was **already consumed** from the
+        mailbox by that hook, so the queue is the only thing still holding it.
+        Withdrawing it would lose it outright, with nothing left to deliver it as
+        its own turn — where a withdrawn *notice* costs only an announcement of
+        mail that is still sitting in the mailbox.
+
+        MUTATION — record ``after_tool_execute``'s ``ctx.enqueue`` return into
+        ``_notice_enqueue_ids`` (the one-line widening a future edit would most
+        plausibly make) and this spec goes red on an empty queue. It is the only
+        spec in the suite that fails on that mutation.
+        """
+        absorbed = _pending_message("the body of the absorbed message", "@Alice")
+        handled = _pending_message("the turn prompt", "@Human")
+        capability = MailboxCapability(observer=_MailboxDouble([absorbed], current=handled))
+        ctx = _QueueCtxDouble()
+
+        # The notice goes out first, exactly as a run would produce it...
+        await capability.before_model_request(ctx, _context())
+        # ...then the model names the id, and this hook absorbs and enqueues it.
+        await capability.after_tool_execute(
+            ctx,  # type: ignore[arg-type]
+            call=ToolCallPart(
+                tool_name=READ_MAILBOX_TOOL,
+                args={MESSAGE_ID_ARG: str(absorbed.id)},
+                tool_call_id="read-1",
+            ),
+            tool_def=MagicMock(),
+            args={MESSAGE_ID_ARG: str(absorbed.id)},
+            result="Acknowledged.",
+        )
+        assert len(ctx.pending_messages) == 2
+
+        await capability.after_node_run(
+            ctx,  # type: ignore[arg-type]
+            node=_MID_RUN_NODE,  # type: ignore[arg-type]
+            result=_end(),
+        )
+
+        remaining = [_queued_text(pending) for pending in ctx.pending_messages]
+        assert remaining == [absorbed.render_for_llm()]
+
+    async def test_before_run_forgets_which_notices_it_could_withdraw(self) -> None:
+        """AC-6 — the tracking set is run-local, so a stale id withdraws nothing.
+
+        Contrived on purpose: a queue does not really outlive the run that filled
+        it. The claim is about the *set*, and this is the only way to state it
+        behaviourally — an id recorded in one run must be unable to reach into
+        another, whatever ends up in front of it.
+        """
+        arrived = _pending_message("news", "@Alice")
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        ctx = _QueueCtxDouble()
+        await capability.before_model_request(ctx, _context())
+        from_the_previous_run = ctx.pending_messages[0]
+
+        await capability.before_run(ctx)  # type: ignore[arg-type]
+        assert capability._notice_enqueue_ids == set()
+
+        await capability.after_node_run(
+            ctx,  # type: ignore[arg-type]
+            node=_MID_RUN_NODE,  # type: ignore[arg-type]
+            result=_end(),
+        )
+
+        assert ctx.pending_messages == [from_the_previous_run]
 
 
 # =============================================================================

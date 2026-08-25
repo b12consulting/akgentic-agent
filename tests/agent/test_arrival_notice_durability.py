@@ -9,7 +9,7 @@ request, into the durable history, and — through ``ContextManager.add_message`
 — into the ``LlmMessageEvent`` stream. A double that faked the drain would
 assert what the author *believes* pydantic-ai does rather than what it does.
 
-Two shapes are pinned, and they are opposites:
+Three shapes are pinned, and the first two are opposites:
 
 - the ordinary next-step-boundary delivery (mail pending from the start, a
   plain tool call creates the boundary the drain delivers into) — the notice
@@ -18,7 +18,11 @@ Two shapes are pinned, and they are opposites:
 - the **run-end withdrawal** (the notice is enqueued at the run's last step
   boundary, so the run would otherwise terminate with it still queued) — the
   notice is withdrawn, the run ends on its own ``End(FinalResult)``, and the
-  answer the model already produced is what ``act()`` returns.
+  answer the model already produced is what ``act()`` returns;
+- the same run-end shape with a **second producer** also holding an ``'asap'``
+  entry — the notice is withdrawn and the foreign entry is not, so the drain
+  redirects for it exactly as it always did. The withdrawal is this
+  capability's own, keyed on the ids it recorded; it is not a queue flush.
 
 The second shape used to be the opposite claim: that the drain's
 ``after_node_run`` redirects through one extra model request so the notice is
@@ -31,11 +35,14 @@ as ADR-010 §5 specifies.
 """
 
 import uuid
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 from akgentic.core import ActorAddress
 from akgentic.llm import LlmMessageEvent, ModelConfig, ReactAgent, ReactAgentConfig
+from pydantic_ai import AgentCapability, RunContext
+from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -43,6 +50,7 @@ from pydantic_ai.messages import (
     ToolCallPart,
     UserPromptPart,
 )
+from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.agent.agent import BaseAgent, MailboxCapability
@@ -135,13 +143,45 @@ def _make_minimal_agent(mailbox: _MailboxDouble) -> BaseAgent:
     return agent
 
 
-def _build_react_agent(agent: BaseAgent, observer: _EventRecorder) -> ReactAgent:
+class _ForeignEnqueue(AbstractCapability[Any]):
+    """Any other producer of queued content — a stand-in for one, at least.
+
+    It enqueues once, at ``'asap'``, from ``before_model_request``: the same
+    one-step-late position the arrival notice occupies, since the outermost
+    drain has already run for that request by the time any other capability's
+    hook fires. Its entry is therefore still queued when the run reaches its
+    ``End``, which is the whole point — nothing withdraws it, so the drain's
+    redirect fires for it exactly as it always did.
+    """
+
+    CONTENT = "a note from somewhere else entirely"
+
+    def __init__(self) -> None:
+        self.enqueued = False
+
+    async def before_model_request(
+        self, ctx: RunContext[Any], request_context: ModelRequestContext
+    ) -> ModelRequestContext:
+        if not self.enqueued:
+            self.enqueued = True
+            ctx.enqueue(self.CONTENT, priority="asap")
+        return request_context
+
+
+def _build_react_agent(
+    agent: BaseAgent,
+    observer: _EventRecorder,
+    extra: list[AgentCapability[Any]] | None = None,
+) -> ReactAgent:
     """A real ReactAgent carrying the agent's mailbox capability and the recorder.
 
     The provider is ``google-gla`` on purpose (see ``test_retry_wins_exhaustive``):
     only the non-native path makes the output a discrete output tool call, which
     the stub model needs to finalise a turn. The API key is never dereferenced —
     ``FunctionModel`` replaces the model before any run happens.
+
+    ``extra`` goes *after* the mailbox capability, mirroring what
+    ``_assemble_capabilities`` builds for a subclass's ``extra_capabilities()``.
     """
     react_config = ReactAgentConfig(
         model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
@@ -150,7 +190,7 @@ def _build_react_agent(agent: BaseAgent, observer: _EventRecorder) -> ReactAgent
         config=react_config,
         deps_type=BaseAgent,
         observer=observer,
-        capabilities=[agent._mailbox_capability],
+        capabilities=[agent._mailbox_capability, *(extra or [])],
     )
     agent._react_agent = react_agent  # type: ignore[attr-defined]
     return react_agent
@@ -266,9 +306,18 @@ class TestArrivalNoticeDurability:
 
         MUTATION — delete ``MailboxCapability.after_node_run`` (the pre-#123
         state) and this spec goes red on ``model_call_count == 1`` first, then on
-        the returned message. It is the only spec in the suite that fails on that
-        mutation; ``test_notice_lands_in_durable_history_and_event_stream_exactly_once``
-        above stays green, which is the point — the mid-run doorbell is untouched.
+        the returned message. It is **the** regression guard for the bug, and the
+        only one that fails on the returned output rather than on a queue.
+
+        Measured against the full suite: that mutation reddens 5 of 447, and all
+        five are withdrawal specs —
+        ``test_a_foreign_producers_entry_still_redirects_at_the_run_end`` here,
+        plus ``test_the_notice_is_withdrawn_when_the_run_has_ended``,
+        ``test_another_producers_entry_is_left_in_the_queue`` and
+        ``test_an_absorbed_messages_rendering_is_never_withdrawn`` in
+        ``test_run_cancellation.py::TestRunEndWithdrawal``. What stays green is
+        the point: ``test_notice_lands_in_durable_history_and_event_stream_exactly_once``
+        above, and every cancel and offer spec — the mid-run doorbell is untouched.
         """
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
 
@@ -323,3 +372,72 @@ class TestArrivalNoticeDurability:
         # so it gets its own turn (ADR-010 §5).
         assert mailbox.pending == [arrived]
         assert mailbox.consumed == []
+
+    def test_a_foreign_producers_entry_still_redirects_at_the_run_end(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The withdrawal is ours alone — everyone else keeps the redirect (AC-5).
+
+        Same shape as the spec above, plus a second capability enqueueing its own
+        ``'asap'`` content. Both entries are queued when the model finalises. The
+        notice is withdrawn; the foreign entry is not, so pydantic-ai's drain
+        discards the ``End`` and redirects through one more model request exactly
+        as it does today, and ``act()`` returns the *second* answer.
+
+        That is the correct outcome, not a residual bug: the drain's redirect is
+        right for content with no other delivery path, and this capability knows
+        of only one such exception — the arrival notice, whose message is still
+        sitting in the actor mailbox. Narrowing the withdrawal to the ids this
+        capability recorded (rather than clearing the queue) is what keeps that
+        true, and this is the spec that says so.
+        """
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+
+        arrived = _pending_message("late news", "@Bob")
+        handled = _pending_message("wrap up", "@Human")
+        notice = render_arrival_notice([arrived], {arrived.id})
+        mailbox = _MailboxDouble([arrived], current=handled)
+        agent = _make_minimal_agent(mailbox)
+        recorder = _EventRecorder()
+        foreign = _ForeignEnqueue()
+        react_agent = _build_react_agent(agent, recorder, extra=[foreign])
+
+        model_call_count = 0
+
+        def stub_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal model_call_count
+            model_call_count += 1
+            output_tool_name = info.output_tools[0].name
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=output_tool_name,
+                        args={
+                            "messages": [
+                                {
+                                    "message_type": "response",
+                                    "message": f"answer from turn {model_call_count}",
+                                    "recipient": "@Human",
+                                }
+                            ]
+                        },
+                        tool_call_id=f"out-{model_call_count}",
+                    )
+                ]
+            )
+
+        try:
+            with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
+                output = agent.act(handled, StructuredOutput)
+        finally:
+            react_agent.close()
+
+        # The drain redirected for the foreign entry: a second turn happened.
+        assert model_call_count == 2
+        assert [m.message for m in output.messages] == ["answer from turn 2"]
+
+        # The foreign content was delivered — once, into that redirect turn.
+        assert _notice_count_in_history(react_agent.context.messages, _ForeignEnqueue.CONTENT) == 1
+        # Our own notice was still withdrawn, and the mail still untouched.
+        assert _notice_count_in_history(react_agent.context.messages, notice) == 0
+        assert mailbox.pending == [arrived]

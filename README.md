@@ -989,10 +989,28 @@ pending messages are announced **once**, by a **durable** notice (rendered by
 pydantic-ai's supported injection path. The auto-injected drain capability delivers it into
 the model request at the next step boundary and records it in the agent's history and the
 event store as its own user-role message — that record **is** the audit trail that the
-doorbell rang. When the run would otherwise end at that boundary, pydantic-ai's drain
-redirects through one final model request so an already-enqueued notice is delivered rather
-than lost — an occasional extra model call, by design. Announced-id tracking is run-local:
-`act()` resets it at each run start, so it dies with the run.
+doorbell rang. Announced-id tracking is run-local: `MailboxCapability.before_run` clears it
+at each run start, so it dies with the run.
+
+**The run's end is the boundary — a notice still queued there is withdrawn, not delivered.**
+An `'asap'` enqueue is always one step late (the drain is mounted outermost, and `before_*`
+hooks walk the chain forwards, so this step's drain has already run when the notice is
+enqueued). If the model produces its final output on that same step, pydantic-ai's drain
+would **discard** the run's own `End(FinalResult)` and redirect through one more model
+request so the queued content is not lost — and `run_sync` then returns only that second
+output, so the answer the agent had already written reaches nobody. That redirect is right
+for content with no other delivery path and wrong for a doorbell: the message behind the
+notice is still sitting in the actor mailbox and **arrives as its own turn** regardless. So
+`MailboxCapability.after_node_run` withdraws the notice once the run has reached its end,
+the `End` survives, and the turn returns the answer it produced. It is possible only on that
+hook — `after_*` walks the capability chain **backwards**, putting this capability ahead of
+the outermost drain.
+
+The withdrawal is narrow, and deliberately so. It is keyed on the `enqueue_id` that
+`ctx.enqueue` returned, never on the notice's text, and it covers only the ids this hook
+recorded: content enqueued by any other producer keeps the redirect, and the rendering
+`after_tool_execute` injects for an **absorbed** message is never withdrawn — that message
+has already been consumed from the mailbox, so the queue is the only thing still holding it.
 
 **Every announced message is listed; only some carry an id.** A message this run can take on
 renders as its own `mailbox_preview()` followed by `(id: …)` — the only way the model can name
