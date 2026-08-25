@@ -4,8 +4,10 @@ The capability has more than one duty. Before every model request it purges a
 pending cancel from the mailbox and raises on it, and it renders and enqueues
 the mid-run arrival notice for mail that landed while the run was in flight.
 After every ``read_mailbox`` call it absorbs the message the model named and
-injects that message's own rendering. The mailbox is the single input to all of
-them, which is what makes them one capability rather than three.
+injects that message's own rendering. And at every node boundary it withdraws
+its own notice once the run has reached its end, so the doorbell never costs
+the answer it interrupted. The mailbox is the single input to all of them,
+which is what makes them one capability rather than four.
 
 **The agent renders; the card does not.** ``read_mailbox`` is a signal that
 carries an id across and acknowledges it — it reads nothing, consumes nothing
@@ -245,19 +247,22 @@ class MailboxCapability(AbstractCapability[Any]):
        boundary: the notice lands in that model request, in the durable
        history and in the ``LlmMessageEvent`` stream by design — the event
        store is the audit trail that the doorbell rang. When the run would
-       otherwise end first, the drain redirects through one final model
-       request so an already-enqueued notice is delivered rather than lost.
-       The hook constructs no message of its own and never mutates an
-       existing message's parts (they are shared with durable history).
-    3. Run-end withdrawal — that redirect is the one case where the doorbell
-       is not worth its price. It discards the run's own ``End(FinalResult)``,
-       so an answer the agent had already written is never returned by
-       ``run_sync`` and reaches nobody. ``after_node_run`` therefore withdraws
-       the notice from the queue once the run has reached its end, and the
-       message arrives as its own turn instead — the fallback ADR-010 §5
-       already specifies. It is possible only on that hook: ``after_*`` walks
-       the capability chain **backwards**, so this capability runs ahead of the
-       outermost drain rather than behind it.
+       otherwise end first, the notice is **withdrawn** rather than delivered
+       — the third duty below. The hook constructs no message of its own and
+       never mutates an existing message's parts (they are shared with durable
+       history).
+
+    A **second hook**, ``after_node_run``, carries a third duty that only the
+    run's end can trigger. The drain's end-of-run redirect — one final model
+    request, so an already-enqueued notice is delivered rather than lost — is
+    the one case where the doorbell is not worth its price: it discards the
+    run's own ``End(FinalResult)``, so an answer the agent had already written
+    is never returned by ``run_sync`` and reaches nobody. ``after_node_run``
+    therefore withdraws the notice from the queue once the run has reached its
+    end, and the message arrives as its own turn instead — the fallback
+    ADR-010 §5 already specifies. It is possible only on that hook: ``after_*``
+    walks the capability chain **backwards**, so this capability runs ahead of
+    the outermost drain rather than behind it.
 
     Each announced message is offered an **id** only if ``offerable_ids``
     admits it; everything else is listed without one and is therefore visible

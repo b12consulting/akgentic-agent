@@ -170,10 +170,11 @@ def _end() -> End[FinalResult[str]]:
 
 
 _MID_RUN_NODE = object()
-"""Stand-in for a node result that is not an ``End``.
+"""Stand-in for a node result that is not an ``End``, and for the node itself.
 
-The hook reads nothing off it — ``isinstance(result, End)`` is the whole test —
-so anything that is not an ``End`` exercises the mid-run branch exactly.
+The hook reads nothing off either — ``isinstance(result, End)`` is the whole
+test — so anything that is not an ``End`` exercises the mid-run branch exactly,
+and the same sentinel serves as the ``node`` argument every spec must pass.
 """
 
 
