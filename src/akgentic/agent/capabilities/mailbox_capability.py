@@ -217,6 +217,26 @@ def _message_line(message: Message, offerable_ids: set[uuid.UUID]) -> str:
     return f"- {message.mailbox_preview()} (id: {message.id})"
 
 
+ABSORBED_PREFIX = (
+    "Additional work, taken on mid-run. It does NOT replace what you were already asked "
+    "to do — answer both before this run ends, one message each in your output."
+)
+"""What an absorbed message is prefixed with when it is injected.
+
+``render_for_llm()`` renders a message the way its own handler receives it —
+imperative and self-contained ("You received a request from @X. A reply is
+expected."). Injected mid-run that reads as a *new assignment*, and the model
+answers it instead of what it was already doing. Observed in the field: an agent
+that had just written a report answered only the newer question, and the report
+answer reached nobody.
+
+The prefix is the capability's, not the message's. **Rendering a message is the
+message's job; delivering one is this capability's**, and framing a delivery is
+part of delivering it — so every class that grows a ``render_for_llm()`` inherits
+this for free.
+"""
+
+
 class MailboxCapability(AbstractCapability[Any]):
     """Mailbox-driven run cancellation and mid-run arrival notice (ADR-040 §5).
 
@@ -546,5 +566,5 @@ class MailboxCapability(AbstractCapability[Any]):
                     type(message).__name__,
                 )
                 continue
-            ctx.enqueue(message.render_for_llm(), priority="asap")
+            ctx.enqueue(f"{ABSORBED_PREFIX}\n\n{message.render_for_llm()}", priority="asap")
         return result

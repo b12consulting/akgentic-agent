@@ -1063,6 +1063,18 @@ rather than as a tool result. An absent or unknown id is a silent no-op. Whateve
 leaves unnamed stays queued and arrives as its own turn once the run ends, and a cancel is
 never offered and never absorbed.
 
+**The injected turn is prefixed with `ABSORBED_PREFIX`, and that prefix is load-bearing.**
+`render_for_llm()` renders a message the way its *own handler* would receive it — imperative and
+self-contained ("You received a request from @X. A reply is expected."). Injected mid-run that
+reads as a **new assignment**, and the model answers it *instead of* what it was already doing.
+Observed in the field: an agent that had just finished a report answered only the newer question,
+and the report answer reached nobody. The prefix says the work is *additional*, that it does not
+replace the current request, and that both answers belong in the output's `messages` list.
+
+The prefix belongs to the capability, not the message: **rendering a message is the message's
+job, delivering one is the capability's**, and framing a delivery is part of delivering it — so
+every class that grows a `render_for_llm()` inherits it for free.
+
 ### Honest limitations
 
 - **An interruption is a clean end, not a failure.** It never routes through the failure
