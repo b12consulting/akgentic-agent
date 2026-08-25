@@ -9,17 +9,25 @@ request, into the durable history, and — through ``ContextManager.add_message`
 — into the ``LlmMessageEvent`` stream. A double that faked the drain would
 assert what the author *believes* pydantic-ai does rather than what it does.
 
-Two shapes are pinned:
+Two shapes are pinned, and they are opposites:
 
 - the ordinary next-step-boundary delivery (mail pending from the start, a
-  plain tool call creates the boundary the drain delivers into), and
-- the end-of-run redirect (the notice is enqueued at the run's last step
-  boundary; the drain's ``after_node_run`` redirects through one extra model
-  request so the notice is delivered rather than lost).
+  plain tool call creates the boundary the drain delivers into) — the notice
+  text lands in the durable history (``react_agent.context.messages``) exactly
+  once, and exactly one ``LlmMessageEvent`` carrying it reaches the observer;
+- the **run-end withdrawal** (the notice is enqueued at the run's last step
+  boundary, so the run would otherwise terminate with it still queued) — the
+  notice is withdrawn, the run ends on its own ``End(FinalResult)``, and the
+  answer the model already produced is what ``act()`` returns.
 
-Both assert the same durability contract: the notice text lands in the durable
-history (``react_agent.context.messages``) exactly once, and exactly one
-``LlmMessageEvent`` carrying it reaches the observer.
+The second shape used to be the opposite claim: that the drain's
+``after_node_run`` redirects through one extra model request so the notice is
+"delivered rather than lost". It does — and the price is the run's own
+``End(FinalResult)``, which that redirect **discards**. The answer the agent had
+already written was then never returned by ``run_sync`` and reached nobody,
+which is what issue #123 reported from a live process. The queued message was
+never at risk: it is still in the actor mailbox and gets its own turn, exactly
+as ADR-010 §5 specifies.
 """
 
 import uuid
@@ -239,24 +247,36 @@ class TestArrivalNoticeDurability:
         # Exactly one LlmMessageEvent carried it to the observer.
         assert len(_notice_events(recorder.events, notice)) == 1
 
-    def test_end_of_run_redirect_delivers_a_leftover_notice(
+    def test_a_notice_left_at_the_run_end_is_withdrawn_and_the_answer_survives(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A notice enqueued at the run's last boundary costs one extra model turn.
+        """The run keeps the output it produced; the notice is withdrawn (#123).
 
-        With no tool call, the only firing is before request 1 — the drain has
-        already run for that request, so the notice is still queued when the
-        model finalises. The drain's ``after_node_run`` then redirects through
-        one more model request instead of losing it: the model sees the notice
-        and finalises again. Same durability contract — history and event
-        stream, exactly once.
+        With no tool call, the hook's only firing is before request 1 — the
+        drain has already run for that request, so the notice is still queued
+        when the model finalises. Without the withdrawal, the drain's
+        ``after_node_run`` **discards** that ``End(FinalResult)`` and redirects
+        into a second model request; the run then finalises again and
+        ``run_sync`` returns the *second* output. The first answer — the one the
+        user was waiting for — is in durable history and nowhere else.
+
+        So the assertion that matters is on the returned value, not on a queue
+        length: the stub model answers differently each turn, and ``act()`` must
+        return the **first** answer.
+
+        MUTATION — delete ``MailboxCapability.after_node_run`` (the pre-#123
+        state) and this spec goes red on ``model_call_count == 1`` first, then on
+        the returned message. It is the only spec in the suite that fails on that
+        mutation; ``test_notice_lands_in_durable_history_and_event_stream_exactly_once``
+        above stays green, which is the point — the mid-run doorbell is untouched.
         """
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
 
         arrived = _pending_message("late news", "@Bob")
         handled = _pending_message("wrap up", "@Human")
         notice = render_arrival_notice([arrived], {arrived.id})
-        agent = _make_minimal_agent(_MailboxDouble([arrived], current=handled))
+        mailbox = _MailboxDouble([arrived], current=handled)
+        agent = _make_minimal_agent(mailbox)
         recorder = _EventRecorder()
         react_agent = _build_react_agent(agent, recorder)
 
@@ -270,7 +290,15 @@ class TestArrivalNoticeDurability:
                 parts=[
                     ToolCallPart(
                         tool_name=output_tool_name,
-                        args=_empty_output_args(),
+                        args={
+                            "messages": [
+                                {
+                                    "message_type": "response",
+                                    "message": f"answer from turn {model_call_count}",
+                                    "recipient": "@Human",
+                                }
+                            ]
+                        },
                         tool_call_id=f"out-{model_call_count}",
                     )
                 ]
@@ -278,11 +306,20 @@ class TestArrivalNoticeDurability:
 
         try:
             with react_agent.pydantic_agent.override(model=FunctionModel(stub_model)):
-                agent.act(handled, StructuredOutput)
+                output = agent.act(handled, StructuredOutput)
         finally:
             react_agent.close()
 
-        # The redirect turn is the documented occasional extra model call.
-        assert model_call_count == 2
-        assert _notice_count_in_history(react_agent.context.messages, notice) == 1
-        assert len(_notice_events(recorder.events, notice)) == 1
+        # The run ended where it said it would — no redirect turn.
+        assert model_call_count == 1
+        # ...and the answer it produced is the one the caller got.
+        assert [m.message for m in output.messages] == ["answer from turn 1"]
+
+        # The notice was withdrawn, so it reached neither history nor the stream.
+        assert _notice_count_in_history(react_agent.context.messages, notice) == 0
+        assert _notice_events(recorder.events, notice) == []
+
+        # The message itself was never at risk: still queued, never consumed,
+        # so it gets its own turn (ADR-010 §5).
+        assert mailbox.pending == [arrived]
+        assert mailbox.consumed == []
