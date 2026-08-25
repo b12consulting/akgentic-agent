@@ -369,7 +369,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             first pay for a third party's ``before_model_request``.
         """
         self._mailbox_capability = MailboxCapability(
-            observer=self, preview_handlers=mailbox_card.mailbox_preview_handlers
+            observer=self,
+            preview_handlers=mailbox_card.mailbox_preview_handlers,
+            arrival_notice=bool(mailbox_card.read_mailbox),
         )
         return [self._mailbox_capability, *self.extra_capabilities()]
 

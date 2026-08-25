@@ -4,8 +4,10 @@ The capability has more than one duty. Before every model request it purges a
 pending cancel from the mailbox and raises on it, and it renders and enqueues
 the mid-run arrival notice for mail that landed while the run was in flight.
 After every ``read_mailbox`` call it absorbs the message the model named and
-injects that message's own rendering. The mailbox is the single input to all of
-them, which is what makes them one capability rather than three.
+injects that message's own rendering. And at every node boundary it withdraws
+its own notice once the run has reached its end, so the doorbell never costs
+the answer it interrupted. The mailbox is the single input to all of them,
+which is what makes them one capability rather than four.
 
 **The agent renders; the card does not.** ``read_mailbox`` is a signal that
 carries an id across and acknowledges it — it reads nothing, consumes nothing
@@ -40,15 +42,18 @@ serves no ``LLM_CONTEXT``: mailbox awareness reaches the model through the
 mid-run arrival notice below alone.
 """
 
+from __future__ import annotations
+
 import logging
 import uuid
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic_ai import RunContext
-from pydantic_ai.capabilities import AbstractCapability, ValidatedToolArgs
+from pydantic_ai.capabilities import AbstractCapability, AgentNode, NodeResult, ValidatedToolArgs
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import ToolDefinition
+from pydantic_graph import End
 
 from akgentic.agent.messages import LlmRenderable, MailboxPreviewable
 from akgentic.core.messages import CancelMessage, Message
@@ -242,10 +247,22 @@ class MailboxCapability(AbstractCapability[Any]):
        boundary: the notice lands in that model request, in the durable
        history and in the ``LlmMessageEvent`` stream by design — the event
        store is the audit trail that the doorbell rang. When the run would
-       otherwise end first, the drain redirects through one final model
-       request so an already-enqueued notice is delivered rather than lost.
-       The hook constructs no message of its own and never mutates an
-       existing message's parts (they are shared with durable history).
+       otherwise end first, the notice is **withdrawn** rather than delivered
+       — the third duty below. The hook constructs no message of its own and
+       never mutates an existing message's parts (they are shared with durable
+       history).
+
+    A **second hook**, ``after_node_run``, carries a third duty that only the
+    run's end can trigger. The drain's end-of-run redirect — one final model
+    request, so an already-enqueued notice is delivered rather than lost — is
+    the one case where the doorbell is not worth its price: it discards the
+    run's own ``End(FinalResult)``, so an answer the agent had already written
+    is never returned by ``run_sync`` and reaches nobody. ``after_node_run``
+    therefore withdraws the notice from the queue once the run has reached its
+    end, and the message arrives as its own turn instead — the fallback
+    ADR-010 §5 already specifies. It is possible only on that hook: ``after_*``
+    walks the capability chain **backwards**, so this capability runs ahead of
+    the outermost drain rather than behind it.
 
     Each announced message is offered an **id** only if ``offerable_ids``
     admits it; everything else is listed without one and is therefore visible
@@ -259,10 +276,33 @@ class MailboxCapability(AbstractCapability[Any]):
     card at agent init and constant for the agent's life.
     """
 
-    def __init__(self, observer: MailboxAccess, preview_handlers: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        observer: MailboxAccess,
+        preview_handlers: list[str] | None = None,
+        arrival_notice: bool = True,
+    ) -> None:
+        """Wire the capability to one agent's mailbox.
+
+        Args:
+            observer: The agent whose mailbox this reads.
+            preview_handlers: Dotted paths of the handler message classes whose
+                runs may be offered an id. ``None`` admits every handler.
+            arrival_notice: Whether a run announces mail that lands mid-flight.
+                ``False`` suppresses the notice **entirely** — nothing rendered,
+                nothing enqueued — which is what a run with no ``read_mailbox``
+                tool needs: a doorbell it cannot answer would be an instruction
+                the model cannot follow, offered on every step boundary.
+                Defaults to ``True`` so a directly-constructed capability behaves
+                as it always has. **Cancellation ignores this flag entirely**:
+                the purge-and-raise runs ahead of the notice and is not
+                configurable from any card.
+        """
         self._observer = observer
         self._announced_ids: set[uuid.UUID] = set()
+        self._notice_enqueue_ids: set[str] = set()
         self._preview_handlers = preview_handlers
+        self._arrival_notice = arrival_notice
 
     async def before_run(self, ctx: RunContext[Any]) -> None:
         """Forget which arrivals the previous run announced.
@@ -282,6 +322,7 @@ class MailboxCapability(AbstractCapability[Any]):
             ctx: The run context. Unused: the reset is unconditional.
         """
         self._announced_ids.clear()
+        self._notice_enqueue_ids.clear()
 
     def offerable_ids(self, pending: list[Message]) -> set[uuid.UUID]:
         """Which of ``pending`` this run may be offered an id for.
@@ -359,12 +400,81 @@ class MailboxCapability(AbstractCapability[Any]):
             raise RunInterruptedError(
                 "The current run was cancelled by a queued /stop or CancelMessage."
             )
+        # The doorbell is configurable; cancellation is not. This gate sits BELOW
+        # the purge-and-raise deliberately — an agent that never announces mail is
+        # still interruptible by a queued /stop or CancelMessage. Moving it above
+        # would turn a notice setting into "this agent cannot be cancelled", and
+        # no notice-shaped test would catch that.
+        if not self._arrival_notice:
+            return request_context
         new_messages = [m for m in pending if m.id not in self._announced_ids]
         if new_messages:
             notice = render_arrival_notice(new_messages, self.offerable_ids(new_messages))
-            ctx.enqueue(notice, priority="asap")
+            # The enqueue id is kept so ``after_node_run`` can withdraw *this* entry and
+            # nothing else. Withdrawal must key on the enqueue site, never on the rendered
+            # text: matching by content would couple the withdrawal to the notice's wording.
+            enqueue_id = ctx.enqueue(notice, priority="asap")
+            if enqueue_id is not None:
+                self._notice_enqueue_ids.add(enqueue_id)
             self._announced_ids.update(message.id for message in new_messages)
         return request_context
+
+    async def after_node_run(
+        self, ctx: RunContext[Any], *, node: AgentNode[Any], result: NodeResult[Any]
+    ) -> NodeResult[Any]:
+        """Withdraw the arrival notice when the run has reached its end.
+
+        **The doorbell must not cost the answer it interrupted.** An ``'asap'`` enqueue is
+        always one step late — ``PendingMessageDrainCapability`` is mounted ``outermost``
+        and ``before_*`` hooks walk the chain forwards, so that step's drain has already
+        run by the time :meth:`before_model_request` enqueues. When the model produces its
+        final output on that same step, the graph returns ``End(FinalResult)`` and the
+        drain's own ``after_node_run`` **discards the End** and redirects into one more
+        model request so the queued content is not lost. The run then produces a *second*
+        final result, and ``run_sync`` returns only that one: the answer the agent had
+        already written reaches nobody.
+
+        That redirect is right for content with no other delivery path, and wrong for
+        ours. The message behind the notice is still sitting in the actor mailbox and gets
+        its own turn whatever happens here — which is exactly the fallback ADR-010 §5
+        already specifies. So the notice is withdrawn rather than delivered, the ``End``
+        survives untouched, and the turn ends with its output intact.
+
+        This hook is where that is possible at all: ``after_*`` walks the chain
+        **backwards**, so this capability runs *ahead* of the outermost drain and can empty
+        the queue before it looks. The result is returned unchanged in every case — this
+        hook never converts an ``End``, never creates one, and never redirects.
+
+        **Only the notice is withdrawn.** :meth:`after_tool_execute` enqueues a message it
+        has already *consumed* from the mailbox; withdrawing that would lose the message
+        outright, with no queue left holding it. Its enqueue id is deliberately never
+        recorded. Entries belonging to any other producer are left alone too, so the drain
+        still redirects for them.
+
+        ``_announced_ids`` is deliberately **not** rolled back: it is run-local, the run is
+        ending, and ``before_run`` clears it. Re-announcing next run is the documented and
+        acceptable outcome.
+
+        Args:
+            ctx: The run context, whose ``pending_messages`` is the queue to filter.
+                pydantic-ai iterates that queue only between graph nodes — in
+                ``before_model_request`` and here — so mutating it in place is supported.
+            node: The node that just ran. Unused: only the result decides.
+            result: The next node, or the ``End`` that ends the run.
+
+        Returns:
+            ``result``, always and unmodified.
+        """
+        if not isinstance(result, End) or ctx.pending_messages is None:
+            return result
+        if not self._notice_enqueue_ids:
+            return result
+        ctx.pending_messages[:] = [
+            pending
+            for pending in ctx.pending_messages
+            if pending.enqueue_id not in self._notice_enqueue_ids
+        ]
+        return result
 
     async def after_tool_execute(
         self,
@@ -391,6 +501,17 @@ class MailboxCapability(AbstractCapability[Any]):
         takes no arguments there is no id to find, and the correct behaviour is
         to do nothing rather than to raise inside someone's run.
         ``MailboxRenderError`` guards the offer filter and has no business here.
+
+        **The enqueue id here is discarded on purpose, and that is load-bearing.**
+        :meth:`after_node_run` withdraws every id it was given; this content must
+        never be among them. The message has already been consumed from the
+        mailbox by the line above, so the queue is the only thing still holding
+        it — withdrawing it would lose it outright, with nothing left to deliver
+        it as its own turn. Unreachable today, because a step that called a tool
+        returns a ``ModelRequestNode`` and never an ``End``, so this content is
+        always drained normally. It is an invariant rather than a live path, and
+        it is written down because the code that guarantees it is not the code
+        that will be edited next.
 
         Args:
             ctx: The run context, whose ``enqueue`` is documented safe from a
