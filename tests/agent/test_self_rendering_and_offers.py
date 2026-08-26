@@ -601,7 +601,11 @@ class TestAnAbsorbedMessageIsFramedAsAddedWork:
 
     async def test_the_injection_says_additional_and_carries_the_rendering_whole(self) -> None:
         """MUTATION — enqueue ``message.render_for_llm()`` bare, as it was before,
-        and the first two assertions go red. Nothing else in the suite moves.
+        and the first two assertions go red, along with the two sibling specs
+        above that pin the same ``"does NOT replace"`` clause: three in this
+        file, nothing outside it. Restoring the prefix's earlier *wording*
+        reddens none of the three — these pin the delivery's shape, not its
+        sentences.
         """
         absorbed = _agent_message("what is the colour of the sky?", "@Human")
         capability = MailboxCapability(observer=_MailboxDouble([absorbed]))
