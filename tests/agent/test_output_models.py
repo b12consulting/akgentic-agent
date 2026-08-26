@@ -120,7 +120,7 @@ class TestPromptCarriedReplyProtocol:
     def test_request_prompt_prefix(self) -> None:
         """A request from @Manager composes the exact AC-3 prompt prefix.
 
-        The composition now lives on ``AgentMessage.render_for_llm()`` — the
+        The composition now lives on ``AgentMessage.rendering()`` — the
         table keeps its home here, and the message reads it. Driving the real
         renderer rather than re-composing the prefix locally is what stops this
         spec from being a tautology that agrees with itself.
@@ -130,7 +130,7 @@ class TestPromptCarriedReplyProtocol:
 
         message = AgentMessage(content="Estimate feature X", type="request")
         message.sender = _sender_named(sender)
-        rendered = message.render_for_llm()
+        rendered = message.rendering()
 
         # The subject is the AC-3 framing and the {sender} substitution, not the
         # protocol's wording — asserting the composed literal here would just

@@ -45,7 +45,7 @@ HumanProxy ──send()──► BaseAgent (Manager)
                     act(message, StructuredOutput)   ← @guard_usage_limits()
                       │
                       ├─ append **Context update N** block (if shared state changed)
-                      ├─ message.render_for_llm() — the message frames itself:
+                      ├─ message.rendering() — the message frames itself:
                       │  "You received a request from @Human. A reply is
                       │   expected: respond to @Human with the result."
                       ├─ expand !!glob_pattern refs in the rendered string
@@ -188,7 +188,7 @@ Intent flows through the system in two complementary ways:
    delivers the **raw** `request.message` as an `AgentMessage` whose `type` field carries that
    intent unchanged. The sender does not rewrite the content.
 
-2. **When receiving** — `AgentMessage.render_for_llm()` puts a one-line reply protocol, keyed on
+2. **When receiving** — `AgentMessage.rendering()` puts a one-line reply protocol, keyed on
    the message's own `type` via `REPLY_PROTOCOLS`, in front of its content. The guidance is
    therefore always the one matching the intent *that* agent received, and it reaches the LLM
    through the **prompt** — not through the output schema. The handler composes nothing.
@@ -258,7 +258,7 @@ enforced at **routing time** in `_route_output()`, not in the schema:
 | `RoleName` | `hire_member(role)` → create actor → send |
 
 The reply-protocol guidance lives where the LLM actually reads it — the **prompt**.
-`AgentMessage.render_for_llm()` puts a one-line protocol (keyed on the message's own
+`AgentMessage.rendering()` puts a one-line protocol (keyed on the message's own
 type via `REPLY_PROTOCOLS`) in front of the content, and `act()` calls it:
 
 ```
@@ -281,7 +281,7 @@ it on the receiving side, so the guidance is always keyed to the intent that age
 received:
 
 ```python
-# AgentMessage.render_for_llm(), called once by act() before the LLM turn:
+# AgentMessage.rendering(), called once by act() before the LLM turn:
 return (
     f"You received {article} {self.type} from {sender_name}. "
     f"{REPLY_PROTOCOLS.get(self.type, '').format(sender=sender_name)}"
@@ -400,7 +400,7 @@ human_proxy.process_human_input("My answer", original_message)
 
 ## Message Protocol
 
-The 5-type intent protocol controls conversation flow. `AgentMessage.render_for_llm()` puts
+The 5-type intent protocol controls conversation flow. `AgentMessage.rendering()` puts
 the `REPLY_PROTOCOLS` instruction matching its own `type` into the **user prompt** (not the
 output schema), so the LLM reads the guidance inline with the content:
 
@@ -661,7 +661,7 @@ mailbox surfaces — the `read_mailbox` tool, which takes the **id** of one wait
 acknowledges it, and `/stop` (`MailboxTool`). The tool consumes nothing itself:
 `MailboxCapability.after_tool_execute` absorbs exactly the message the model named, so that
 one is not delivered again as its own turn, and injects that message's own
-`render_for_llm()`. Mail the model does not name stays queued, and a cancel is never offered
+`rendering()`. Mail the model does not name stays queued, and a cancel is never offered
 and never absorbed. A card already supplied in `config.tools` wins over the prepended
 default, and `config.tools` itself is never mutated — `on_start()` copies the list.
 
@@ -913,7 +913,7 @@ Separately from the command channel, `BaseAgent`'s own public methods are reacha
 
 When the registry carries an `_expand_media_refs` command — `WorkspaceTool` is what provides it —
 `act()` expands inline file references before the LLM call. Expansion runs on the **rendered**
-string, after `message.render_for_llm()`, so a `!!glob` written anywhere in a message's own
+string, after `message.rendering()`, so a `!!glob` written anywhere in a message's own
 framing expands exactly as one written in its content does:
 
 ```
@@ -937,8 +937,8 @@ A running turn can be interrupted. The design is **two surfaces, one predicate, 
   the same `CommandsAnnouncedEvent` as any other command; `CancelMessage`
   (`akgentic.core.messages`) is the typed carrier for programmatic senders. Both land in the
   agent's mailbox like any other message.
-- **One predicate.** `is_cancel`, defined once in `akgentic.agent.capabilities`, recognises
-  both forms — nothing else in the system parses cancel vocabulary.
+- **One predicate.** `is_cancel`, defined once in `akgentic.tool.mailbox`, recognises both
+  forms — nothing else in the system parses cancel vocabulary.
 - **One hook.** `MailboxCapability.before_model_request` (same module), built
   **unconditionally** by `BaseAgent` — never contributed by a card, so cancellation works even
   on an agent configured without `MailboxTool`. The agent owns *both* the vocabulary and the
@@ -985,9 +985,8 @@ at recognition, so a cancel can never go stale and cancel the next run.
 
 **`read_mailbox=False` turns it off completely.** The notice exists to offer the model a way to
 take a waiting message on now, so without that tool it is an instruction the model cannot
-follow, rendered on every step boundary of every run. `BaseAgent` reads the card at wiring time
-and hands `MailboxCapability` the answer; with reads disabled nothing is rendered and nothing is
-enqueued. Mail is not lost — it still arrives as its own turn, which is the fallback the design
+follow, rendered on every step boundary of every run. `MailboxCapability` reads `read_mailbox` off
+the card it is given; with reads disabled nothing is rendered and nothing is enqueued. Mail is not lost — it still arrives as its own turn, which is the fallback the design
 already specifies. **Cancellation is unaffected**: the purge-and-raise runs *ahead* of the
 notice and is not configurable from any card, so a `/stop` or `CancelMessage` still ends the run
 — including for an agent carrying no `MailboxTool` at all.
@@ -996,9 +995,9 @@ notice and is not configurable from any card, so a `/stop` or `CancelMessage` st
 > the informational "1 new message arrived — finish your current work first" notice. Deliberate.
 > That signal is not worth a render on every step boundary when the run cannot act on it.
 >
-> `mailbox_preview_handlers: []` is **not** the same switch and is not a substitute. It
-> withholds every *id* but still renders, so every line becomes "Message cannot be handled in
-> the run" — a doorbell that announces something and then says nothing can be done about it.
+> It is also the **only** switch: there is no per-handler setting any more. The card field that
+> named handlers by dotted path is gone, replaced by the message type itself — see the offer rule
+> below.
 
 The same hook, after the cancel check, announces mail that arrived during the run: new
 pending messages are announced **once**, by a **durable** notice (rendered by
@@ -1030,24 +1029,28 @@ recorded: content enqueued by any other producer keeps the redirect, and the ren
 has already been consumed from the mailbox, so the queue is the only thing still holding it.
 
 **Every announced message is listed; only some carry an id.** A message this run can take on
-renders as its own `mailbox_preview()` followed by `(id: …)` — the only way the model can name
+renders as its own `rendering_preview()` followed by `(id: …)` — the only way the model can name
 it. Everything else renders as the fixed line `- Message cannot be handled in the run`, with no
 id and no content. That missing id *is* the constraint: such a message is **visible but
 unaskable** — not rejected, not validated, not refused. The affordance simply is not offered.
 
-A message is offered an id only when **all four** of these hold:
+A message is offered an id only when **all three** of these hold:
 
-1. **It can render a preview at all** — it satisfies `MailboxPreviewable`. A class that
-   declares no `mailbox_preview()` is never offered, which is what keeps a class carrying its
-   own fields out of a mid-run read instead of being handed an id it cannot honour.
-2. **The current handler's message class is whitelisted** — the `MailboxTool` card's
-   `mailbox_preview_handlers`. `None`, the default, admits every handler; `[]` is a different
-   value and admits none.
-3. **Its class is exactly the class of the message being handled.** Same class means same
+1. **It is a `MailboxMessage`** (`akgentic.tool.mailbox`). Extending that base is how a class
+   declares it can travel through a mailbox, and it owes both `rendering()` and
+   `rendering_preview()` — either one left unanswered raises. A class that renders but should
+   never be absorbed mid-run simply does not extend it; `TriageMessage` in `custom_agent.py` is
+   the worked case, renderable by `act()` and never offered.
+2. **Its class is exactly the class of the message being handled.** Same class means same
    handler means same output type, so an absorbed message is answered in the shape its own
    handler would have produced. An exact class check, not `isinstance`.
-4. **It is not a cancel.** A `/stop` arrives as an ordinary `AgentMessage` and does have a
+3. **It is not a cancel.** A `/stop` arrives as an ordinary `AgentMessage` and does have a
    preview, so offering its id would let the model read its way out of being cancelled.
+
+> There used to be a fourth condition — a `mailbox_preview_handlers` list on the card, naming
+> handlers by dotted path. It is gone and nothing replaced it: 1 and 2 already decide exactly what
+> it decided, and it cost a dotted-path resolution, four `ValueError` shapes and a typo that
+> surfaced only at agent init.
 
 The closing line follows the same rule. It points at `read_mailbox` "with one of the ids above"
 only when at least one id is on offer; otherwise it says only "Finish your current work first —
@@ -1060,13 +1063,13 @@ principle one step earlier: a notice that cannot name an id is degraded, and a n
 
 **Naming an id absorbs that one message.** `read_mailbox` takes the id and acknowledges it;
 `MailboxCapability.after_tool_execute` consumes exactly the message named and enqueues that
-message's own `render_for_llm()` at `"asap"`, so its content arrives as its own injected turn
+message's own `rendering()` at `"asap"`, so its content arrives as its own injected turn
 rather than as a tool result. An absent or unknown id is a silent no-op. Whatever the model
 leaves unnamed stays queued and arrives as its own turn once the run ends, and a cancel is
 never offered and never absorbed.
 
 **The injected turn is prefixed with `ABSORBED_PREFIX`, and that prefix is load-bearing.**
-`render_for_llm()` renders a message the way its *own handler* would receive it — imperative and
+`rendering()` renders a message the way its *own handler* would receive it — imperative and
 self-contained ("You received a request from @X. A reply is expected."). Injected mid-run that
 reads as a **new assignment**, and the model answers it *instead of* what it was already doing.
 Observed in the field: an agent that had just finished a report answered only the newer question,
@@ -1084,7 +1087,29 @@ noise, a swallowed report reaches nobody.
 
 The prefix belongs to the capability, not the message: **rendering a message is the message's
 job, delivering one is the capability's**, and framing a delivery is part of delivering it — so
-every class that grows a `render_for_llm()` inherits it for free.
+every class that grows a `rendering()` inherits it for free.
+
+**Both injected strings come from the `MailboxTool` card, and the card is what gets injected.**
+`MailboxCapability(observer=self, card=mailbox_card)` is the whole of the wiring:
+`BaseAgent._assemble_capabilities` hands the card over and inspects none of it, and the capability
+reads `absorbed_prefix`, `arrival_closing` and `read_mailbox` off it
+itself. The mailbox's wording is therefore a deployment decision rather than a code change, and
+which fields the mailbox needs is knowledge the *consumer* holds — the agent does not repeat it.
+
+The card is **required**, so a card published before these fields existed fails loudly rather than
+quietly running text nobody can see in the catalog; `akgentic-agent` depends on an `akgentic-tool`
+release carrying them. The one value that does not reach the model is the empty string: `""` falls
+back to the module constant, because a prefix set empty is a configuration mistake whose failure
+mode is a mid-run injection with no framing at all. That is `or`, not `is None`: an empty string is
+a configuration mistake rather than a choice.
+
+Two deliberate asymmetries a reader will otherwise re-litigate. First, the closing line reaches
+`render_arrival_notice` as a *function parameter* while the prefix arrives at construction: the
+renderer is a module-level function, which constructor injection cannot reach. Second, the
+id-less closing is **not** configurable and takes no parameter — a listing carrying no id may not
+promise a read whatever a deployment sets. Cancellation consults neither string: the
+purge-and-raise runs above the notice, so a capability built with empty text for both is still
+interruptible.
 
 ### Honest limitations
 
@@ -1212,7 +1237,7 @@ package's release lands on the raised floor.
 ```
 src/akgentic/agent/
     __init__.py          # Public API: BaseAgent, AgentConfig, HumanProxy, AgentMessage,
-                         #   LlmRenderable, MailboxPreviewable, RunInterruptedError,
+                         #   LlmRenderable, RunInterruptedError,
                          #   MailboxRenderError
     agent.py             # BaseAgent — actor + LLM + tool composition, routing logic
     capabilities/        # Capabilities the agent wires itself: MailboxCapability, is_cancel,
@@ -1221,7 +1246,7 @@ src/akgentic/agent/
     custom_agent.py      # Worked example: a second agent class with its own schema
     human_proxy.py       # HumanProxy — human-in-the-loop bridge
     messages.py          # AgentMessage with typed protocol, and the two rendering
-                         #   Protocols: LlmRenderable, MailboxPreviewable
+                         #   LlmRenderable — the Protocol act() accepts
     output_models.py     # StructuredOutput, Request, REPLY_PROTOCOLS
     usage_limits.py      # guard_usage_limits decorator + escalation (no agent.py import)
     utils.py             # resolve_recipient — the team addressing convention

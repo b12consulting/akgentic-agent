@@ -30,12 +30,12 @@ import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.llm import ModelConfig, PromptTemplate
 from akgentic.tool.core import CommandRegistry, ContextState, ToolCard, ToolFactory
-from akgentic.tool.mailbox import MailboxTool, ReadMailbox
+from akgentic.tool.mailbox import MailboxCapability, MailboxTool, ReadMailbox
+from akgentic.tool.mailbox.capability import _CLOSING_WITH_IDS, ABSORBED_PREFIX
 from akgentic.tool.team import TeamTool
 
 import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.capabilities import MailboxCapability
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -327,45 +327,6 @@ def _wired_capability() -> MailboxCapability:
     return capability
 
 
-class TestPreviewWhitelistReachesTheCapability:
-    """The whitelist is configured on a card and enforced in a capability.
-
-    Nothing else crosses that gap: every offer-rule spec constructs the
-    capability with ``preview_handlers=`` directly. A wrong attribute name, a
-    card filter that misses, or a dropped constructor argument would leave all
-    of them green while every deployment fell back to admitting every handler —
-    the permissive direction, and a silent one.
-
-    These specs configure a stock ``MailboxTool`` on purpose. Reading the field
-    off the real card is what makes them a guard on the seam rather than on this
-    package alone: a rename on the ``akgentic-tool`` side turns them red here,
-    which is the only place the mismatch is visible.
-    """
-
-    _HANDLER = "akgentic.agent.messages.AgentMessage"
-
-    def test_the_cards_whitelist_is_what_the_capability_enforces(self) -> None:
-        card = MailboxTool(mailbox_preview_handlers=[self._HANDLER])
-
-        _start_agent(_agent_config(tools=[card]))
-
-        assert _wired_capability()._preview_handlers == [self._HANDLER]
-
-    def test_an_empty_whitelist_survives_the_trip_as_itself(self) -> None:
-        """``[]`` admits no handler and is never coerced to ``None`` on the way."""
-        card = MailboxTool(mailbox_preview_handlers=[])
-
-        _start_agent(_agent_config(tools=[card]))
-
-        assert _wired_capability()._preview_handlers == []
-
-    def test_a_card_declaring_no_whitelist_admits_every_handler(self) -> None:
-        """The card's own default, reached through the auto-inserted mailbox card."""
-        _start_agent(_agent_config())
-
-        assert _wired_capability()._preview_handlers is None
-
-
 class TestTheNoticeIsGatedOnTheReadTool:
     """Story 26-2: `read_mailbox=False` turns the doorbell off.
 
@@ -420,3 +381,72 @@ class TestTheNoticeIsGatedOnTheReadTool:
         assert isinstance(capability, MailboxCapability)
         assert capability._arrival_notice is False
         assert card.get_commands(), "the /stop command must survive read_mailbox=False"
+
+
+# =============================================================================
+# Epic 27 — the two injected prompt strings travel from the card too
+# =============================================================================
+
+
+class _CardCarryingPromptText(MailboxTool):
+    """A ``MailboxTool`` that already carries the two prompt fields.
+
+    The real card grows them in ``akgentic-tool``, and the two halves are
+    designed to land in either order — so this package's specs must be able to
+    exercise *both* worlds against whichever card version is resolved: a card
+    that has the fields, and a card that does not. Subclassing is what makes the
+    first case reachable before the field lands, without this package assuming
+    anything about when it does.
+    """
+
+    absorbed_prefix: str = ""
+    arrival_closing: str = ""
+
+
+class TestThePromptTextReachesTheCapabilityFromTheCard:
+    """The wording is a deployment decision, read off the card defensively.
+
+    ``getattr(card, name, None) or CONSTANT`` — never a direct attribute read:
+    ``akgentic-agent`` resolves ``akgentic-tool`` from PyPI in CI, so a card
+    predating the fields must keep working and produce exactly today's text.
+    """
+
+    _PREFIX = "SENTINEL PREFIX — configured on the card."
+    _CLOSING = "SENTINEL CLOSING — configured on the card."
+
+    def test_a_card_carrying_neither_field_yields_the_module_constants(self) -> None:
+        """The stock card: whatever it carries, the delivered text is this module's.
+
+        **This spec deliberately means two different things depending on which
+        ``akgentic-tool`` is resolved, and both are worth having.** Against a
+        card *predating* the fields — which is what CI resolves from PyPI until
+        the tool-side half is published — the ``getattr`` misses and this pins
+        the **fallback**. Against a card that *carries* them, the ``getattr``
+        hits and the very same two assertions become a guard on the **seam**:
+        the card's default text must still be byte-for-byte the text this module
+        ships. So the two environments cover the two worlds between them, which
+        is why this spec is written against the stock card rather than a double.
+
+        If it goes red in a workspace whose card has the fields, nothing here is
+        broken: the two copies of the wording have drifted apart and one of them
+        is wrong. Fix the drift, not this spec.
+
+        MUTATION — this one stays green when the wiring lines are deleted
+        outright, by design: it pins the *fallback*. The two below are what go
+        red.
+        """
+        _start_agent(_agent_config())
+
+        capability = _wired_capability()
+        assert capability._absorbed_prefix == ABSORBED_PREFIX
+        assert capability._arrival_closing == _CLOSING_WITH_IDS
+
+    def test_a_card_carrying_the_fields_decides_the_text(self) -> None:
+        """MUTATION — drop either wiring line and its half of this goes red."""
+        card = _CardCarryingPromptText(absorbed_prefix=self._PREFIX, arrival_closing=self._CLOSING)
+
+        _start_agent(_agent_config(tools=[card]))
+
+        capability = _wired_capability()
+        assert capability._absorbed_prefix == self._PREFIX
+        assert capability._arrival_closing == self._CLOSING

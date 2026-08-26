@@ -44,6 +44,7 @@ from unittest.mock import MagicMock
 import pytest
 from akgentic.core import ActorAddress
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
+from akgentic.tool.mailbox import MailboxTool
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -89,7 +90,7 @@ def _make_minimal_agent() -> BaseAgent:
     agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
 
     # Mailbox capability normally built in _build_react_agent (Epic 20).
-    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
+    agent._mailbox_capability = MailboxCapability(observer=agent, card=MailboxTool())  # type: ignore[arg-type]
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"
@@ -108,9 +109,7 @@ def _structured_output_args(
 ) -> dict[str, list[dict[str, str]]]:
     """Build valid `StructuredOutput` tool args. All three Request fields are required."""
     return {
-        "messages": [
-            {"message_type": message_type, "message": message, "recipient": recipient}
-        ]
+        "messages": [{"message_type": message_type, "message": message, "recipient": recipient}]
     }
 
 

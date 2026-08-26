@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig
 from akgentic.tool.core import ContextState, ContextUpdater
+from akgentic.tool.mailbox import MailboxTool
 from pydantic_ai import RunContext
 from pydantic_ai.messages import (
     ModelRequest,
@@ -100,7 +101,7 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     )
 
     # Mailbox capability normally built in _build_react_agent (Epic 20).
-    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
+    agent._mailbox_capability = MailboxCapability(observer=agent, card=MailboxTool())  # type: ignore[arg-type]
     return agent
 
 
@@ -159,9 +160,7 @@ class TestClearReset:
 
         blocks = _recorded_blocks(agent)
         assert len(blocks) == 2
-        assert blocks[1] == (
-            "**Context update 1** — current state.\n\n**Team roster:**\n@Manager"
-        )
+        assert blocks[1] == ("**Context update 1** — current state.\n\n**Team roster:**\n@Manager")
 
     def test_compact_gains_no_reset_call(self) -> None:
         holder: dict[str, ContextState | None] = {"state": _RosterState(members=("@Manager",))}
@@ -214,7 +213,7 @@ def _real_react_agent_pair() -> tuple[ReactAgent, BaseAgent, dict[str, ContextSt
     )
 
     # Mailbox capability normally built in _build_react_agent (Epic 20).
-    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
+    agent._mailbox_capability = MailboxCapability(observer=agent, card=MailboxTool())  # type: ignore[arg-type]
     return react_agent, agent, holder
 
 
@@ -231,6 +230,7 @@ class TestPrefixStability:
         """
         react_agent, agent, holder = _real_react_agent_pair()
         try:
+
             @react_agent.system_prompt
             def agent_backstory(ctx: RunContext[BaseAgent]) -> str:
                 return "You are a test agent with a fixed backstory."

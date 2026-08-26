@@ -109,8 +109,8 @@ class TestCustomAgentNormalTurn:
         message, output_type = agent.act.call_args[0]  # type: ignore[attr-defined]
         assert output_type is TriageOutput
         assert isinstance(message, TriageMessage)
-        assert "disk full on node 3" in message.render_for_llm()
-        assert "monitoring" in message.render_for_llm()
+        assert "disk full on node 3" in message.rendering()
+        assert "monitoring" in message.rendering()
 
         agent.send.assert_called_once()  # type: ignore[attr-defined]
         _, sent = agent.send.call_args[0]  # type: ignore[attr-defined]
