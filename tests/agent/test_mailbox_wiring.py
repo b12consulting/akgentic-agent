@@ -455,7 +455,21 @@ class TestThePromptTextReachesTheCapabilityFromTheCard:
     _CLOSING = "SENTINEL CLOSING — configured on the card."
 
     def test_a_card_carrying_neither_field_yields_the_module_constants(self) -> None:
-        """Today's published card: the ``getattr`` misses, and nothing changes.
+        """The stock card: whatever it carries, the delivered text is this module's.
+
+        **This spec deliberately means two different things depending on which
+        ``akgentic-tool`` is resolved, and both are worth having.** Against a
+        card *predating* the fields — which is what CI resolves from PyPI until
+        the tool-side half is published — the ``getattr`` misses and this pins
+        the **fallback**. Against a card that *carries* them, the ``getattr``
+        hits and the very same two assertions become a guard on the **seam**:
+        the card's default text must still be byte-for-byte the text this module
+        ships. So the two environments cover the two worlds between them, which
+        is why this spec is written against the stock card rather than a double.
+
+        If it goes red in a workspace whose card has the fields, nothing here is
+        broken: the two copies of the wording have drifted apart and one of them
+        is wrong. Fix the drift, not this spec.
 
         MUTATION — this one stays green when the wiring lines are deleted
         outright, by design: it pins the *fallback*. The two below are what go
@@ -469,9 +483,7 @@ class TestThePromptTextReachesTheCapabilityFromTheCard:
 
     def test_a_card_carrying_the_fields_decides_the_text(self) -> None:
         """MUTATION — drop either wiring line and its half of this goes red."""
-        card = _CardCarryingPromptText(
-            absorbed_prefix=self._PREFIX, arrival_closing=self._CLOSING
-        )
+        card = _CardCarryingPromptText(absorbed_prefix=self._PREFIX, arrival_closing=self._CLOSING)
 
         _start_agent(_agent_config(tools=[card]))
 
