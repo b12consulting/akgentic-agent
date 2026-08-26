@@ -162,7 +162,11 @@ _CLOSING_WITH_IDS = (
 _CLOSING_WITHOUT_IDS = "Finish your current work first — you will get them just after."
 
 
-def render_arrival_notice(new_messages: list[Message], offerable_ids: set[uuid.UUID]) -> str:
+def render_arrival_notice(
+    new_messages: list[Message],
+    offerable_ids: set[uuid.UUID],
+    closing_with_ids: str = _CLOSING_WITH_IDS,
+) -> str:
     """Doorbell for messages that arrived mid-run (ADR-010 §5, ADR-040 §5).
 
     A count line, one line per message **in the order given**, then the closing
@@ -185,10 +189,22 @@ def render_arrival_notice(new_messages: list[Message], offerable_ids: set[uuid.U
     work is finished, and is worth nothing after. The reassurance that unread
     mail arrives as its own turn is true either way and is kept in both.
 
+    **The closing line arrives as a parameter, and the prefix does not.** That
+    asymmetry is deliberate, not an oversight: this is a module-level *function*,
+    so constructor injection cannot reach it the way it reaches
+    :data:`ABSORBED_PREFIX` on :class:`MailboxCapability`. The caller passes its
+    configured closing here instead, and the default keeps every existing
+    two-argument call rendering exactly what it always did.
+    ``_CLOSING_WITHOUT_IDS`` takes no parameter — a listing carrying no id may
+    not promise a read whatever a deployment configures.
+
     Args:
         new_messages: The messages to announce, in reception order.
         offerable_ids: Ids the offer filter admitted. Every one of them must
             belong to a message satisfying ``MailboxPreviewable``.
+        closing_with_ids: The closing line for a listing that offers at least one
+            id. Defaults to the module constant, which is what a directly-called
+            render has always used.
 
     Returns:
         The rendered notice, or ``""`` for an empty list.
@@ -205,7 +221,7 @@ def render_arrival_notice(new_messages: list[Message], offerable_ids: set[uuid.U
     lines = [f"{count} new {noun} arrived:"]
     lines.extend(_message_line(message, offerable_ids) for message in new_messages)
     offered = any(message.id in offerable_ids for message in new_messages)
-    lines.append(_CLOSING_WITH_IDS if offered else _CLOSING_WITHOUT_IDS)
+    lines.append(closing_with_ids if offered else _CLOSING_WITHOUT_IDS)
     return "\n".join(lines)
 
 
@@ -324,6 +340,8 @@ class MailboxCapability(AbstractCapability[Any]):
         observer: MailboxAccess,
         preview_handlers: list[str] | None = None,
         arrival_notice: bool = True,
+        absorbed_prefix: str = ABSORBED_PREFIX,
+        arrival_closing: str = _CLOSING_WITH_IDS,
     ) -> None:
         """Wire the capability to one agent's mailbox.
 
@@ -340,12 +358,25 @@ class MailboxCapability(AbstractCapability[Any]):
                 as it always has. **Cancellation ignores this flag entirely**:
                 the purge-and-raise runs ahead of the notice and is not
                 configurable from any card.
+            absorbed_prefix: What an absorbed message's own rendering is prefixed
+                with when it is injected. Defaults to :data:`ABSORBED_PREFIX`, so
+                a directly-constructed capability behaves as it always has.
+            arrival_closing: The arrival notice's closing line for a listing that
+                offers at least one id. Defaults to the module constant, same
+                reason. ``_CLOSING_WITHOUT_IDS`` is not configurable: a listing
+                with no id may not promise a read whatever a deployment sets.
+
+        **Cancellation ignores both strings as well as the flag above.** The
+        purge-and-raise reads no configured value at all, so a capability built
+        with empty strings for both is still interruptible.
         """
         self._observer = observer
         self._announced_ids: set[uuid.UUID] = set()
         self._notice_enqueue_ids: set[str] = set()
         self._preview_handlers = preview_handlers
         self._arrival_notice = arrival_notice
+        self._absorbed_prefix = absorbed_prefix
+        self._arrival_closing = arrival_closing
 
     async def before_run(self, ctx: RunContext[Any]) -> None:
         """Forget which arrivals the previous run announced.
@@ -452,7 +483,9 @@ class MailboxCapability(AbstractCapability[Any]):
             return request_context
         new_messages = [m for m in pending if m.id not in self._announced_ids]
         if new_messages:
-            notice = render_arrival_notice(new_messages, self.offerable_ids(new_messages))
+            notice = render_arrival_notice(
+                new_messages, self.offerable_ids(new_messages), self._arrival_closing
+            )
             # The enqueue id is kept so ``after_node_run`` can withdraw *this* entry and
             # nothing else. Withdrawal must key on the enqueue site, never on the rendered
             # text: matching by content would couple the withdrawal to the notice's wording.
@@ -589,5 +622,5 @@ class MailboxCapability(AbstractCapability[Any]):
                     type(message).__name__,
                 )
                 continue
-            ctx.enqueue(f"{ABSORBED_PREFIX}\n\n{message.render_for_llm()}", priority="asap")
+            ctx.enqueue(f"{self._absorbed_prefix}\n\n{message.render_for_llm()}", priority="asap")
         return result

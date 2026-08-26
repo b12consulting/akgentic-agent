@@ -617,3 +617,28 @@ class TestAnAbsorbedMessageIsFramedAsAddedWork:
         assert "does NOT replace" in enqueued
         assert enqueued == f"{ABSORBED_PREFIX}\n\n{absorbed.render_for_llm()}"
         assert priority == "asap"
+
+    async def test_the_prefix_is_the_one_the_capability_was_built_with(self) -> None:
+        """Epic 27 — a custom prefix in, the same prefix out.
+
+        The framing text is the capability's, taken from whoever constructed it,
+        which at the wiring site is the ``MailboxTool`` card. What is pinned is
+        the invariant, not the sentences: the constructed value frames the
+        delivery, and the message's own rendering is still carried whole.
+
+        MUTATION — restore ``ABSORBED_PREFIX`` at the ``ctx.enqueue`` call in
+        ``after_tool_execute`` and this goes red on its own; the sibling spec
+        above stays green, because it constructs no prefix of its own.
+        """
+        sentinel = "SENTINEL PREFIX — configured on the card."
+        absorbed = _agent_message("what is the colour of the sky?", "@Human")
+        capability = MailboxCapability(
+            observer=_MailboxDouble([absorbed]),
+            absorbed_prefix=sentinel,
+        )
+        ctx = _CtxDouble()
+
+        await _after_read(capability, ctx, {MESSAGE_ID_ARG: str(absorbed.id)})
+
+        (enqueued,), _priority = ctx.enqueue_calls[0]
+        assert enqueued == f"{sentinel}\n\n{absorbed.render_for_llm()}"

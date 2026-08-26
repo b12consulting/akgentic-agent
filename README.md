@@ -1086,6 +1086,24 @@ The prefix belongs to the capability, not the message: **rendering a message is 
 job, delivering one is the capability's**, and framing a delivery is part of delivering it — so
 every class that grows a `render_for_llm()` inherits it for free.
 
+**Both injected strings come from the `MailboxTool` card.** The absorbed-message prefix and the
+arrival notice's closing line are `MailboxCapability` constructor arguments, and
+`BaseAgent._assemble_capabilities` feeds them from the card it already reads the preview
+whitelist off — so the mailbox's wording is a deployment decision rather than a code change. The
+card is read **defensively**: a card that carries neither field, or carries an empty string for
+one, yields the module constant, which is exactly the text that shipped before. An empty string
+falls back rather than being honoured, because a prefix set to `""` is a configuration mistake
+whose failure mode is a mid-run injection with no framing at all. The constants remain the
+constructor defaults, so a directly-constructed `MailboxCapability` behaves as it always has.
+
+Two deliberate asymmetries a reader will otherwise re-litigate. First, the closing line reaches
+`render_arrival_notice` as a *function parameter* while the prefix arrives at construction: the
+renderer is a module-level function, which constructor injection cannot reach. Second, the
+id-less closing is **not** configurable and takes no parameter — a listing carrying no id may not
+promise a read whatever a deployment sets. Cancellation consults neither string: the
+purge-and-raise runs above the notice, so a capability built with empty text for both is still
+interruptible.
+
 ### Honest limitations
 
 - **An interruption is a clean end, not a failure.** It never routes through the failure

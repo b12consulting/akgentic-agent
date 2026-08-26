@@ -54,6 +54,7 @@ from typing import Any, TypeVar, cast
 from pydantic_ai import AgentCapability, BinaryContent, ModelRetry, RunContext
 
 from akgentic.agent.capabilities import MailboxCapability, RunInterruptedError
+from akgentic.agent.capabilities.mailbox_capability import ABSORBED_PREFIX, _CLOSING_WITH_IDS
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage, LlmRenderable
 from akgentic.agent.output_models import StructuredOutput
@@ -351,8 +352,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Separate from ``_build_react_agent`` because the two need different
         things. This needs the ``MailboxTool`` card, to read the preview
-        whitelist off it; the builder needs only the finished list. Keeping them
-        apart is what lets the builder be a pure function of its arguments.
+        whitelist and the two injected prompt strings off it; the builder needs
+        only the finished list. Keeping them apart is what lets the builder be a
+        pure function of its arguments.
+
+        The prompt strings — the absorbed-message prefix and the arrival
+        notice's closing line — make the mailbox's wording a deployment decision
+        rather than a code change. They are read defensively, so a card
+        predating them yields the module constants, which is exactly the
+        behaviour that shipped before.
 
         The mailbox capability is held on ``self`` as well as returned:
         ``after_tool_execute`` and the cancel check must share one instance for
@@ -360,8 +368,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         name.
 
         Args:
-            mailbox_card: The card the whitelist is read from — either the one
-                the config supplied or the auto-inserted default.
+            mailbox_card: The card the whitelist and the prompt strings are read
+                from — either the one the config supplied or the auto-inserted
+                default.
 
         Returns:
             ``[mailbox, *extra_capabilities()]``. Mailbox first because hook
@@ -372,6 +381,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             observer=self,
             preview_handlers=mailbox_card.mailbox_preview_handlers,
             arrival_notice=bool(mailbox_card.read_mailbox),
+            # Read defensively: these two fields do not exist on older published
+            # versions of the card, and the halves are designed to land in either
+            # order. `or`, NOT `is None` — and that is deliberately unlike
+            # `mailbox_preview_handlers` one line above, where `[]` and `None` are
+            # different values on purpose. Here an empty string is a configuration
+            # mistake, not a choice: honouring it would ship a mid-run injection
+            # with no framing at all, so it falls back to the constant.
+            absorbed_prefix=getattr(mailbox_card, "absorbed_prefix", None) or ABSORBED_PREFIX,
+            arrival_closing=getattr(mailbox_card, "arrival_closing", None) or _CLOSING_WITH_IDS,
         )
         return [self._mailbox_capability, *self.extra_capabilities()]
 

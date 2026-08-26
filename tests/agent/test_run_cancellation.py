@@ -58,7 +58,13 @@ import akgentic.agent.agent as agent_module
 from akgentic.agent import RunInterruptedError
 from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.capabilities import is_cancel, render_arrival_notice
-from akgentic.agent.capabilities.mailbox_capability import MESSAGE_ID_ARG, READ_MAILBOX_TOOL
+from akgentic.agent.capabilities.mailbox_capability import (
+    _CLOSING_WITH_IDS,
+    _CLOSING_WITHOUT_IDS,
+    ABSORBED_PREFIX,
+    MESSAGE_ID_ARG,
+    READ_MAILBOX_TOOL,
+)
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
@@ -344,6 +350,100 @@ class TestArrivalNotice:
         await capability.before_model_request(ctx, _context())
 
         assert ctx.enqueue_calls == []
+
+
+# =============================================================================
+# Epic 27 — the injected prompt text is the capability's, not the module's
+# =============================================================================
+
+
+class TestTheInjectedTextIsWhatTheCapabilityWasBuiltWith:
+    """A custom string in, the same string out — for both injected strings.
+
+    The invariant, never the phrasing: story 26-4 retired an assertion on a
+    clause of the prefix for exactly that reason, and re-coupling these specs to
+    wording would make the next tuning pass a test failure for no behavioural
+    reason. What matters is that the value the capability was constructed with is
+    the value that reaches the run.
+    """
+
+    _CLOSING = "SENTINEL CLOSING — configured on the card."
+
+    async def test_the_capabilitys_closing_line_closes_the_notice(self) -> None:
+        """AC 3 — MUTATION: pass ``_CLOSING_WITH_IDS`` instead of
+        ``self._arrival_closing`` at the ``render_arrival_notice`` call in
+        ``before_model_request`` and this goes red alone.
+        """
+        arrived = _pending_message("news", "@Alice")
+        handled = _pending_message("the turn prompt", "@Human")
+        capability = MailboxCapability(
+            observer=_MailboxDouble([arrived], current=handled),
+            arrival_closing=self._CLOSING,
+        )
+        ctx = _CtxDouble()
+
+        await capability.before_model_request(ctx, _context())
+
+        (notice,), _priority = ctx.enqueue_calls[0]
+        assert str(arrived.id) in notice, "the listing must have offered an id at all"
+        assert notice.endswith(self._CLOSING)
+
+    async def test_an_id_less_listing_keeps_the_unconfigurable_closing(self) -> None:
+        """AC 5 — no id on offer, so no configured closing either.
+
+        ``_MailboxDouble`` with no ``current`` is the idle case: nothing can be
+        offered, so the notice carries no id and must not promise a read.
+        """
+        arrived = _pending_message()
+        capability = MailboxCapability(
+            observer=_MailboxDouble([arrived]), arrival_closing=self._CLOSING
+        )
+        ctx = _CtxDouble()
+
+        await capability.before_model_request(ctx, _context())
+
+        (notice,), _priority = ctx.enqueue_calls[0]
+        assert notice.endswith(_CLOSING_WITHOUT_IDS)
+        assert self._CLOSING not in notice
+
+    async def test_a_capability_built_with_neither_string_behaves_as_it_always_has(self) -> None:
+        """Both parameters are optional; the module constants are the defaults."""
+        capability = MailboxCapability(observer=_MailboxDouble())
+
+        assert capability._absorbed_prefix == ABSORBED_PREFIX
+        assert capability._arrival_closing == _CLOSING_WITH_IDS
+
+
+class TestCancellationConsultsNeitherString:
+    """AC 8 — a capability built with no usable prompt text is still interruptible.
+
+    The purge-and-raise runs *above* the notice gate and reads no configured
+    value. No notice-shaped spec would catch a regression here: strip the text
+    and every notice spec above simply stops asserting anything, while a run
+    that can no longer be stopped is invisible.
+    """
+
+    @pytest.mark.parametrize(
+        ("prefix", "closing"),
+        [
+            pytest.param("SENTINEL PREFIX", "SENTINEL CLOSING", id="sentinel"),
+            pytest.param("", "", id="empty"),
+        ],
+    )
+    async def test_a_pending_cancel_is_purged_and_raised_whatever_the_text(
+        self, prefix: str, closing: str
+    ) -> None:
+        cancel = CancelMessage()
+        mailbox = _MailboxDouble([_pending_message("hello"), cancel])
+        capability = MailboxCapability(
+            observer=mailbox, absorbed_prefix=prefix, arrival_closing=closing
+        )
+
+        with pytest.raises(RunInterruptedError):
+            await capability.before_model_request(_CtxDouble(), _context())
+
+        assert mailbox.consume_calls == [[cancel.id]]
+        assert cancel not in mailbox.pending
 
 
 # =============================================================================

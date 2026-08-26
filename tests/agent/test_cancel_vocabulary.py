@@ -247,6 +247,56 @@ def test_arrival_notice_leaves_a_short_preview_whole() -> None:
 
 
 # =============================================================================
+# The closing line is the caller's, and only in the offered branch (Epic 27)
+# =============================================================================
+
+
+class TestTheClosingLineIsAParameter:
+    """The renderer is module-level, so its closing arrives as an argument.
+
+    ``MailboxCapability`` takes its prefix at construction; this function cannot
+    be reached that way, so the closing line is a parameter defaulting to the
+    module constant. What is pinned below is the invariant — *the string the
+    caller passed is the string the notice closes with* — never the phrasing,
+    which is free to be re-tuned without reddening anything here.
+    """
+
+    _SENTINEL = "SENTINEL CLOSING — configured by the caller."
+
+    def test_the_closing_line_is_the_one_the_caller_passed(self) -> None:
+        """MUTATION — render the constant instead of the parameter and this
+        goes red on its own; nothing else in the suite notices, because every
+        other spec passes no closing at all.
+        """
+        offered = _agent_message("@Alice", "hello")
+
+        notice = render_arrival_notice([offered], _offered(offered), self._SENTINEL)
+
+        assert notice.endswith(self._SENTINEL)
+        assert CLOSING_WITH_IDS not in notice
+
+    def test_a_custom_closing_never_reaches_an_id_less_listing(self) -> None:
+        """``_CLOSING_WITHOUT_IDS`` is not configurable and takes no parameter.
+
+        A listing carrying no id may not promise a read, whatever the caller
+        configured — the closing the caller passes points at ``read_mailbox``,
+        and there is no id to name.
+        """
+        unofferable = _agent_message("@Alice", "not for this run")
+
+        notice = render_arrival_notice([unofferable], set(), self._SENTINEL)
+
+        assert notice.endswith(CLOSING_WITHOUT_IDS)
+        assert self._SENTINEL not in notice
+
+    def test_the_two_argument_call_still_closes_with_the_module_default(self) -> None:
+        """The parameter's default is what every existing caller relies on."""
+        offered = _agent_message("@Alice", "hello")
+
+        assert render_arrival_notice([offered], _offered(offered)).endswith(CLOSING_WITH_IDS)
+
+
+# =============================================================================
 # FR8 — the vocabulary is the agent's, structurally
 # =============================================================================
 
