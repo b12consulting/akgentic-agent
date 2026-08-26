@@ -23,7 +23,7 @@ Architecture:
   acknowledges a cancel that lands while the agent is idle. Akgent still
   contributes the lifecycle handler receiveMsg_StopRecursively
 - Mailbox-driven run control (ADR-040): MailboxCapability, from
-  akgentic.agent.capabilities, peeks the mailbox before every model request and
+  akgentic.tool.mailbox, peeks the mailbox before every model request and
   does two things with what it finds — it purges a pending /stop or
   CancelMessage and raises RunInterruptedError on it, and it renders the mid-run
   arrival notice for mail not yet announced this run and enqueues it for the
@@ -53,8 +53,6 @@ from typing import Any, TypeVar, cast
 
 from pydantic_ai import AgentCapability, BinaryContent, ModelRetry, RunContext
 
-from akgentic.agent.capabilities import MailboxCapability, RunInterruptedError
-from akgentic.agent.capabilities.mailbox_capability import ABSORBED_PREFIX, _CLOSING_WITH_IDS
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage, LlmRenderable
 from akgentic.agent.output_models import StructuredOutput
@@ -73,7 +71,7 @@ from akgentic.llm import (
 from akgentic.tool.core import CommandRegistry, ContextUpdater, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized
 from akgentic.tool.core.event import CommandsAnnouncedEvent
-from akgentic.tool.mailbox import MailboxTool
+from akgentic.tool.mailbox import MailboxCapability, MailboxTool, RunInterruptedError
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace.readers import MediaContent
 
@@ -128,7 +126,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       while idle (Akgent contributes receiveMsg_StopRecursively). /-prefixed
       content is offered to the CommandRegistry first; everything else —
       including a /-prefixed token the registry does not recognise — is run as
-      one act() turn, framed by the message's own render_for_llm(), which is
+      one act() turn, framed by the message's own rendering(), which is
       where the reply protocol for its type lives.
     - A turn interrupted by a queued cancel never reaches a handler:
       act() absorbs the RunInterruptedError itself, calls
@@ -351,16 +349,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """Build the run's capability stack: the framework's own, then the subclass's.
 
         Separate from ``_build_react_agent`` because the two need different
-        things. This needs the ``MailboxTool`` card, to read the preview
-        whitelist and the two injected prompt strings off it; the builder needs
-        only the finished list. Keeping them apart is what lets the builder be a
-        pure function of its arguments.
+        things. This needs the ``MailboxTool`` card; the builder needs only the
+        finished list. Keeping them apart is what lets the builder be a pure
+        function of its arguments.
 
-        The prompt strings — the absorbed-message prefix and the arrival
-        notice's closing line — make the mailbox's wording a deployment decision
-        rather than a code change. They are read defensively, so a card
-        predating them yields the module constants, which is exactly the
-        behaviour that shipped before.
+        **The card is handed over whole, and nothing here inspects it.** Which
+        fields the mailbox capability reads, what each falls back to, and how it
+        tolerates a card predating a field are all that capability's business —
+        this method's is to know that the mailbox needs its card. An earlier
+        shape unpacked four values here instead, and every field added to the
+        card would have meant editing this method again.
 
         The mailbox capability is held on ``self`` as well as returned:
         ``after_tool_execute`` and the cancel check must share one instance for
@@ -368,29 +366,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         name.
 
         Args:
-            mailbox_card: The card the whitelist and the prompt strings are read
-                from — either the one the config supplied or the auto-inserted
-                default.
+            mailbox_card: The agent's card — either the one the config supplied
+                or the auto-inserted default.
 
         Returns:
             ``[mailbox, *extra_capabilities()]``. Mailbox first because hook
             order is registration order, so a run about to be cancelled does not
             first pay for a third party's ``before_model_request``.
         """
-        self._mailbox_capability = MailboxCapability(
-            observer=self,
-            preview_handlers=mailbox_card.mailbox_preview_handlers,
-            arrival_notice=bool(mailbox_card.read_mailbox),
-            # Read defensively: these two fields do not exist on older published
-            # versions of the card, and the halves are designed to land in either
-            # order. `or`, NOT `is None` — and that is deliberately unlike
-            # `mailbox_preview_handlers` one line above, where `[]` and `None` are
-            # different values on purpose. Here an empty string is a configuration
-            # mistake, not a choice: honouring it would ship a mid-run injection
-            # with no framing at all, so it falls back to the constant.
-            absorbed_prefix=getattr(mailbox_card, "absorbed_prefix", None) or ABSORBED_PREFIX,
-            arrival_closing=getattr(mailbox_card, "arrival_closing", None) or _CLOSING_WITH_IDS,
-        )
+        self._mailbox_capability = MailboxCapability(observer=self, card=mailbox_card)
         return [self._mailbox_capability, *self.extra_capabilities()]
 
     def _build_react_agent(
@@ -522,7 +506,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """Execute one LLM REACT loop against the output type the caller names.
 
         Takes the **message**, not a prompt. Framing is
-        ``message.render_for_llm()`` — one definition per message class, living
+        ``message.rendering()`` — one definition per message class, living
         in the class — so a handler composes no prompt and there is no second
         way in that could bypass the framing. There is deliberately no string
         overload: passing a bare ``str`` is a type error, not a supported path.
@@ -536,7 +520,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Recipient validity is NOT constrained in the schema — it is enforced at
         routing time in _route_output(). Reply-protocol guidance is carried by
-        the message itself (see ``AgentMessage.render_for_llm``), not the
+        the message itself (see ``AgentMessage.renderer``), not the
         output-schema docstring.
 
         Args:
@@ -578,7 +562,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 tells the tiers apart any more.
         """
         self._deliver_context_update()
-        rendered_message = message.render_for_llm()
+        rendered_message = message.rendering()
         prompt = self._build_prompt_expanding_media_refs(rendered_message)
         try:
             output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
@@ -638,7 +622,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Args:
             rendered: The prompt text, already produced by the message's own
-                ``render_for_llm()``.
+                ``rendering()``.
 
         Returns:
             ``rendered`` unchanged when no reference expanded; otherwise the
@@ -704,7 +688,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Content starting with ``/`` is offered to the command registry first; if a
         command handles it, the method returns without involving the LLM. Otherwise
         the message itself is run as one act() turn — it frames itself through
-        ``AgentMessage.render_for_llm()``, which is where the reply protocol for
+        ``AgentMessage.rendering()``, which is where the reply protocol for
         ``message.type`` now lives — whose StructuredOutput goes to
         _route_output().
 

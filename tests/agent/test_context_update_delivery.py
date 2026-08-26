@@ -28,6 +28,7 @@ from unittest.mock import MagicMock
 
 from akgentic.llm import ContextManager, ReactAgent
 from akgentic.tool.core import ContextState, ContextUpdater
+from akgentic.tool.mailbox import MailboxTool
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 
 import akgentic.agent.agent as agent_module
@@ -120,7 +121,7 @@ def _make_agent(providers: list[Callable[[], Any]] | None = None) -> BaseAgent:
     )
 
     # Mailbox capability normally built in _build_react_agent (Epic 20).
-    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
+    agent._mailbox_capability = MailboxCapability(observer=agent, card=MailboxTool())  # type: ignore[arg-type]
     return agent
 
 
@@ -165,9 +166,7 @@ class TestNoAgentSideBaselineState:
 
         agent._deliver_context_update()
 
-        assert {name for name in vars(agent) if name.startswith("_context")} == {
-            "_context_updater"
-        }
+        assert {name for name in vars(agent) if name.startswith("_context")} == {"_context_updater"}
 
     def test_delivery_advances_the_persisted_slot_not_an_agent_field(self) -> None:
         """The counter and baselines advance on ``state.tool_state``."""
@@ -194,9 +193,7 @@ class TestThinDelivery:
 
         blocks = _recorded_blocks(agent)
         assert len(blocks) == 1
-        assert blocks[0] == (
-            "**Context update 1** — current state.\n\n**Team roster:**\n@Manager"
-        )
+        assert blocks[0] == ("**Context update 1** — current state.\n\n**Team roster:**\n@Manager")
 
     def test_nothing_to_say_appends_nothing(self) -> None:
         """``compose_update`` returning ``None`` must not reach the context."""
@@ -343,9 +340,7 @@ class TestOnStartWiring:
 
         class _CapturingReactAgent:
             def __init__(self, **kwargs: object) -> None:
-                self.context = SimpleNamespace(
-                    append_user_prompt=recorded.append, messages=[]
-                )
+                self.context = SimpleNamespace(append_user_prompt=recorded.append, messages=[])
 
             def system_prompt(self, fn: object) -> object:
                 return fn

@@ -1,7 +1,7 @@
 """Tests for the run-cancellation vocabulary owned by the agent (Epic 20, FR8).
 
 ``is_cancel`` and ``render_arrival_notice`` are *defined* in
-``akgentic.agent.capabilities.mailbox_capability`` — not imported from
+``akgentic.tool.mailbox.capability`` — not imported from
 ``akgentic.tool.mailbox``. The behavioural specs below are the tool suite's,
 ported verbatim so a byte-for-byte identical vocabulary is proven rather than
 assumed; the two ownership specs at the bottom are what keeps it here.
@@ -17,10 +17,10 @@ import uuid
 import pytest
 from akgentic.core import ActorAddressProxy
 from akgentic.core.messages import CancelMessage, Message, UserMessage
+from akgentic.tool.mailbox import PREVIEW_LIMIT, is_cancel, render_arrival_notice
+from akgentic.tool.mailbox.capability import UNOFFERABLE_LINE
 
-from akgentic.agent.capabilities import is_cancel, render_arrival_notice
-from akgentic.agent.capabilities.mailbox_capability import UNOFFERABLE_LINE
-from akgentic.agent.messages import PREVIEW_LIMIT, AgentMessage
+from akgentic.agent.messages import AgentMessage
 
 # The two closing lines, once each: every exact-string spec below ends with one.
 # Which one is not decoration — the notice may only point at ``read_mailbox``
@@ -58,7 +58,7 @@ def _agent_message(sender: str, content: str) -> AgentMessage:
     """An AgentMessage carrying a mock sender address.
 
     The notice specs use this rather than ``UserMessage`` because previewability
-    is now the discriminator: ``AgentMessage`` declares ``mailbox_preview()``
+    is now the discriminator: ``AgentMessage`` declares ``rendering_preview()``
     and ``UserMessage`` does not, so only the former can ever carry an id.
     """
     message = AgentMessage(content=content, type="request")
@@ -179,11 +179,11 @@ def test_a_listing_with_no_ids_does_not_promise_a_read() -> None:
 def test_a_bare_message_is_never_offered_even_when_the_filter_says_so() -> None:
     """The internal-invariant guard: our own filter admitted the inadmissible.
 
-    A bare ``Message`` declares no ``mailbox_preview``, so an id for it can only
+    A bare ``Message`` declares no ``rendering_preview``, so an id for it can only
     come from a broken filter. It raises rather than rendering a blank line —
     and it raises **only** on that path, which the sibling assertion pins.
     """
-    from akgentic.agent.capabilities import MailboxRenderError
+    from akgentic.tool.mailbox import MailboxRenderError
 
     unpreviewable = Message()
 
@@ -312,9 +312,9 @@ class TestVocabularyOwnership:
     """
 
     def test_is_cancel_is_defined_by_the_agent(self) -> None:
-        assert is_cancel.__module__ == "akgentic.agent.capabilities.mailbox_capability"
+        assert is_cancel.__module__ == "akgentic.tool.mailbox.capability"
 
     def test_render_arrival_notice_is_defined_by_the_agent(self) -> None:
         assert (
-            render_arrival_notice.__module__ == "akgentic.agent.capabilities.mailbox_capability"
+            render_arrival_notice.__module__ == "akgentic.tool.mailbox.capability"
         )

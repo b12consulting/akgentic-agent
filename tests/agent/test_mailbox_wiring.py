@@ -30,13 +30,12 @@ import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.llm import ModelConfig, PromptTemplate
 from akgentic.tool.core import CommandRegistry, ContextState, ToolCard, ToolFactory
-from akgentic.tool.mailbox import MailboxTool, ReadMailbox
+from akgentic.tool.mailbox import MailboxCapability, MailboxTool, ReadMailbox
+from akgentic.tool.mailbox.capability import _CLOSING_WITH_IDS, ABSORBED_PREFIX
 from akgentic.tool.team import TeamTool
 
 import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.capabilities import MailboxCapability
-from akgentic.agent.capabilities.mailbox_capability import _CLOSING_WITH_IDS, ABSORBED_PREFIX
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -328,45 +327,6 @@ def _wired_capability() -> MailboxCapability:
     return capability
 
 
-class TestPreviewWhitelistReachesTheCapability:
-    """The whitelist is configured on a card and enforced in a capability.
-
-    Nothing else crosses that gap: every offer-rule spec constructs the
-    capability with ``preview_handlers=`` directly. A wrong attribute name, a
-    card filter that misses, or a dropped constructor argument would leave all
-    of them green while every deployment fell back to admitting every handler —
-    the permissive direction, and a silent one.
-
-    These specs configure a stock ``MailboxTool`` on purpose. Reading the field
-    off the real card is what makes them a guard on the seam rather than on this
-    package alone: a rename on the ``akgentic-tool`` side turns them red here,
-    which is the only place the mismatch is visible.
-    """
-
-    _HANDLER = "akgentic.agent.messages.AgentMessage"
-
-    def test_the_cards_whitelist_is_what_the_capability_enforces(self) -> None:
-        card = MailboxTool(mailbox_preview_handlers=[self._HANDLER])
-
-        _start_agent(_agent_config(tools=[card]))
-
-        assert _wired_capability()._preview_handlers == [self._HANDLER]
-
-    def test_an_empty_whitelist_survives_the_trip_as_itself(self) -> None:
-        """``[]`` admits no handler and is never coerced to ``None`` on the way."""
-        card = MailboxTool(mailbox_preview_handlers=[])
-
-        _start_agent(_agent_config(tools=[card]))
-
-        assert _wired_capability()._preview_handlers == []
-
-    def test_a_card_declaring_no_whitelist_admits_every_handler(self) -> None:
-        """The card's own default, reached through the auto-inserted mailbox card."""
-        _start_agent(_agent_config())
-
-        assert _wired_capability()._preview_handlers is None
-
-
 class TestTheNoticeIsGatedOnTheReadTool:
     """Story 26-2: `read_mailbox=False` turns the doorbell off.
 
@@ -490,20 +450,3 @@ class TestThePromptTextReachesTheCapabilityFromTheCard:
         capability = _wired_capability()
         assert capability._absorbed_prefix == self._PREFIX
         assert capability._arrival_closing == self._CLOSING
-
-    def test_an_empty_card_field_falls_back_to_the_module_constant(self) -> None:
-        """``or``, not ``is None`` — an empty string is a configuration mistake.
-
-        Honouring ``""`` ships a mid-run injection with no framing at all, which
-        is the bug story 26-3 was opened for. This is a deliberate departure from
-        ``mailbox_preview_handlers``, one line above at the wiring site, where
-        ``[]`` and ``None`` are different values on purpose.
-
-        MUTATION — swap the ``or`` for ``if ... is None`` at the wiring site and
-        this goes red on its own; every other spec here stays green.
-        """
-        _start_agent(_agent_config(tools=[_CardCarryingPromptText()]))
-
-        capability = _wired_capability()
-        assert capability._absorbed_prefix == ABSORBED_PREFIX
-        assert capability._arrival_closing == _CLOSING_WITH_IDS

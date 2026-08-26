@@ -8,7 +8,7 @@ Reused unchanged from BaseAgent:
 - ``act(message, output_type)`` — forwards the type you name to the REACT loop,
   so a custom output model needs no plumbing. This is the whole reason a
   subclass can have its own schema at all. It takes the *message*, not a string:
-  framing is the message's own ``render_for_llm()``, so a handler composes no
+  framing is the message's own ``rendering()``, so a handler composes no
   prompt and there is no second way in that could bypass it.
 - The usage-limit policy — **nothing to declare, and nothing to remember**. It
   is applied inside ``act()`` itself, so it arrives with the LLM call. A breach
@@ -17,7 +17,7 @@ Reused unchanged from BaseAgent:
   in THIS agent's schema because ``act()`` was asked for that schema.
 - ``notify_human``, ``send``, ``get_team_member``, ``hire_member`` — no schema in
   their signatures.
-- ``MailboxCapability`` (``akgentic.agent.capabilities``) — built
+- ``MailboxCapability`` (``akgentic.tool.mailbox``) — built
   unconditionally by ``_build_react_agent``, so every subclass gets all of its
   duties without asking: a queued ``/stop`` or ``CancelMessage`` is purged from
   the mailbox and interrupts the run, and mail that arrives mid-run is announced
@@ -30,7 +30,7 @@ Supplied here:
 
 - ``TriageOutput`` — the structured output this agent reasons against.
 - ``TriageMessage`` — the message type, with its own ``receiveMsg_`` handler and
-  its own ``render_for_llm()``. It declares no ``mailbox_preview``, which is
+  its own ``rendering()``. It declares no ``rendering_preview``, which is
   what keeps it out of mid-run mailbox reads.
 - ``_route_triage`` — how a TriageOutput is delivered. Called from the handler
   body, and that one call serves the normal turn, the interrupted one, and the
@@ -96,10 +96,10 @@ class TriageMessage(Message):
     for ``receiveMsg_<Type>``, so this lands on ``receiveMsg_TriageMessage``
     below with no registration step.
 
-    It satisfies ``LlmRenderable`` through ``render_for_llm`` below — the whole
+    It declares ``rendering()`` below and so satisfies ``LlmRenderable`` — the whole
     point of keying that contract on a method: this class has no ``content``
     field and was never going to grow one. It declares **no**
-    ``mailbox_preview``, so it is never offered for a mid-run read: a triage run
+    ``rendering_preview``, so it is never offered for a mid-run read: a triage run
     is not a place to absorb unrelated mail, and a class that cannot render a
     preview must not be handed an id it cannot honour.
     """
@@ -107,7 +107,7 @@ class TriageMessage(Message):
     incident: str
     reported_by: str = "unknown"
 
-    def render_for_llm(self) -> str:
+    def rendering(self) -> str:
         """The incident, framed as the triage prompt this agent reasons against."""
         return (
             f"Incident reported by {self.reported_by}:\n\n{self.incident}\n\n"

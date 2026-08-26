@@ -37,6 +37,14 @@ from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.core.messages import CancelMessage, HandledMessage
 from akgentic.llm import ModelConfig, PromptTemplate, ReactAgent, ReactAgentConfig
 from akgentic.tool import MailboxTool
+from akgentic.tool.mailbox import is_cancel, render_arrival_notice
+from akgentic.tool.mailbox.capability import (
+    _CLOSING_WITH_IDS,
+    _CLOSING_WITHOUT_IDS,
+    ABSORBED_PREFIX,
+    MESSAGE_ID_ARG,
+    READ_MAILBOX_TOOL,
+)
 from pydantic_ai import Agent, AgentCapability
 from pydantic_ai._enqueue import PendingMessage
 from pydantic_ai.capabilities import AbstractCapability
@@ -57,14 +65,6 @@ import akgentic.agent
 import akgentic.agent.agent as agent_module
 from akgentic.agent import RunInterruptedError
 from akgentic.agent.agent import BaseAgent, MailboxCapability
-from akgentic.agent.capabilities import is_cancel, render_arrival_notice
-from akgentic.agent.capabilities.mailbox_capability import (
-    _CLOSING_WITH_IDS,
-    _CLOSING_WITHOUT_IDS,
-    ABSORBED_PREFIX,
-    MESSAGE_ID_ARG,
-    READ_MAILBOX_TOOL,
-)
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
@@ -207,20 +207,24 @@ class TestRunInterruptedError:
 
 class TestCancelCheck:
     async def test_pending_stop_raises(self) -> None:
-        capability = MailboxCapability(observer=_MailboxDouble([_pending_message("/stop")]))
+        capability = MailboxCapability(
+            observer=_MailboxDouble([_pending_message("/stop")]), card=MailboxTool()
+        )
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
 
     async def test_pending_cancel_message_raises(self) -> None:
-        capability = MailboxCapability(observer=_MailboxDouble([CancelMessage()]))
+        capability = MailboxCapability(
+            observer=_MailboxDouble([CancelMessage()]), card=MailboxTool()
+        )
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
 
     async def test_cancel_buried_behind_other_mail_still_raises(self) -> None:
         pending = [_pending_message("hello"), _pending_message("/stop now", "@Bob")]
-        capability = MailboxCapability(observer=_MailboxDouble(pending))
+        capability = MailboxCapability(observer=_MailboxDouble(pending), card=MailboxTool())
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
@@ -228,7 +232,7 @@ class TestCancelCheck:
     async def test_cancel_check_runs_before_the_notice(self) -> None:
         """A pending /stop raises — the new mail beside it is never announced."""
         pending = [_pending_message("hello"), _pending_message("/stop")]
-        capability = MailboxCapability(observer=_MailboxDouble(pending))
+        capability = MailboxCapability(observer=_MailboxDouble(pending), card=MailboxTool())
         ctx = _CtxDouble()
 
         with pytest.raises(RunInterruptedError):
@@ -238,7 +242,7 @@ class TestCancelCheck:
         assert capability._announced_ids == set()
 
     async def test_empty_mailbox_neither_raises_nor_enqueues(self) -> None:
-        capability = MailboxCapability(observer=_MailboxDouble())
+        capability = MailboxCapability(observer=_MailboxDouble(), card=MailboxTool())
         ctx = _CtxDouble()
         context = _context()
 
@@ -258,7 +262,9 @@ class TestArrivalNotice:
         """One growth, one ``ctx.enqueue`` call — the hook itself appends nothing."""
         arrived = _pending_message("news", "@Alice")
         handled = _pending_message("the turn prompt", "@Human")
-        capability = MailboxCapability(observer=_MailboxDouble([arrived], current=handled))
+        capability = MailboxCapability(
+            observer=_MailboxDouble([arrived], current=handled), card=MailboxTool()
+        )
         existing = ModelRequest(parts=[UserPromptPart(content="the turn prompt")])
         existing_parts = existing.parts
         ctx = _CtxDouble()
@@ -273,7 +279,7 @@ class TestArrivalNotice:
 
     async def test_same_message_is_announced_once_across_firings(self) -> None:
         arrived = _pending_message()
-        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]), card=MailboxTool())
         ctx = _CtxDouble()
 
         await capability.before_model_request(ctx, _context())
@@ -285,7 +291,7 @@ class TestArrivalNotice:
         first = _pending_message("one", "@Alice")
         second = _pending_message("two", "@Bob")
         mailbox = _MailboxDouble([first], current=_pending_message("handled", "@Human"))
-        capability = MailboxCapability(observer=mailbox)
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())
         ctx = _CtxDouble()
 
         await capability.before_model_request(ctx, _context())
@@ -300,7 +306,7 @@ class TestArrivalNotice:
     async def test_before_run_forgets_the_announced_backlog(self) -> None:
         """The run-start hook is what clears the set — no caller has to remember."""
         arrived = _pending_message()
-        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]), card=MailboxTool())
         ctx = _CtxDouble()
 
         await capability.before_model_request(ctx, _context())
@@ -312,7 +318,7 @@ class TestArrivalNotice:
     async def test_without_before_run_the_backlog_stays_announced(self) -> None:
         """The complement: nothing else clears the set, so the hook is load-bearing."""
         arrived = _pending_message()
-        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]), card=MailboxTool())
         ctx = _CtxDouble()
 
         await capability.before_model_request(ctx, _context())
@@ -330,7 +336,7 @@ class TestArrivalNotice:
         with no error anywhere. So this drives a real ``Agent.run`` and asserts
         the set came back empty.
         """
-        capability = MailboxCapability(observer=_MailboxDouble([]))
+        capability = MailboxCapability(observer=_MailboxDouble([]), card=MailboxTool())
         capability._announced_ids.add(uuid.uuid4())
 
         def _reply(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -343,7 +349,7 @@ class TestArrivalNotice:
     async def test_no_growth_enqueues_nothing(self) -> None:
         arrived = _pending_message()
         mailbox = _MailboxDouble([arrived])
-        capability = MailboxCapability(observer=mailbox)
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())
         await capability.before_model_request(_CtxDouble(), _context())
 
         ctx = _CtxDouble()
@@ -378,7 +384,7 @@ class TestTheInjectedTextIsWhatTheCapabilityWasBuiltWith:
         handled = _pending_message("the turn prompt", "@Human")
         capability = MailboxCapability(
             observer=_MailboxDouble([arrived], current=handled),
-            arrival_closing=self._CLOSING,
+            card=MailboxTool(arrival_closing=self._CLOSING),
         )
         ctx = _CtxDouble()
 
@@ -396,7 +402,7 @@ class TestTheInjectedTextIsWhatTheCapabilityWasBuiltWith:
         """
         arrived = _pending_message()
         capability = MailboxCapability(
-            observer=_MailboxDouble([arrived]), arrival_closing=self._CLOSING
+            observer=_MailboxDouble([arrived]), card=MailboxTool(arrival_closing=self._CLOSING)
         )
         ctx = _CtxDouble()
 
@@ -408,7 +414,7 @@ class TestTheInjectedTextIsWhatTheCapabilityWasBuiltWith:
 
     async def test_a_capability_built_with_neither_string_behaves_as_it_always_has(self) -> None:
         """Both parameters are optional; the module constants are the defaults."""
-        capability = MailboxCapability(observer=_MailboxDouble())
+        capability = MailboxCapability(observer=_MailboxDouble(), card=MailboxTool())
 
         assert capability._absorbed_prefix == ABSORBED_PREFIX
         assert capability._arrival_closing == _CLOSING_WITH_IDS
@@ -436,7 +442,7 @@ class TestCancellationConsultsNeitherString:
         cancel = CancelMessage()
         mailbox = _MailboxDouble([_pending_message("hello"), cancel])
         capability = MailboxCapability(
-            observer=mailbox, absorbed_prefix=prefix, arrival_closing=closing
+            observer=mailbox, card=MailboxTool(absorbed_prefix=prefix, arrival_closing=closing)
         )
 
         with pytest.raises(RunInterruptedError):
@@ -465,7 +471,7 @@ class TestRunEndWithdrawal:
     async def test_the_notice_is_withdrawn_when_the_run_has_ended(self) -> None:
         """AC-1, AC-3 — the entry the hook enqueued leaves; the result does not change."""
         arrived = _pending_message("news", "@Alice")
-        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]), card=MailboxTool())
         ctx = _QueueCtxDouble()
         await capability.before_model_request(ctx, _context())
         assert len(ctx.pending_messages) == 1
@@ -491,7 +497,7 @@ class TestRunEndWithdrawal:
         goes red with it; nothing else in the suite does.
         """
         arrived = _pending_message("news", "@Alice")
-        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]), card=MailboxTool())
         ctx = _QueueCtxDouble()
         await capability.before_model_request(ctx, _context())
         queued = list(ctx.pending_messages)
@@ -512,7 +518,7 @@ class TestRunEndWithdrawal:
         arrival notice has one.
         """
         arrived = _pending_message("news", "@Alice")
-        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]), card=MailboxTool())
         ctx = _QueueCtxDouble()
         await capability.before_model_request(ctx, _context())
         ctx.enqueue("a note from somewhere else entirely", priority="asap")
@@ -547,7 +553,9 @@ class TestRunEndWithdrawal:
         """
         absorbed = _pending_message("the body of the absorbed message", "@Alice")
         handled = _pending_message("the turn prompt", "@Human")
-        capability = MailboxCapability(observer=_MailboxDouble([absorbed], current=handled))
+        capability = MailboxCapability(
+            observer=_MailboxDouble([absorbed], current=handled), card=MailboxTool()
+        )
         ctx = _QueueCtxDouble()
 
         # The notice goes out first, exactly as a run would produce it...
@@ -576,7 +584,7 @@ class TestRunEndWithdrawal:
         # inside the added-work framing the injection wraps it in.
         remaining = [_queued_text(pending) for pending in ctx.pending_messages]
         assert len(remaining) == 1
-        assert absorbed.render_for_llm() in remaining[0]
+        assert absorbed.rendering() in remaining[0]
 
     async def test_before_run_forgets_which_notices_it_could_withdraw(self) -> None:
         """AC-6 — the tracking set is run-local, so a stale id withdraws nothing.
@@ -587,7 +595,7 @@ class TestRunEndWithdrawal:
         another, whatever ends up in front of it.
         """
         arrived = _pending_message("news", "@Alice")
-        capability = MailboxCapability(observer=_MailboxDouble([arrived]))
+        capability = MailboxCapability(observer=_MailboxDouble([arrived]), card=MailboxTool())
         ctx = _QueueCtxDouble()
         await capability.before_model_request(ctx, _context())
         from_the_previous_run = ctx.pending_messages[0]
@@ -805,15 +813,6 @@ class TestCapabilityWiring:
         assert capabilities == [agent._mailbox_capability, extra]
         assert isinstance(agent._mailbox_capability, MailboxCapability)
 
-    def test_assembly_reads_the_whitelist_off_the_card_it_is_given(self) -> None:
-        """The card is the argument, so the builder never has to know about cards."""
-        agent: BaseAgent = object.__new__(BaseAgent)
-        handler = "akgentic.agent.messages.AgentMessage"
-
-        agent._assemble_capabilities(MailboxTool(mailbox_preview_handlers=[handler]))
-
-        assert agent._mailbox_capability._preview_handlers == [handler]
-
     def test_real_branch_forwards_a_copy_of_the_list_it_is_given(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -926,9 +925,7 @@ class TestCatchSite:
             system.tell(agent_addr, AgentMessage(content="do the thing", type="request"))
 
             assert _wait_until(
-                lambda: any(
-                    "not delivered" in record.getMessage() for record in caplog.records
-                )
+                lambda: any("not delivered" in record.getMessage() for record in caplog.records)
             )
 
 
@@ -949,7 +946,7 @@ class TestPurgeAtRecognition:
     async def test_the_recognised_cancel_is_gone_from_the_mailbox(self) -> None:
         stop = _pending_message("/stop")
         mailbox = _MailboxDouble([stop])
-        capability = MailboxCapability(observer=mailbox)
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
@@ -962,7 +959,7 @@ class TestPurgeAtRecognition:
         keep = _pending_message("hello", "@Alice")
         stop = _pending_message("/stop now", "@Bob")
         mailbox = _MailboxDouble([keep, stop])
-        capability = MailboxCapability(observer=mailbox)
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
@@ -975,7 +972,7 @@ class TestPurgeAtRecognition:
         keep = _pending_message("hello", "@Bob")
         second = CancelMessage(reason="and again")
         mailbox = _MailboxDouble([first, keep, second])
-        capability = MailboxCapability(observer=mailbox)
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
@@ -997,7 +994,7 @@ class TestPurgeAtRecognition:
                 return []
 
         mailbox = _AlreadyGoneMailbox([_pending_message("/stop")])
-        capability = MailboxCapability(observer=mailbox)
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())
 
         with pytest.raises(RunInterruptedError):
             await capability.before_model_request(_CtxDouble(), _context())
@@ -1100,9 +1097,7 @@ class TestNoCatchSubclassSurvives:
 
 
 class TestIdleCancel:
-    def test_idle_cancel_message_is_a_logged_noop(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_idle_cancel_message_is_a_logged_noop(self, caplog: pytest.LogCaptureFixture) -> None:
         with (
             _running_agent() as (system, agent_addr, _),
             caplog.at_level(logging.INFO, logger=AGENT_LOGGER),
@@ -1110,9 +1105,7 @@ class TestIdleCancel:
             system.tell(agent_addr, CancelMessage(reason="operator changed their mind"))
 
             assert _wait_until(
-                lambda: any(
-                    "nothing to cancel" in record.getMessage() for record in caplog.records
-                )
+                lambda: any("nothing to cancel" in record.getMessage() for record in caplog.records)
             )
             assert _InterruptibleReactAgent.run_calls == 0
 
@@ -1162,7 +1155,7 @@ def _make_cardless_agent(pending: list[Any]) -> BaseAgent:
     # ``consume_mailbox`` has no inbox to reach into. Stubbed rather than
     # dropped: the hook purges before it raises, so the cancel path calls it.
     agent.consume_mailbox = MagicMock(return_value=[])  # type: ignore[method-assign]
-    agent._mailbox_capability = MailboxCapability(observer=agent)
+    agent._mailbox_capability = MailboxCapability(observer=agent, card=MailboxTool())
 
     agent.get_team = MagicMock(return_value=[])  # type: ignore[method-assign]
     agent.send = MagicMock()  # type: ignore[method-assign]

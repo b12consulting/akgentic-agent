@@ -2,12 +2,12 @@
 
 Four subjects, in the order the design builds them:
 
-1. **The contracts.** ``LlmRenderable`` and ``MailboxPreviewable``, both
+1. **The contracts.** ``rendering()`` and ``rendering_preview()``, both
    ``@runtime_checkable``, both keyed on a *method*. The negative case — a class
-   carrying ``content`` but no ``render_for_llm`` — is the one that pins the
+   carrying ``content`` but no ``rendering`` — is the one that pins the
    method-not-field decision, because a field-based contract is exactly what
    produced the data loss this epic removes.
-2. **The renderings.** ``AgentMessage.render_for_llm()`` reproduces the prefix
+2. **The renderings.** ``AgentMessage.rendering()`` reproduces the prefix
    its handler used to build inline, byte-for-byte, for **every**
    ``REPLY_PROTOCOLS`` key — the proof that moving the framing carried no
    behaviour with it.
@@ -32,22 +32,23 @@ import akgentic.core.messages as core_messages
 import pytest
 from akgentic.core import ActorAddress
 from akgentic.core.messages import CancelMessage, Message, UserMessage
-
-from akgentic.agent.capabilities import MailboxRenderError, render_arrival_notice
-from akgentic.agent.capabilities.mailbox_capability import (
+from akgentic.tool.mailbox import (
+    PREVIEW_LIMIT,
+    MailboxMessage,
+    MailboxRenderError,
+    MailboxTool,
+    render_arrival_notice,
+)
+from akgentic.tool.mailbox.capability import (
     ABSORBED_PREFIX,
     MESSAGE_ID_ARG,
     READ_MAILBOX_TOOL,
     UNOFFERABLE_LINE,
     MailboxCapability,
 )
+
 from akgentic.agent.custom_agent import TriageMessage
-from akgentic.agent.messages import (
-    PREVIEW_LIMIT,
-    AgentMessage,
-    LlmRenderable,
-    MailboxPreviewable,
-)
+from akgentic.agent.messages import AgentMessage, LlmRenderable
 from akgentic.agent.output_models import REPLY_PROTOCOLS
 
 # =============================================================================
@@ -132,20 +133,37 @@ async def _after_read(
 # =============================================================================
 
 
-class TestLlmRenderableIsKeyedOnTheMethod:
-    """The contract is ``render_for_llm()``. It is never a ``content`` field."""
+class TestRenderingIsKeyedOnTheMethod:
+    """The contract is ``rendering()``. It is never a ``content`` field."""
 
-    def test_the_protocol_declares_exactly_one_member(self) -> None:
-        assert set(LlmRenderable.__protocol_attrs__) == {"render_for_llm"}  # type: ignore[attr-defined]
+    def test_the_base_promises_both_renderings(self) -> None:
+        """Extending ``MailboxMessage`` is a declaration, not an offer.
 
-    def test_a_class_implementing_only_the_method_satisfies_it(self) -> None:
-        class _RendersOnly:
-            def render_for_llm(self) -> str:
+        A subclass that forgets either method fails loudly here rather than
+        silently. For ``rendering()`` that is data loss averted: the capability
+        consumes a message it takes on, so a quiet ``None`` would delete it from
+        the mailbox and deliver nothing. For ``rendering_preview()`` it keeps one
+        rule with one mechanism — a message opts out of mid-run reads by not
+        extending this class, never by declining a method.
+        """
+
+        class _SaysNothing(MailboxMessage):
+            pass
+
+        message = _SaysNothing()
+        with pytest.raises(NotImplementedError):
+            message.rendering()
+        with pytest.raises(NotImplementedError):
+            message.rendering_preview()
+
+    def test_a_subclass_overriding_only_the_method_renders(self) -> None:
+        class _RendersOnly(MailboxMessage):
+            def rendering(self) -> str:
                 return "I know how I should read."
 
-        assert isinstance(_RendersOnly(), LlmRenderable)
+        assert _RendersOnly().rendering() == "I know how I should read."
 
-    def test_a_class_with_content_but_no_method_does_not_satisfy_it(self) -> None:
+    def test_a_content_field_alone_does_not_render(self) -> None:
         """The whole decision, in one assertion.
 
         A field-keyed contract is what let a mailbox read render every message
@@ -154,50 +172,72 @@ class TestLlmRenderableIsKeyedOnTheMethod:
         declares its own fields a first-class citizen rather than a casualty.
         """
 
-        class _ContentOnly:
-            content = "I have a body but no idea how to present it."
+        class _ContentOnly(MailboxMessage):
+            content: str = "I have a body but no idea how to present it."
 
-        assert not isinstance(_ContentOnly(), LlmRenderable)
+        with pytest.raises(NotImplementedError):
+            _ContentOnly().rendering()
 
-    def test_there_is_no_intermediate_base_class(self) -> None:
-        """AgentMessage implements the method directly, off ``Message`` alone."""
-        assert AgentMessage.__mro__[1] is Message
-        assert LlmRenderable not in AgentMessage.__mro__
+    def test_agent_message_extends_the_mailbox_base(self) -> None:
+        assert AgentMessage.__mro__[1] is MailboxMessage
+        assert issubclass(MailboxMessage, Message)
 
 
-class TestMailboxPreviewableIsSeparate:
+class TestThePreviewIsSeparate:
     """Previewability is a second opt-in, and it is the offer discriminator."""
 
-    def test_the_protocol_declares_exactly_one_member(self) -> None:
-        assert set(MailboxPreviewable.__protocol_attrs__) == {"mailbox_preview"}  # type: ignore[attr-defined]
-
-    def test_agent_message_satisfies_both_contracts(self) -> None:
+    def test_agent_message_answers_both(self) -> None:
         message = _agent_message()
-        assert isinstance(message, LlmRenderable)
-        assert isinstance(message, MailboxPreviewable)
+        assert message.rendering() is not None
+        assert message.rendering_preview() is not None
 
-    def test_triage_message_renders_but_offers_no_preview(self) -> None:
-        """A triage run is not a place to absorb unrelated mail."""
+    def test_triage_message_renders_without_joining_the_mailbox(self) -> None:
+        """``act()`` needs a rendering; it does not need a mailbox.
+
+        ``TriageMessage`` declares ``rendering()`` and nothing else, so it is a
+        valid ``act()`` argument while never being absorbable mid-run — the
+        arrival notice lists it with no id.
+        """
         incident = TriageMessage(incident="disk full", reported_by="monitoring")
+        assert incident.rendering() is not None
         assert isinstance(incident, LlmRenderable)
-        assert not isinstance(incident, MailboxPreviewable)
+        assert not isinstance(incident, MailboxMessage)
 
-    def test_a_bare_message_and_a_cancel_satisfy_neither(self) -> None:
+    def test_messages_outside_the_mailbox_base_render_nothing(self) -> None:
         for message in (Message(), CancelMessage(reason="stop"), UserMessage(content="hi")):
-            assert not isinstance(message, LlmRenderable), type(message).__name__
-            assert not isinstance(message, MailboxPreviewable), type(message).__name__
+            assert not isinstance(message, MailboxMessage), type(message).__name__
 
 
-class TestTheContractsLiveInThisPackage:
-    """NFR3: ``akgentic-core`` is the actor framework and knows nothing of models."""
+class TestTheContractLivesWithBothItsConsumers:
+    """NFR3 still holds — ``akgentic-core`` knows nothing about readers.
 
-    def test_both_protocols_are_declared_by_the_agent_package(self) -> None:
-        assert LlmRenderable.__module__ == "akgentic.agent.messages"
-        assert MailboxPreviewable.__module__ == "akgentic.agent.messages"
+    The two renderings are declared once, on ``MailboxMessage`` in
+    ``akgentic-tool``: the package ``akgentic-agent`` (for ``act()``) and the
+    mailbox capability (for the mid-run absorb) both already depend on. Declaring
+    them as Protocols forced the same contract to be written twice, once per
+    package, because neither may import the other.
+    """
 
-    def test_core_declares_neither(self) -> None:
-        assert getattr(core_messages, "LlmRenderable", None) is None
-        assert getattr(core_messages, "MailboxPreviewable", None) is None
+    def test_the_base_is_declared_by_the_mailbox_package(self) -> None:
+        assert MailboxMessage.__module__ == "akgentic.tool.mailbox.message"
+
+    def test_core_declares_neither_rendering(self) -> None:
+        # The other candidate home, rejected: prose rendering is not the actor
+        # framework's business, and a base Message that rendered would make it so.
+        assert not hasattr(core_messages.Message, "rendering")
+        assert not hasattr(core_messages.Message, "rendering_preview")
+
+    def test_the_act_protocol_and_the_mailbox_base_name_the_same_method(self) -> None:
+        # LlmRenderable is a structural view of one MailboxMessage method, held by
+        # the package that owns act(). They agree only while the name matches.
+        assert set(LlmRenderable.__protocol_attrs__) == {"rendering"}  # type: ignore[attr-defined]
+        assert isinstance(_agent_message(), LlmRenderable)
+
+    def test_the_duplicated_preview_protocols_are_gone(self) -> None:
+        import akgentic.tool.mailbox as mailbox_package
+
+        for name in ("MailboxPreviewable", "SelfRendering"):
+            assert getattr(mailbox_package, name, None) is None, name
 
 
 # =============================================================================
@@ -222,18 +262,18 @@ class TestAgentMessageRendersTheOldPrefix:
         protocol = REPLY_PROTOCOLS[message_type].format(sender="@Manager")
         expected = f"You received {article} {message_type} from @Manager. {protocol}\n\nthe body"
 
-        assert message.render_for_llm() == expected
+        assert message.rendering() == expected
 
     def test_a_senderless_message_renders_unknown(self) -> None:
         message = AgentMessage(content="orphan", type="request")
         assert message.sender is None
-        assert "from unknown. " in message.render_for_llm()
+        assert "from unknown. " in message.rendering()
 
     def test_an_unknown_type_still_renders_the_body(self) -> None:
         """``REPLY_PROTOCOLS.get`` returns "" — the framing degrades, the body survives."""
         message = _agent_message("the body", "@Manager")
         object.__setattr__(message, "type", "telegram")
-        rendered = message.render_for_llm()
+        rendered = message.rendering()
         assert rendered.startswith("You received a telegram from @Manager. ")
         assert rendered.endswith("\n\nthe body")
 
@@ -242,21 +282,21 @@ class TestAgentMessagePreview:
     """AC 6: the arrival-notice line body, minus the bullet."""
 
     def test_it_is_sender_type_and_content(self) -> None:
-        assert _agent_message("ship it", "@Bob").mailbox_preview() == "@Bob (request): ship it"
+        assert _agent_message("ship it", "@Bob").rendering_preview() == "@Bob (request): ship it"
 
     def test_content_whitespace_is_collapsed(self) -> None:
-        preview = _agent_message("two\n\n  words", "@Bob").mailbox_preview()
+        preview = _agent_message("two\n\n  words", "@Bob").rendering_preview()
         assert preview == "@Bob (request): two words"
 
     def test_a_long_body_is_cut_at_the_limit_with_an_ellipsis(self) -> None:
-        preview = _agent_message("x" * 400, "@Bob").mailbox_preview()
+        preview = _agent_message("x" * 400, "@Bob").rendering_preview()
         assert preview == f"@Bob (request): {'x' * PREVIEW_LIMIT}…"
 
     def test_an_empty_body_leaves_no_dangling_colon(self) -> None:
-        assert _agent_message("", "@Bob").mailbox_preview() == "@Bob (request)"
+        assert _agent_message("", "@Bob").rendering_preview() == "@Bob (request)"
 
     def test_a_senderless_message_previews_as_unknown(self) -> None:
-        assert AgentMessage(content="hi").mailbox_preview() == "unknown (request): hi"
+        assert AgentMessage(content="hi").rendering_preview() == "unknown (request): hi"
 
 
 class TestTriageMessageRendersItself:
@@ -264,7 +304,7 @@ class TestTriageMessageRendersItself:
 
     def test_it_reproduces_the_inline_triage_prompt(self) -> None:
         incident = TriageMessage(incident="disk full on node 3", reported_by="monitoring")
-        assert incident.render_for_llm() == (
+        assert incident.rendering() == (
             "Incident reported by monitoring:\n\ndisk full on node 3\n\n"
             "Assess severity, summarise in one line, and hand off whatever you "
             "cannot resolve yourself."
@@ -282,7 +322,8 @@ class TestOfferRule:
     def test_a_same_class_previewable_non_cancel_is_offered(self) -> None:
         pending = _agent_message("please review", "@Alice")
         capability = MailboxCapability(
-            observer=_MailboxDouble([pending], current=_agent_message("handled", "@Human"))  # type: ignore[arg-type]
+            observer=_MailboxDouble([pending], current=_agent_message("handled", "@Human")),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
 
         assert capability.offerable_ids([pending]) == {pending.id}
@@ -297,7 +338,8 @@ class TestOfferRule:
         pending = _agent_message("please review", "@Alice")
         during_triage = TriageMessage(incident="disk full")
         capability = MailboxCapability(
-            observer=_MailboxDouble([pending], current=during_triage)  # type: ignore[arg-type]
+            observer=_MailboxDouble([pending], current=during_triage),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
 
         assert capability.offerable_ids([pending]) == set()
@@ -306,7 +348,8 @@ class TestOfferRule:
         """The mirror of the above, which is the direction the defect ran."""
         pending = TriageMessage(incident="disk full")
         capability = MailboxCapability(
-            observer=_MailboxDouble([pending], current=_agent_message())  # type: ignore[arg-type]
+            observer=_MailboxDouble([pending], current=_agent_message()),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
 
         assert capability.offerable_ids([pending]) == set()
@@ -315,7 +358,8 @@ class TestOfferRule:
         """Rule 15d — offering its id would let the model read its way out of a cancel."""
         stop = _agent_message("/stop", "@Human")
         capability = MailboxCapability(
-            observer=_MailboxDouble([stop], current=_agent_message("handled", "@Human"))  # type: ignore[arg-type]
+            observer=_MailboxDouble([stop], current=_agent_message("handled", "@Human")),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
 
         assert capability.offerable_ids([stop]) == set()
@@ -323,7 +367,8 @@ class TestOfferRule:
     def test_a_cancel_message_is_never_offered(self) -> None:
         cancel = CancelMessage(reason="user pressed Esc")
         capability = MailboxCapability(
-            observer=_MailboxDouble([cancel], current=cancel)  # type: ignore[arg-type]
+            observer=_MailboxDouble([cancel], current=cancel),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
 
         assert capability.offerable_ids([cancel]) == set()
@@ -337,56 +382,20 @@ class TestOfferRule:
         """
         pending = TriageMessage(incident="another disk")
         capability = MailboxCapability(
-            observer=_MailboxDouble([pending], current=TriageMessage(incident="first disk"))  # type: ignore[arg-type]
+            observer=_MailboxDouble([pending], current=TriageMessage(incident="first disk")),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
 
         assert capability.offerable_ids([pending]) == set()
 
     def test_nothing_is_offered_while_the_agent_is_idle(self) -> None:
         pending = _agent_message()
-        capability = MailboxCapability(observer=_MailboxDouble([pending], current=None))  # type: ignore[arg-type]
-
-        assert capability.offerable_ids([pending]) == set()
-
-
-class TestOfferWhitelist:
-    """AC 20 — the card decides which handlers show a preview at all."""
-
-    _AGENT_MESSAGE_PATH = "akgentic.agent.messages.AgentMessage"
-
-    def _capability(self, pending: Message, handlers: list[str] | None) -> MailboxCapability:
-        return MailboxCapability(
-            observer=_MailboxDouble([pending], current=_agent_message("handled", "@Human")),  # type: ignore[arg-type]
-            preview_handlers=handlers,
-        )
-
-    def test_no_whitelist_admits_every_handler(self) -> None:
-        """The default, and what an older card that lacks the param falls back to."""
-        pending = _agent_message()
-        assert self._capability(pending, None).offerable_ids([pending]) == {pending.id}
-
-    def test_an_empty_whitelist_admits_none(self) -> None:
-        """``[]`` is a different value from ``None`` and is never coerced to it."""
-        pending = _agent_message()
-        assert self._capability(pending, []).offerable_ids([pending]) == set()
-
-    def test_naming_the_handlers_class_admits_it(self) -> None:
-        pending = _agent_message()
-        capability = self._capability(pending, [self._AGENT_MESSAGE_PATH])
-        assert capability.offerable_ids([pending]) == {pending.id}
-
-    def test_naming_another_class_leaves_this_handler_out(self) -> None:
-        pending = _agent_message()
-        capability = self._capability(pending, ["akgentic.agent.custom_agent.TriageMessage"])
-        assert capability.offerable_ids([pending]) == set()
-
-    def test_an_agent_with_no_mailbox_card_admits_every_handler(self) -> None:
-        """The param is read defensively — an absent card is not a configuration error."""
-        pending = _agent_message()
         capability = MailboxCapability(
-            observer=_MailboxDouble([pending], current=_agent_message("handled", "@Human"))  # type: ignore[arg-type]
+            observer=_MailboxDouble([pending], current=None),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
-        assert capability.offerable_ids([pending]) == {pending.id}
+
+        assert capability.offerable_ids([pending]) == set()
 
 
 class TestNoticeIntegration:
@@ -395,7 +404,8 @@ class TestNoticeIntegration:
     async def test_the_notice_offers_an_id_for_what_this_run_can_handle(self) -> None:
         pending = _agent_message("please review", "@Alice")
         capability = MailboxCapability(
-            observer=_MailboxDouble([pending], current=_agent_message("handled", "@Human"))  # type: ignore[arg-type]
+            observer=_MailboxDouble([pending], current=_agent_message("handled", "@Human")),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
         ctx = _CtxDouble()
 
@@ -410,7 +420,8 @@ class TestNoticeIntegration:
         """The everyday case the guard must NOT turn into an exception."""
         pending = TriageMessage(incident="disk full")
         capability = MailboxCapability(
-            observer=_MailboxDouble([pending], current=TriageMessage(incident="other"))  # type: ignore[arg-type]
+            observer=_MailboxDouble([pending], current=TriageMessage(incident="other")),  # type: ignore[arg-type]
+            card=MailboxTool(),
         )
         ctx = _CtxDouble()
 
@@ -452,7 +463,7 @@ class TestAfterToolExecuteInjection:
         named = _agent_message("the real content", "@Alice")
         other = _agent_message("not this one", "@Bob")
         mailbox = _MailboxDouble([named, other])
-        capability = MailboxCapability(observer=mailbox)  # type: ignore[arg-type]
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())  # type: ignore[arg-type]
         ctx = _CtxDouble()
 
         result = await _after_read(capability, ctx, {MESSAGE_ID_ARG: str(named.id)})
@@ -464,7 +475,7 @@ class TestAfterToolExecuteInjection:
         (enqueued,), priority = ctx.enqueue_calls[0]
         assert len(ctx.enqueue_calls) == 1
         assert priority == "asap"
-        assert named.render_for_llm() in enqueued
+        assert named.rendering() in enqueued
         assert "does NOT replace" in enqueued
         assert result == "Acknowledged."
 
@@ -472,7 +483,7 @@ class TestAfterToolExecuteInjection:
         """AC 21 — the hook does nothing at all for any other tool."""
         pending = _agent_message()
         mailbox = _MailboxDouble([pending])
-        capability = MailboxCapability(observer=mailbox)  # type: ignore[arg-type]
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())  # type: ignore[arg-type]
         ctx = _CtxDouble()
 
         result = await _after_read(
@@ -501,7 +512,7 @@ class TestAfterToolExecuteInjection:
         """
         pending = _agent_message()
         mailbox = _MailboxDouble([pending])
-        capability = MailboxCapability(observer=mailbox)  # type: ignore[arg-type]
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())  # type: ignore[arg-type]
         ctx = _CtxDouble()
 
         result = await _after_read(capability, ctx, args)
@@ -513,23 +524,33 @@ class TestAfterToolExecuteInjection:
 
     async def test_an_id_that_is_no_longer_queued_injects_nothing(self) -> None:
         mailbox = _MailboxDouble([])
-        capability = MailboxCapability(observer=mailbox)  # type: ignore[arg-type]
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())  # type: ignore[arg-type]
         ctx = _CtxDouble()
 
         await _after_read(capability, ctx, {MESSAGE_ID_ARG: str(uuid.uuid4())})
 
         assert ctx.enqueue_calls == []
 
-    async def test_a_consumed_message_that_renders_nothing_is_skipped(self) -> None:
-        """AC 24 — absorbed, but not injected: there is nothing to inject."""
+    async def test_a_message_that_cannot_render_is_left_in_the_mailbox(self) -> None:
+        """Not consumed, so not lost — it still arrives as its own turn.
+
+        The hook peeks and renders BEFORE it consumes. Consuming first would
+        delete a message that turns out to render nothing: gone from the queue,
+        never enqueued, with nothing left holding it. That is silent data loss,
+        and it is what this order exists to prevent.
+
+        MUTATION — move ``consume_mailbox`` above the render check and this goes
+        red on its own.
+        """
         unrenderable = UserMessage(content="I have a body but no rendering")
         mailbox = _MailboxDouble([unrenderable])
-        capability = MailboxCapability(observer=mailbox)  # type: ignore[arg-type]
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())  # type: ignore[arg-type]
         ctx = _CtxDouble()
 
         await _after_read(capability, ctx, {MESSAGE_ID_ARG: str(unrenderable.id)})
 
-        assert mailbox.consume_calls == [[unrenderable.id]]
+        assert mailbox.consume_calls == []
+        assert mailbox.pending == [unrenderable]
         assert ctx.enqueue_calls == []
 
 
@@ -561,7 +582,7 @@ class TestTheToolContractIsReadByName:
 
         named = _agent_message("absorb me", "@Alice")
         mailbox = _MailboxDouble([named])
-        capability = MailboxCapability(observer=mailbox)  # type: ignore[arg-type]
+        capability = MailboxCapability(observer=mailbox, card=MailboxTool())  # type: ignore[arg-type]
         ctx = _CtxDouble()
 
         card = MailboxTool()
@@ -577,14 +598,14 @@ class TestTheToolContractIsReadByName:
         (enqueued,), priority = ctx.enqueue_calls[0]
         assert len(ctx.enqueue_calls) == 1
         assert priority == "asap"
-        assert named.render_for_llm() in enqueued
+        assert named.rendering() in enqueued
         assert "does NOT replace" in enqueued
 
 
 class TestAnAbsorbedMessageIsFramedAsAddedWork:
     """An absorbed message must not read as a replacement for the current one.
 
-    ``render_for_llm()`` renders a message the way its own handler receives it —
+    ``rendering()`` renders a message the way its own handler receives it —
     imperative and self-contained. Injected mid-run that reads as a fresh
     assignment, and the model answers it *instead of* what it was already doing.
     Observed in the field: an agent that had just written a report answered only
@@ -600,7 +621,7 @@ class TestAnAbsorbedMessageIsFramedAsAddedWork:
     """
 
     async def test_the_injection_says_additional_and_carries_the_rendering_whole(self) -> None:
-        """MUTATION — enqueue ``message.render_for_llm()`` bare, as it was before,
+        """MUTATION — enqueue ``message.rendering()`` bare, as it was before,
         and the first two assertions go red, along with the two sibling specs
         above that pin the same ``"does NOT replace"`` clause: three in this
         file, nothing outside it. Restoring the prefix's earlier *wording*
@@ -608,14 +629,14 @@ class TestAnAbsorbedMessageIsFramedAsAddedWork:
         sentences.
         """
         absorbed = _agent_message("what is the colour of the sky?", "@Human")
-        capability = MailboxCapability(observer=_MailboxDouble([absorbed]))
+        capability = MailboxCapability(observer=_MailboxDouble([absorbed]), card=MailboxTool())
         ctx = _CtxDouble()
 
         await _after_read(capability, ctx, {MESSAGE_ID_ARG: str(absorbed.id)})
 
         (enqueued,), priority = ctx.enqueue_calls[0]
         assert "does NOT replace" in enqueued
-        assert enqueued == f"{ABSORBED_PREFIX}\n\n{absorbed.render_for_llm()}"
+        assert enqueued == f"{ABSORBED_PREFIX}\n\n{absorbed.rendering()}"
         assert priority == "asap"
 
     async def test_the_prefix_is_the_one_the_capability_was_built_with(self) -> None:
@@ -634,11 +655,11 @@ class TestAnAbsorbedMessageIsFramedAsAddedWork:
         absorbed = _agent_message("what is the colour of the sky?", "@Human")
         capability = MailboxCapability(
             observer=_MailboxDouble([absorbed]),
-            absorbed_prefix=sentinel,
+            card=MailboxTool(absorbed_prefix=sentinel),
         )
         ctx = _CtxDouble()
 
         await _after_read(capability, ctx, {MESSAGE_ID_ARG: str(absorbed.id)})
 
         (enqueued,), _priority = ctx.enqueue_calls[0]
-        assert enqueued == f"{sentinel}\n\n{absorbed.render_for_llm()}"
+        assert enqueued == f"{sentinel}\n\n{absorbed.rendering()}"

@@ -123,7 +123,7 @@ def _make_agent(
     agent._context_updater.compose_update.return_value = None
 
     # Mailbox capability normally built in _build_react_agent (Epic 20).
-    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
+    agent._mailbox_capability = MailboxCapability(observer=agent, card=MailboxTool())  # type: ignore[arg-type]
 
     config = MagicMock(spec=AgentConfig)
     config.name = name
@@ -188,9 +188,7 @@ class TestRequestSnippet:
 
     def test_recipient_is_an_unconstrained_plain_string(self) -> None:
         """Documented as validated at ROUTING time, not in the schema."""
-        nonsense = Request(
-            message_type="request", message="hi", recipient="@NobodyHasThisName"
-        )
+        nonsense = Request(message_type="request", message="hi", recipient="@NobodyHasThisName")
         assert nonsense.recipient == "@NobodyHasThisName"
 
         schema = Request.model_json_schema()["properties"]["recipient"]
@@ -359,9 +357,7 @@ class TestRoutedTurnSnippet:
         agent = self._agent_returning(
             StructuredOutput(
                 messages=[
-                    Request(
-                        message_type="request", message="do this", recipient="@Assistant"
-                    )
+                    Request(message_type="request", message="do this", recipient="@Assistant")
                 ]
             )
         )
@@ -421,11 +417,7 @@ class TestRoutedTurnSnippet:
     def test_unresolvable_at_member_is_skipped_not_raised(self) -> None:
         agent = self._agent_returning(
             StructuredOutput(
-                messages=[
-                    Request(
-                        message_type="request", message="hi", recipient="@Designer"
-                    )
-                ]
+                messages=[Request(message_type="request", message="hi", recipient="@Designer")]
             )
         )
         _stub(agent, "get_team_member", return_value=None)
@@ -467,7 +459,7 @@ class TestReceiverSidePrefixSnippet:
         # by TestReplyProtocolsTable. Deriving that one span keeps this test on its
         # own subject and stops a deliberate rewording from failing it.
         protocol = REPLY_PROTOCOLS["request"].format(sender="@Manager")
-        assert message.render_for_llm() == (
+        assert message.rendering() == (
             f"You received a request from @Manager. {protocol}\n\nEstimate feature X"
         )
 
@@ -482,7 +474,7 @@ class TestReceiverSidePrefixSnippet:
         agent.receiveMsg_AgentMessage(message, _make_address("@Manager"))
 
         assert act.call_args[0][0] is message
-        assert message.render_for_llm().startswith("You received an instruction from @Manager.")
+        assert message.rendering().startswith("You received an instruction from @Manager.")
 
     @patch("akgentic.agent.agent.sleep", MagicMock())
     def test_raw_content_is_preserved_after_the_prefix(self) -> None:
@@ -494,7 +486,7 @@ class TestReceiverSidePrefixSnippet:
         agent.receiveMsg_AgentMessage(message, _make_address("@Developer456"))
 
         assert act.call_args[0][0] is message
-        assert message.render_for_llm().endswith("\n\n3 days")
+        assert message.rendering().endswith("\n\n3 days")
 
 
 # =============================================================================
@@ -620,7 +612,7 @@ class TestSlashDispatchFallback:
 
         act.assert_called_once()
         assert act.call_args[0][0] is message
-        assert message.render_for_llm().endswith("\n\n/usr/local is full — please fix")
+        assert message.rendering().endswith("\n\n/usr/local is full — please fix")
 
     @patch("akgentic.agent.agent.sleep", MagicMock())
     def test_a_recognised_slash_message_never_reaches_the_llm_path(self) -> None:
@@ -729,14 +721,10 @@ class TestSimpleTeamAliasSnippet:
             "fire": "fire_member",
         }
 
-        registered = _announced_command_names(
-            [TeamTool(), PlanningTool(vector_store=False)]
-        )
+        registered = _announced_command_names([TeamTool(), PlanningTool(vector_store=False)])
 
         missing = {
-            alias: real
-            for alias, real in documented_aliases.items()
-            if real not in registered
+            alias: real for alias, real in documented_aliases.items() if real not in registered
         }
         assert not missing, f"alias targets that no command registers: {missing}"
 
@@ -756,7 +744,7 @@ class TestActMediaExpansion:
         message = AgentMessage(content="just text")
         agent.act(message, StructuredOutput)
 
-        assert _react_agent_of(agent).run_sync.call_args[0][0] == message.render_for_llm()
+        assert _react_agent_of(agent).run_sync.call_args[0][0] == message.rendering()
 
     def test_unchanged_expansion_leaves_the_prompt_a_plain_string(self) -> None:
         def _expand_media_refs(prompt: str) -> Any:
@@ -769,7 +757,7 @@ class TestActMediaExpansion:
         message = AgentMessage(content="just text")
         agent.act(message, StructuredOutput)
 
-        assert _react_agent_of(agent).run_sync.call_args[0][0] == message.render_for_llm()
+        assert _react_agent_of(agent).run_sync.call_args[0][0] == message.rendering()
 
     def test_changed_expansion_switches_to_a_parts_prompt(self) -> None:
         def _expand_media_refs(prompt: str) -> Any:
@@ -1073,12 +1061,8 @@ class TestEventSubscriberSnippet:
                 if isinstance(message, SentMessage):
                     sender = cast(ActorAddress, message.sender)
                     body = cast(AgentMessage, message.message)
-                    printed.append(
-                        f"[{sender.name}] → {message.recipient.name}: {body.content}"
-                    )
-                elif isinstance(message, EventMessage) and isinstance(
-                    message.event, ToolCallEvent
-                ):
+                    printed.append(f"[{sender.name}] → {message.recipient.name}: {body.content}")
+                elif isinstance(message, EventMessage) and isinstance(message.event, ToolCallEvent):
                     printed.append(f"TOOL: {message.event.tool_name}")
 
         # EventSubscriber is a Protocol whose hooks all have no-op bodies, so a
@@ -1226,9 +1210,7 @@ class TestAnnouncedCommandSet:
                 ),
             )
             orchestrator.register_agent_profiles([card])
-            manager_addr = orchestrator.createActor(
-                BaseAgent, config=card.get_config_copy()
-            )
+            manager_addr = orchestrator.createActor(BaseAgent, config=card.get_config_copy())
 
             deadline = time.monotonic() + 5.0
             while not announced and time.monotonic() < deadline:

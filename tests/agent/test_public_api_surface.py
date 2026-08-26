@@ -1,7 +1,7 @@
 """The public import surface of ``akgentic.agent``, frozen (Epic 20, FR8 AC 7).
 
 Moving ``MailboxCapability`` and ``RunInterruptedError`` into
-``akgentic.agent.capabilities`` is a *relocation*, not an API change. Four
+``akgentic.tool.mailbox`` is a *relocation*, not an API change. Four
 things have to stay true, and each is a way the move or the rename could have
 gone wrong silently:
 
@@ -11,7 +11,7 @@ gone wrong silently:
 - The classes are **one** object each, however you reach them. Seven existing
   test modules import them from ``akgentic.agent.agent``; the public docs show
   ``from akgentic.agent import RunInterruptedError``; the canonical home is
-  ``akgentic.agent.capabilities``. A duplicate definition on any of those paths
+  ``akgentic.tool.mailbox``. A duplicate definition on any of those paths
   would break ``except RunInterruptedError`` for whoever imported the other one.
 - The old name ``MailboxCancelCapability`` resolves from **nowhere**. It was
   never released — it shipped on the epic branch and was renamed before the
@@ -21,14 +21,16 @@ gone wrong silently:
 
 from __future__ import annotations
 
-import akgentic.agent
-import akgentic.agent.agent as agent_module
-import akgentic.agent.capabilities as capabilities_module
-import akgentic.agent.capabilities.mailbox_capability as mailbox_capability_module
-from akgentic.agent.capabilities.mailbox_capability import (
+import akgentic.tool.mailbox as capabilities_module
+import akgentic.tool.mailbox.capability as mailbox_capability_module
+import pytest
+from akgentic.tool.mailbox.capability import (
     MailboxCapability,
     RunInterruptedError,
 )
+
+import akgentic.agent
+import akgentic.agent.agent as agent_module
 
 EXPECTED_PUBLIC_API = {
     "__version__",
@@ -36,10 +38,8 @@ EXPECTED_PUBLIC_API = {
     "HumanProxy",
     "BaseAgent",
     "RunInterruptedError",
-    "MailboxRenderError",
     "AgentMessage",
     "LlmRenderable",
-    "MailboxPreviewable",
 }
 
 
@@ -64,16 +64,23 @@ class TestOneClassNotTwo:
         assert capabilities_module.MailboxCapability is MailboxCapability
         assert agent_module.MailboxCapability is MailboxCapability
 
-    def test_capabilities_package_re_exports_every_symbol(self) -> None:
-        assert set(capabilities_module.__all__) == {
+    def test_the_mailbox_package_exports_the_capability_and_its_vocabulary(self) -> None:
+        # The capability ships from akgentic-tool, beside the card it reads.
+        # akgentic-agent no longer re-exports it: there is no
+        # akgentic.agent.capabilities package, and nothing forwards these names.
+        for name in (
             "MailboxCapability",
             "MailboxRenderError",
             "RunInterruptedError",
             "is_cancel",
             "render_arrival_notice",
-        }
-        for name in capabilities_module.__all__:
+        ):
+            assert name in capabilities_module.__all__, name
             assert getattr(capabilities_module, name, None) is not None, name
+
+    def test_the_agent_package_no_longer_carries_a_capabilities_module(self) -> None:
+        with pytest.raises(ImportError):
+            import akgentic.agent.capabilities  # noqa: F401
 
 
 class TestOldNameIsGone:

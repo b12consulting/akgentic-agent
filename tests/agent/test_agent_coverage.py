@@ -20,6 +20,7 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 from akgentic.core import ActorAddress
 from akgentic.tool.errors import CommandNotRecognized
+from akgentic.tool.mailbox import MailboxTool
 from pydantic_ai import ModelRetry
 
 from akgentic.agent.agent import BaseAgent, MailboxCapability
@@ -85,7 +86,7 @@ def _make_minimal_agent(
     agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
 
     # Mailbox capability normally built in _build_react_agent (Epic 20).
-    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
+    agent._mailbox_capability = MailboxCapability(observer=agent, card=MailboxTool())  # type: ignore[arg-type]
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = name
@@ -266,7 +267,7 @@ class TestReceiveAgentMessage:
 
         Two halves, and both matter. The handler builds no prompt any more — so
         it is the *message* act() receives. The prefix text is unchanged, which
-        is what ``render_for_llm()`` is asserted against here byte-for-byte.
+        is what ``rendering()`` is asserted against here byte-for-byte.
         """
         agent = _make_minimal_agent()
         act = _stub_act(agent)
@@ -283,7 +284,7 @@ class TestReceiveAgentMessage:
 
         protocol = REPLY_PROTOCOLS["request"].format(sender="@Alice")
         expected = f"You received a request from @Alice. {protocol}\n\nhello world"
-        assert message.render_for_llm() == expected
+        assert message.rendering() == expected
 
     @patch("akgentic.agent.agent.sleep")
     def test_usage_limit_error_notifies_human(self, mock_sleep: MagicMock) -> None:
@@ -353,7 +354,7 @@ class TestReceiveAgentMessage:
 
         protocol = REPLY_PROTOCOLS["request"].format(sender="@Bob")
         expected = f"You received a request from @Bob. {protocol}\n\ndo this"
-        assert message.render_for_llm() == expected
+        assert message.rendering() == expected
 
     @patch("akgentic.agent.agent.sleep")
     def test_reconstructs_prefix_with_an_for_acknowledgment(self, mock_sleep: MagicMock) -> None:
@@ -367,7 +368,7 @@ class TestReceiveAgentMessage:
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Carol"))
 
         assert act.call_args[0][0] is message
-        rendered = message.render_for_llm()
+        rendered = message.rendering()
         protocol = REPLY_PROTOCOLS["acknowledgment"]
         assert rendered.startswith(f"You received an acknowledgment from @Carol. {protocol}")
         assert rendered.endswith("ack")
@@ -384,7 +385,7 @@ class TestReceiveAgentMessage:
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Manager"))
 
         assert act.call_args[0][0] is message
-        rendered = message.render_for_llm()
+        rendered = message.rendering()
         protocol = REPLY_PROTOCOLS["instruction"].format(sender="@Manager")
         assert rendered.startswith(f"You received an instruction from @Manager. {protocol}")
         assert rendered.endswith("step 1")
@@ -408,7 +409,7 @@ class TestReceiveAgentMessage:
         agent.receiveMsg_AgentMessage(message, _make_mock_sender("@Somewhere"))
 
         assert act.call_args[0][0] is message
-        rendered = message.render_for_llm()
+        rendered = message.rendering()
         assert "from unknown. " in rendered
         assert rendered.endswith("hello")
 
@@ -636,7 +637,7 @@ class TestSlashCommandDispatch:
         # rendering still carries the prefix.
         act.assert_called_once()
         assert act.call_args[0][0] is message
-        prefixed = message.render_for_llm()
+        prefixed = message.rendering()
         assert prefixed.endswith("/etc/passwd")
         assert "You received a request from @Human. " in prefixed
 

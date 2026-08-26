@@ -42,6 +42,7 @@ import pytest
 from akgentic.core import ActorAddress
 from akgentic.core.messages import CancelMessage, Message
 from akgentic.llm import LlmMessageEvent, ModelConfig, ReactAgent, ReactAgentConfig
+from akgentic.tool.mailbox import MailboxTool, render_arrival_notice
 from pydantic_ai import AgentCapability, RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.messages import (
@@ -55,7 +56,6 @@ from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.agent.agent import BaseAgent, MailboxCapability, RunInterruptedError
-from akgentic.agent.capabilities import render_arrival_notice
 from akgentic.agent.config import AgentConfig
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -133,7 +133,7 @@ def _make_minimal_agent(mailbox: _MailboxDouble) -> BaseAgent:
     agent._context_updater = MagicMock()  # type: ignore[attr-defined]
     agent._context_updater.compose_update.return_value = None  # type: ignore[attr-defined]
 
-    agent._mailbox_capability = MailboxCapability(observer=mailbox)
+    agent._mailbox_capability = MailboxCapability(observer=mailbox, card=MailboxTool())
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"
@@ -261,9 +261,7 @@ class TestArrivalNoticeDurability:
             output_tool_name = info.output_tools[0].name
             if model_call_count == 1:
                 return ModelResponse(
-                    parts=[
-                        ToolCallPart(tool_name="check_status", args={}, tool_call_id="fn-1")
-                    ]
+                    parts=[ToolCallPart(tool_name="check_status", args={}, tool_call_id="fn-1")]
                 )
             return ModelResponse(
                 parts=[
@@ -474,7 +472,9 @@ class TestArrivalNoticeIsGatedOnTheReadTool:
         mailbox = _MailboxDouble([arrived], current=handled)
 
         agent = _make_minimal_agent(mailbox)
-        agent._mailbox_capability = MailboxCapability(observer=mailbox, arrival_notice=False)
+        agent._mailbox_capability = MailboxCapability(
+            observer=mailbox, card=MailboxTool(read_mailbox=False)
+        )
         recorder = _EventRecorder()
         react_agent = _build_react_agent(agent, recorder)
 
@@ -544,7 +544,9 @@ class TestArrivalNoticeIsGatedOnTheReadTool:
         mailbox.pending = [cancel]  # type: ignore[list-item]
 
         agent = _make_minimal_agent(mailbox)
-        agent._mailbox_capability = MailboxCapability(observer=mailbox, arrival_notice=False)
+        agent._mailbox_capability = MailboxCapability(
+            observer=mailbox, card=MailboxTool(read_mailbox=False)
+        )
         react_agent = _build_react_agent(agent, _EventRecorder())
 
         def stub_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:

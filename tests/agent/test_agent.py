@@ -9,6 +9,7 @@ live actor system or real LLM calls. Media expansion resolves the
 from typing import Any
 from unittest.mock import MagicMock
 
+from akgentic.tool.mailbox import MailboxTool
 from akgentic.tool.workspace.readers import MediaContent
 from pydantic_ai import BinaryContent
 
@@ -42,7 +43,7 @@ def _message(content: str, sender_name: str = "@Human") -> AgentMessage:
 
     These specs are about media expansion, and expansion runs on what the
     message *renders*, not on the raw body. Comparing against
-    ``message.render_for_llm()`` rather than against the body is therefore the
+    ``message.rendering()`` rather than against the body is therefore the
     spec, not a concession to the new signature.
     """
     message = AgentMessage(content=content)
@@ -90,7 +91,7 @@ def _make_minimal_agent(name: str = "@TestAgent", media_cmd: Any = None) -> Base
 
     # Mailbox capability normally built in _build_react_agent (Epic 20) —
     # act() resets its run-local tracking at each run start.
-    agent._mailbox_capability = MailboxCapability(observer=agent)  # type: ignore[arg-type]
+    agent._mailbox_capability = MailboxCapability(observer=agent, card=MailboxTool())  # type: ignore[arg-type]
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = name
@@ -134,8 +135,8 @@ class TestBaseAgentMediaExpansion:
         message = _message("describe !!photo.png please")
         agent.act(message, output_type=str)
 
-        # Expansion consumes the RENDERED string, after render_for_llm().
-        mock_cmd.assert_called_once_with(message.render_for_llm())
+        # Expansion consumes the RENDERED string, after rendering().
+        mock_cmd.assert_called_once_with(message.rendering())
         assert len(captured_prompts) == 1
         result_prompt = captured_prompts[0]
         assert isinstance(result_prompt, list)
@@ -170,7 +171,7 @@ class TestBaseAgentMediaExpansion:
         result_prompt = captured_prompts[0]
         # Must be the rendered string, NOT a list
         assert isinstance(result_prompt, str)
-        assert result_prompt == message.render_for_llm()
+        assert result_prompt == message.rendering()
 
     # ------------------------------------------------------------------
     # document token → hint string list, no BinaryContent
@@ -226,7 +227,7 @@ class TestBaseAgentMediaExpansion:
         assert len(captured_prompts) == 1
         result_prompt = captured_prompts[0]
         assert isinstance(result_prompt, str)
-        assert result_prompt == message.render_for_llm()
+        assert result_prompt == message.rendering()
 
     # ------------------------------------------------------------------
     # act() takes the message, and there is no string path
