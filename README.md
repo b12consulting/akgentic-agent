@@ -1052,9 +1052,11 @@ A message is offered an id only when **all four** of these hold:
 The closing line follows the same rule. It points at `read_mailbox` "with one of the ids above"
 only when at least one id is on offer; otherwise it says only "Finish your current work first —
 you will get them just after", because promising a read for a listing that carries no id would
-be an instruction the model cannot follow. The card-level gate above is that same principle one
-step earlier: a notice that cannot name an id is degraded, and a notice whose *tool* does not
-exist is not rendered at all.
+be an instruction the model cannot follow. When it does point, it also gives the one reason that
+decides the timing: a message that may add to or change the work in flight is worth taking on
+before that work is finished, and is worth nothing after. The card-level gate above is that same
+principle one step earlier: a notice that cannot name an id is degraded, and a notice whose
+*tool* does not exist is not rendered at all.
 
 **Naming an id absorbs that one message.** `read_mailbox` takes the id and acknowledges it;
 `MailboxCapability.after_tool_execute` consumes exactly the message named and enqueues that
@@ -1068,8 +1070,17 @@ never offered and never absorbed.
 self-contained ("You received a request from @X. A reply is expected."). Injected mid-run that
 reads as a **new assignment**, and the model answers it *instead of* what it was already doing.
 Observed in the field: an agent that had just finished a report answered only the newer question,
-and the report answer reached nobody. The prefix says the work is *additional*, that it does not
-replace the current request, and that both answers belong in the output's `messages` list.
+and the report answer reached nobody. The prefix says the work is *additional* and that it does
+not replace the current request.
+
+**How many answers are owed, it does not assert — it asks.** A mid-run arrival is either a
+separate request (two answers, one message each in the output's `messages` list) or an addition
+to, or correction of, the request already in flight, where one message answers both. The
+capability cannot tell which: it has not read the message, and a classification made in code
+would be invisible and unrecoverable, where one made by the model is right there in the output.
+So the prefix states both cases and names a default for the doubtful ones — **answer
+separately** — because the two failure modes are not symmetric: a redundant second message is
+noise, a swallowed report reaches nobody.
 
 The prefix belongs to the capability, not the message: **rendering a message is the message's
 job, delivering one is the capability's**, and framing a delivery is part of delivering it — so

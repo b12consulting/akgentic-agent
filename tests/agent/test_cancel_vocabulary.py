@@ -26,8 +26,10 @@ from akgentic.agent.messages import PREVIEW_LIMIT, AgentMessage
 # Which one is not decoration — the notice may only point at ``read_mailbox``
 # when the listing actually carries an id to name.
 CLOSING_WITH_IDS = (
-    "Call `read_mailbox` with one of the ids above to take that message on now, "
-    "or finish your current work first — you will get them just after."
+    "Call `read_mailbox` with one of the ids above to take that message on now — worth doing "
+    "if it may add to or change what you are working on, since a correction only helps before "
+    "the work is finished. Otherwise finish your current work first — you will get them just "
+    "after."
 )
 CLOSING_WITHOUT_IDS = "Finish your current work first — you will get them just after."
 

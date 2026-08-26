@@ -153,8 +153,10 @@ UNOFFERABLE_LINE = "- Message cannot be handled in the run"
 """What a message this run cannot take on renders as — no id, no content."""
 
 _CLOSING_WITH_IDS = (
-    "Call `read_mailbox` with one of the ids above to take that message on now, "
-    "or finish your current work first — you will get them just after."
+    "Call `read_mailbox` with one of the ids above to take that message on now — worth doing "
+    "if it may add to or change what you are working on, since a correction only helps before "
+    "the work is finished. Otherwise finish your current work first — you will get them just "
+    "after."
 )
 
 _CLOSING_WITHOUT_IDS = "Finish your current work first — you will get them just after."
@@ -177,9 +179,11 @@ def render_arrival_notice(new_messages: list[Message], offerable_ids: set[uuid.U
 
     The closing line follows the same rule. It points at ``read_mailbox`` only
     when at least one id is on offer, because promising a read for a listing
-    that carries no id would be an instruction the model cannot follow. The
-    reassurance that unread mail arrives as its own turn is true either way and
-    is kept in both.
+    that carries no id would be an instruction the model cannot follow. When it
+    does point, it also gives the one reason that decides the timing: a message
+    that may add to or change the work in flight is worth taking on before that
+    work is finished, and is worth nothing after. The reassurance that unread
+    mail arrives as its own turn is true either way and is kept in both.
 
     Args:
         new_messages: The messages to announce, in reception order.
@@ -219,7 +223,9 @@ def _message_line(message: Message, offerable_ids: set[uuid.UUID]) -> str:
 
 ABSORBED_PREFIX = (
     "Additional work, taken on mid-run. It does NOT replace what you were already asked "
-    "to do — answer both before this run ends, one message each in your output."
+    "to do. It may be a separate request, in which case answer both before this run ends, "
+    "one message each in your output; or it may add to or correct the request already in "
+    "flight, in which case one message answers both. When unsure, answer separately."
 )
 """What an absorbed message is prefixed with when it is injected.
 
@@ -228,7 +234,24 @@ imperative and self-contained ("You received a request from @X. A reply is
 expected."). Injected mid-run that reads as a *new assignment*, and the model
 answers it instead of what it was already doing. Observed in the field: an agent
 that had just written a report answered only the newer question, and the report
-answer reached nobody.
+answer reached nobody. The first sentence is the clause that stops that failure
+and is not to be reworded.
+
+**The output obligation after it is a choice, not an assertion.** A mid-run
+arrival is either a separate request — two answers owed, one message each — or
+an addition to, or correction of, the request already in flight, where one
+answer covers both. The capability cannot tell which: it has not read the
+message, and a classification made here would be invisible and unrecoverable,
+where one made by the model is right there in the output. So the string states
+both cases and lets the model choose. The second case is not an edge — the offer
+filter admits a pending message only when its class is *exactly* the handled
+message's, so a message eligible for a mid-run read is by construction the kind
+most likely to be a follow-up on the same thread.
+
+**The default lives in the string, and it is "answer separately."** Not in this
+docstring, not in a comment: the model reads the string. The two failure modes
+are not symmetric — a redundant second message is noise, a swallowed report
+reaches nobody — so the doubt is biased toward the cheap failure.
 
 The prefix is the capability's, not the message's. **Rendering a message is the
 message's job; delivering one is this capability's**, and framing a delivery is
