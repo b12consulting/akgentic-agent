@@ -35,6 +35,7 @@ from akgentic.core.messages import CancelMessage, Message, UserMessage
 
 from akgentic.agent.capabilities import MailboxRenderError, render_arrival_notice
 from akgentic.agent.capabilities.mailbox_capability import (
+    ABSORBED_PREFIX,
     MESSAGE_ID_ARG,
     READ_MAILBOX_TOOL,
     UNOFFERABLE_LINE,
@@ -588,11 +589,23 @@ class TestAnAbsorbedMessageIsFramedAsAddedWork:
     assignment, and the model answers it *instead of* what it was already doing.
     Observed in the field: an agent that had just written a report answered only
     the newer question, and the report answer reached nobody.
+
+    What is pinned here is the **shape of the delivery**, not the sentences the
+    prefix happens to use: the prefix arrives ahead of the message's own
+    rendering, and that rendering is carried whole. The one clause pinned by its
+    text is *"does NOT replace"* — the clause the field failure was opened for.
+    Everything else in the string is prompt wording, free to be re-tuned without
+    reddening a suite; an assert on a phrase would make the next wording pass a
+    test failure for no behavioural reason.
     """
 
     async def test_the_injection_says_additional_and_carries_the_rendering_whole(self) -> None:
         """MUTATION — enqueue ``message.render_for_llm()`` bare, as it was before,
-        and the first two assertions go red. Nothing else in the suite moves.
+        and the first two assertions go red, along with the two sibling specs
+        above that pin the same ``"does NOT replace"`` clause: three in this
+        file, nothing outside it. Restoring the prefix's earlier *wording*
+        reddens none of the three — these pin the delivery's shape, not its
+        sentences.
         """
         absorbed = _agent_message("what is the colour of the sky?", "@Human")
         capability = MailboxCapability(observer=_MailboxDouble([absorbed]))
@@ -602,6 +615,5 @@ class TestAnAbsorbedMessageIsFramedAsAddedWork:
 
         (enqueued,), priority = ctx.enqueue_calls[0]
         assert "does NOT replace" in enqueued
-        assert "answer both" in enqueued
-        assert absorbed.render_for_llm() in enqueued
+        assert enqueued == f"{ABSORBED_PREFIX}\n\n{absorbed.render_for_llm()}"
         assert priority == "asap"
