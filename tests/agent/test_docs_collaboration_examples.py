@@ -884,11 +884,6 @@ class TestExtraCapabilitiesSnippet:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         agent: AuditedAgent = object.__new__(AuditedAgent)
-
-        # The agent's own state, normally assigned in on_start. act() reads
-        # state.tool_state.active_model to re-apply a persisted model selection;
-        # an empty slot makes that a no-op, which is what these specs want.
-        agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
         config = MagicMock(spec=AgentConfig)
         config.name = "@Audited"
         agent.config = config  # type: ignore[attr-defined]
@@ -912,11 +907,6 @@ class TestExtraCapabilitiesSnippet:
     ) -> None:
         """Documented: `extra_capabilities()` returns `[]` on BaseAgent."""
         agent: BaseAgent = object.__new__(BaseAgent)
-
-        # The agent's own state, normally assigned in on_start. act() reads
-        # state.tool_state.active_model to re-apply a persisted model selection;
-        # an empty slot makes that a no-op, which is what these specs want.
-        agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
         assert agent.extra_capabilities() == []
         capabilities = self._build(agent, monkeypatch)
