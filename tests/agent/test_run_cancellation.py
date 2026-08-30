@@ -68,7 +68,7 @@ import akgentic.agent
 import akgentic.agent.agent as agent_module
 from akgentic.agent import RunInterruptedError
 from akgentic.agent.agent import BaseAgent, MailboxCapability
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -802,6 +802,11 @@ class TestCapabilityWiring:
     def test_base_agent_extra_capabilities_defaults_to_empty(self) -> None:
         """The hook is safe on a half-built agent — it reads nothing off self."""
         agent: BaseAgent = object.__new__(BaseAgent)
+
+        # The agent's own state, normally assigned in on_start. act() reads
+        # state.tool_state.active_model to re-apply a persisted model selection;
+        # an empty slot makes that a no-op, which is what these specs want.
+        agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
         assert agent.extra_capabilities() == []
 
     def test_assembly_is_mailbox_first_then_the_subclass(
@@ -816,6 +821,11 @@ class TestCapabilityWiring:
         extra = _RecordingCapability()
         monkeypatch.setattr(_AgentWithOneExtra, "extra", extra)
         agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
+
+        # The agent's own state, normally assigned in on_start. act() reads
+        # state.tool_state.active_model to re-apply a persisted model selection;
+        # an empty slot makes that a no-op, which is what these specs want.
+        agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
         capabilities = agent._assemble_capabilities(MailboxTool())
 
@@ -834,6 +844,11 @@ class TestCapabilityWiring:
 
         monkeypatch.setattr(agent_module, "ReactAgent", _FakeReactAgent)
         agent: BaseAgent = object.__new__(BaseAgent)
+
+        # The agent's own state, normally assigned in on_start. act() reads
+        # state.tool_state.active_model to re-apply a persisted model selection;
+        # an empty slot makes that a no-op, which is what these specs want.
+        agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
         given: list[AgentCapability[Any]] = [_RecordingCapability()]
 
         agent._build_react_agent(ReactAgentConfig(), given, [], [])
@@ -859,6 +874,11 @@ class TestCapabilityWiring:
         fake_loadtest.MockReactAgent = _FakeMockReactAgent  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "akgentic.llm.loadtest", fake_loadtest)
         agent: BaseAgent = object.__new__(BaseAgent)
+
+        # The agent's own state, normally assigned in on_start. act() reads
+        # state.tool_state.active_model to re-apply a persisted model selection;
+        # an empty slot makes that a no-op, which is what these specs want.
+        agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
         given: list[AgentCapability[Any]] = [_RecordingCapability()]
 
         agent._build_react_agent(ReactAgentConfig(), given, [], [])
@@ -1144,6 +1164,11 @@ def _make_cardless_agent(pending: list[Any]) -> BaseAgent:
     """
     agent: BaseAgent = object.__new__(BaseAgent)
 
+    # The agent's own state, normally assigned in on_start. act() reads
+    # state.tool_state.active_model to re-apply a persisted model selection;
+    # an empty slot makes that a no-op, which is what these specs want.
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
+
     registry = MagicMock()
     registry.has.return_value = False
     agent._command_registry = registry  # type: ignore[attr-defined]
@@ -1231,6 +1256,11 @@ def _make_extension_point_agent() -> _AgentWithOneExtra:
     assembly, not a list the test wrote.
     """
     agent: _AgentWithOneExtra = object.__new__(_AgentWithOneExtra)
+
+    # The agent's own state, normally assigned in on_start. act() reads
+    # state.tool_state.active_model to re-apply a persisted model selection;
+    # an empty slot makes that a no-op, which is what these specs want.
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
     registry = MagicMock()
     registry.has.return_value = False

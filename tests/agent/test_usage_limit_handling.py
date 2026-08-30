@@ -39,7 +39,7 @@ from akgentic.llm import AgentUsageLimitError, ReactAgent, RunUsageLimitError, U
 from akgentic.tool.errors import CommandNotRecognized
 
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import Request, StructuredOutput
 
@@ -80,6 +80,11 @@ def _make_agent() -> BaseAgent:
     read as satisfied when nothing had been checked at all.
     """
     agent: BaseAgent = object.__new__(BaseAgent)
+
+    # The agent's own state, normally assigned in on_start. act() reads
+    # state.tool_state.active_model to re-apply a persisted model selection;
+    # an empty slot makes that a no-op, which is what these specs want.
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
     agent._command_registry = _make_registry()  # type: ignore[attr-defined]
     agent._react_agent = MagicMock(spec=ReactAgent)  # type: ignore[attr-defined]

@@ -66,7 +66,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
@@ -274,6 +274,11 @@ def build_agent(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[..., Any]]
         built.append(react)
 
         agent: BaseAgent = object.__new__(agent_cls)
+
+        # The agent's own state, normally assigned in on_start. act() reads
+        # state.tool_state.active_model to re-apply a persisted model selection;
+        # an empty slot makes that a no-op, which is what these specs want.
+        agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
         agent._react_agent = react  # type: ignore[attr-defined]
         agent._command_registry = _make_registry()  # type: ignore[attr-defined]
         agent.team_id = uuid.uuid4()

@@ -27,7 +27,7 @@ from akgentic.llm import AgentUsageLimitError, ReactAgent, RunUsageLimitError
 from pydantic import BaseModel
 
 from akgentic.agent.agent import RunInterruptedError
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.custom_agent import CustomAgent, Handoff, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
 
@@ -48,6 +48,11 @@ def _make_custom_agent() -> CustomAgent:
     nothing had been called.
     """
     agent: CustomAgent = object.__new__(CustomAgent)
+
+    # The agent's own state, normally assigned in on_start. act() reads
+    # state.tool_state.active_model to re-apply a persisted model selection;
+    # an empty slot makes that a no-op, which is what these specs want.
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
     agent._react_agent = MagicMock(spec=ReactAgent)  # type: ignore[attr-defined]
     agent._command_registry = MagicMock()  # type: ignore[attr-defined]

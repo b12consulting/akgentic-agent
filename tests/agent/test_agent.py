@@ -14,7 +14,7 @@ from akgentic.tool.workspace.readers import MediaContent
 from pydantic_ai import BinaryContent
 
 from akgentic.agent.agent import BaseAgent, MailboxCapability
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage, LlmRenderable
 from akgentic.agent.output_models import StructuredOutput
 
@@ -78,6 +78,11 @@ def _make_minimal_agent(name: str = "@TestAgent", media_cmd: Any = None) -> Base
     - config: mock with .name
     """
     agent: BaseAgent = object.__new__(BaseAgent)
+
+    # The agent's own state, normally assigned in on_start. act() reads
+    # state.tool_state.active_model to re-apply a persisted model selection;
+    # an empty slot makes that a no-op, which is what these specs want.
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
     # Minimal attributes expected by act()
     agent._command_registry = _make_registry(media_cmd)  # type: ignore[attr-defined]
