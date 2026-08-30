@@ -144,10 +144,16 @@ class TestInheritedRejections:
 
 
 class TestDuplicateRosterKeys:
-    """Two entries with one ``provider:model`` key make a switch request ambiguous."""
+    """Two entries with one ``provider:model`` key make a switch request ambiguous.
+
+    Every rejection here asserts the *guard's own* message fragment. A bare
+    ``pytest.raises(ValueError)`` around a list ``model_cfg`` is satisfied by Pydantic's
+    plain "not a ModelConfig" type error, so it stays green even with the roster feature
+    absent altogether — proving nothing about the rule it is named for.
+    """
 
     def test_two_identical_entries_rejected(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="duplicate entry"):
             AgentConfig(model_cfg=[GPT, CLAUDE, GPT])
 
     def test_implicit_and_explicit_provider_spellings_collide(self) -> None:
@@ -156,7 +162,7 @@ class TestDuplicateRosterKeys:
         This is why the guard must run *after* field validation: before it, the
         implicit spelling has no ``provider`` at all and the two look distinct.
         """
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="duplicate entry"):
             AgentConfig(
                 model_cfg=[
                     {"model": "gpt-4o"},
@@ -165,7 +171,7 @@ class TestDuplicateRosterKeys:
             )
 
     def test_duplicates_in_a_hand_set_roster_are_rejected_too(self) -> None:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="duplicate entry"):
             AgentConfig(model_cfg=GPT, model_roster=[GPT, GPT])
 
     def test_same_model_name_under_two_providers_is_not_a_duplicate(self) -> None:
@@ -286,8 +292,13 @@ class TestValidatorsCoexist:
         assert _deprecations(caught) == []
 
     def test_the_usage_limits_rejection_survives_a_roster(self) -> None:
-        """Neither validator may mask the other's error."""
-        with pytest.raises(ValueError):
+        """Neither validator may mask the other's error.
+
+        Matched on the usage-limits message specifically: an unqualified ValueError here
+        would also be satisfied by the roster validator raising instead, which is the
+        very masking this spec exists to rule out.
+        """
+        with pytest.raises(ValueError, match="both usage_limits"):
             AgentConfig(
                 model_cfg=[GPT, CLAUDE],
                 usage_limits=RunUsageLimits(run_request_limit=10),
@@ -331,7 +342,12 @@ class TestListOfDicts:
         assert all(isinstance(entry, ModelConfig) for entry in cfg.model_roster)
 
     def test_an_empty_dict_list_is_rejected_the_same_way(self) -> None:
-        with pytest.raises(ValueError):
+        """Matched on "empty" for the same reason as the AC 3 spec it mirrors.
+
+        ``model_cfg: []`` fails Pydantic's own type check too, so a bare
+        ``pytest.raises(ValueError)`` passes with no normalizer in the module at all.
+        """
+        with pytest.raises(ValueError, match="empty"):
             AgentConfig.model_validate({"model_cfg": []})
 
 

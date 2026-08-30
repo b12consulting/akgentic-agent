@@ -13,7 +13,15 @@ network is touched.
 import time
 
 from akgentic.core import ActorSystem, BaseConfig, Orchestrator
-from akgentic.llm import ModelConfig, PromptTemplate, ReactAgentConfig
+from akgentic.llm import (
+    AgentUsageLimits,
+    CompactionConfig,
+    ModelConfig,
+    PromptTemplate,
+    ReactAgentConfig,
+    RuntimeConfig,
+    RunUsageLimits,
+)
 
 import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent
@@ -121,3 +129,42 @@ class TestRosterReachesTheReactAgent:
         assert built.model_cfg == CLAUDE
         assert built.model_cfg in built.model_roster
         ReactAgentConfig.model_validate(built.model_dump())
+
+
+class TestEverySharedFieldIsForwarded:
+    """The general form of the defect this story fixed by hand.
+
+    ``model_roster`` was added to ReactAgentConfig and then had to be carried across as
+    a separate manual keyword. Nothing forced that: the roster was accepted on
+    AgentConfig and silently dropped on the way to the ReactAgent, and every other test
+    in the package stayed green. The next field the two models come to share will be
+    dropped in exactly the same way, for exactly as long as nobody notices.
+
+    So the pairing is derived from ``model_fields`` at runtime rather than from a list
+    written out here — a hand-written list is correct on the day it is written and stale
+    the day a field is added, which is the failure mode itself. Every shared field is
+    given a non-default value, so a dropped keyword surfaces as that field's default
+    rather than as a coincidental match.
+    """
+
+    def test_every_field_shared_with_react_agent_config_arrives(self) -> None:
+        agent_cfg = _agent_config(
+            model_cfg=[GPT, CLAUDE, GEMINI],
+            runtime_cfg=RuntimeConfig(retries=7),
+            run_usage_limits=RunUsageLimits(run_request_limit=13),
+            agent_usage_limits=AgentUsageLimits(agent_request_limit=17),
+            compaction_cfg=CompactionConfig(keep_recent_messages=9),
+        )
+        built = _start_agent_and_capture_config(agent_cfg)
+
+        shared = set(AgentConfig.model_fields) & set(ReactAgentConfig.model_fields)
+        assert "model_roster" in shared, "the guard is vacuous if the field it guards is gone"
+
+        dropped = {
+            name: (getattr(agent_cfg, name), getattr(built, name))
+            for name in sorted(shared)
+            if getattr(built, name) != getattr(agent_cfg, name)
+        }
+        assert not dropped, (
+            f"declared on AgentConfig but not carried onto ReactAgentConfig: {dropped}"
+        )
