@@ -1069,6 +1069,8 @@ leaves unnamed stays queued and arrives as its own turn once the run ends, and a
 never offered and never absorbed.
 
 **The injected turn is prefixed with `ABSORBED_PREFIX`, and that prefix is load-bearing.**
+(`ABSORBED_PREFIX` and `ARRIVAL_CLOSING` are both exported from `akgentic.tool.mailbox`, so a
+caller overriding one can build on the shipped wording rather than replace it blind.)
 `rendering()` renders a message the way its *own handler* would receive it — imperative and
 self-contained ("You received a request from @X. A reply is expected."). Injected mid-run that
 reads as a **new assignment**, and the model answers it *instead of* what it was already doing.
@@ -1089,12 +1091,20 @@ The prefix belongs to the capability, not the message: **rendering a message is 
 job, delivering one is the capability's**, and framing a delivery is part of delivering it — so
 every class that grows a `rendering()` inherits it for free.
 
-**Both injected strings come from the `MailboxTool` card, and the card is what gets injected.**
+**The card is what gets injected, and the wording is not on it.**
 `MailboxCapability(observer=self, card=mailbox_card)` is the whole of the wiring:
 `BaseAgent._assemble_capabilities` hands the card over and inspects none of it, and the capability
-reads `absorbed_prefix`, `arrival_closing` and `read_mailbox` off it
-itself. The mailbox's wording is therefore a deployment decision rather than a code change, and
-which fields the mailbox needs is knowledge the *consumer* holds — the agent does not repeat it.
+reads `read_mailbox` off it itself to decide whether the doorbell rings. Which fields the mailbox
+needs is knowledge the *consumer* holds — the agent does not repeat it.
+
+The two injected strings are **`MailboxCapability`'s own**, keyword-only constructor parameters
+defaulting to `ABSORBED_PREFIX` and `ARRIVAL_CLOSING`. They lived on the card for one release and
+came back off it: the catalog persists a card with a plain `model_dump(mode="json")` and no
+`exclude_defaults`, so a literal field default was written into every stored entry and each team
+froze a private copy of prose that is expected to keep improving. `BaseAgent` passes neither
+parameter, so every deployment runs the shipped wording and improving a sentence reaches every
+existing team on upgrade rather than only teams created afterwards. Overriding is still possible,
+in process, by a caller constructing the capability directly.
 
 The card is **required**, so a card published before these fields existed fails loudly rather than
 quietly running text nobody can see in the catalog; `akgentic-agent` depends on an `akgentic-tool`
