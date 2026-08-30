@@ -16,7 +16,7 @@ import types
 import akgentic.agent.agent as agent_module
 import pytest
 from akgentic.agent.agent import BaseAgent
-from akgentic.llm import ReactAgentConfig
+from akgentic.llm import ModelConfig, ReactAgentConfig
 
 ENV_VAR = "AKGENTIC_MOCK_SCENARIO"
 
@@ -135,3 +135,73 @@ def test_mock_path_omits_event_loop_kwarg(monkeypatch: pytest.MonkeyPatch) -> No
     agent._build_react_agent(ReactAgentConfig(), [], [], [])
 
     assert "event_loop" not in captured
+
+
+GPT = ModelConfig(provider="openai", model="gpt-4o")
+CLAUDE = ModelConfig(provider="anthropic", model="claude-sonnet-4-5")
+
+
+class TestMockScenarioCopyStaysConsistent:
+    """The scenario copy replaces the active model, so it must drop the roster with it.
+
+    ``model_copy(update=...)`` skips validation, so rewriting ``model_cfg.model`` to the
+    scenario path while leaving the roster alone produces a config whose active model is
+    absent from its own roster — internally inconsistent, and raising only later, on the
+    next re-validation, where nothing points back at this line. A mock serves exactly one
+    scenario file, so a roster it could switch away from is meaningless anyway.
+    """
+
+    @staticmethod
+    def _build_mock_config(
+        monkeypatch: pytest.MonkeyPatch, config: ReactAgentConfig
+    ) -> ReactAgentConfig:
+        monkeypatch.setenv(ENV_VAR, "/tmp/sandpile-research.yaml")
+
+        captured: dict[str, object] = {}
+
+        class _FakeMockReactAgent:
+            def __init__(self, **kwargs: object) -> None:
+                captured.update(kwargs)
+
+        fake_loadtest = types.ModuleType("akgentic.llm.loadtest")
+        fake_loadtest.MockReactAgent = _FakeMockReactAgent  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "akgentic.llm.loadtest", fake_loadtest)
+
+        _make_agent()._build_react_agent(config, [], [], [])
+
+        mock_cfg = captured["config"]
+        assert isinstance(mock_cfg, ReactAgentConfig)
+        return mock_cfg
+
+    def test_copy_survives_revalidation_of_its_own_dump(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cfg = self._build_mock_config(
+            monkeypatch, ReactAgentConfig(model_cfg=[GPT, CLAUDE])
+        )
+        ReactAgentConfig.model_validate(mock_cfg.model_dump())
+
+    def test_copy_carries_the_scenario_path_and_no_roster(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cfg = self._build_mock_config(
+            monkeypatch, ReactAgentConfig(model_cfg=[GPT, CLAUDE])
+        )
+        assert mock_cfg.model_cfg.model == "/tmp/sandpile-research.yaml"
+        assert mock_cfg.model_roster == []
+
+    def test_the_original_config_keeps_its_roster(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``self.config`` is left untouched — the copy is the only thing rewritten."""
+        config = ReactAgentConfig(model_cfg=[GPT, CLAUDE])
+        self._build_mock_config(monkeypatch, config)
+        assert config.model_roster == [GPT, CLAUDE]
+        assert config.model_cfg == GPT
+
+    def test_a_single_model_mock_config_is_unaffected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mock_cfg = self._build_mock_config(monkeypatch, ReactAgentConfig(model_cfg=GPT))
+        assert mock_cfg.model_roster == []
+        ReactAgentConfig.model_validate(mock_cfg.model_dump())

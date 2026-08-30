@@ -242,6 +242,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # with a per-call output_type override.
         react_agent_config = ReactAgentConfig(
             model_cfg=self.config.model_cfg,
+            model_roster=self.config.model_roster,
             runtime_cfg=self.config.runtime_cfg,
             run_usage_limits=self.config.run_usage_limits,
             agent_usage_limits=self.config.agent_usage_limits,
@@ -426,8 +427,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
             # Carry the scenario path in a config copy's model field (the mock
             # reads model_cfg.model first); self.config is left untouched.
+            # The roster goes with it: model_copy skips validation, so keeping a
+            # roster the rewritten active model is no longer part of would leave the
+            # copy internally inconsistent, raising only on some later
+            # re-validation. A mock serves exactly one scenario file anyway, so a
+            # roster it could switch away from is meaningless.
             mock_cfg = config.model_copy(
-                update={"model_cfg": config.model_cfg.model_copy(update={"model": scenario})}
+                update={
+                    "model_cfg": config.model_cfg.model_copy(update={"model": scenario}),
+                    "model_roster": [],
+                }
             )
             return cast(
                 ReactAgent,
