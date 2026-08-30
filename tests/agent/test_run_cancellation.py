@@ -37,11 +37,14 @@ from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.core.messages import CancelMessage, HandledMessage
 from akgentic.llm import ModelConfig, PromptTemplate, ReactAgent, ReactAgentConfig
 from akgentic.tool import MailboxTool
-from akgentic.tool.mailbox import is_cancel, render_arrival_notice
-from akgentic.tool.mailbox.capability import (
-    _CLOSING_WITH_IDS,
-    _CLOSING_WITHOUT_IDS,
+from akgentic.tool.mailbox import (
     ABSORBED_PREFIX,
+    ARRIVAL_CLOSING,
+    is_cancel,
+    render_arrival_notice,
+)
+from akgentic.tool.mailbox.capability import (
+    _CLOSING_WITHOUT_IDS,
     MESSAGE_ID_ARG,
     READ_MAILBOX_TOOL,
 )
@@ -373,10 +376,10 @@ class TestTheInjectedTextIsWhatTheCapabilityWasBuiltWith:
     the value that reaches the run.
     """
 
-    _CLOSING = "SENTINEL CLOSING — configured on the card."
+    _CLOSING = "SENTINEL CLOSING — passed to the capability."
 
     async def test_the_capabilitys_closing_line_closes_the_notice(self) -> None:
-        """AC 3 — MUTATION: pass ``_CLOSING_WITH_IDS`` instead of
+        """AC 3 — MUTATION: pass ``ARRIVAL_CLOSING`` instead of
         ``self._arrival_closing`` at the ``render_arrival_notice`` call in
         ``before_model_request`` and this goes red alone.
         """
@@ -384,7 +387,8 @@ class TestTheInjectedTextIsWhatTheCapabilityWasBuiltWith:
         handled = _pending_message("the turn prompt", "@Human")
         capability = MailboxCapability(
             observer=_MailboxDouble([arrived], current=handled),
-            card=MailboxTool(arrival_closing=self._CLOSING),
+            card=MailboxTool(),
+            arrival_closing=self._CLOSING,
         )
         ctx = _CtxDouble()
 
@@ -402,7 +406,9 @@ class TestTheInjectedTextIsWhatTheCapabilityWasBuiltWith:
         """
         arrived = _pending_message()
         capability = MailboxCapability(
-            observer=_MailboxDouble([arrived]), card=MailboxTool(arrival_closing=self._CLOSING)
+            observer=_MailboxDouble([arrived]),
+            card=MailboxTool(),
+            arrival_closing=self._CLOSING,
         )
         ctx = _CtxDouble()
 
@@ -417,7 +423,7 @@ class TestTheInjectedTextIsWhatTheCapabilityWasBuiltWith:
         capability = MailboxCapability(observer=_MailboxDouble(), card=MailboxTool())
 
         assert capability._absorbed_prefix == ABSORBED_PREFIX
-        assert capability._arrival_closing == _CLOSING_WITH_IDS
+        assert capability._arrival_closing == ARRIVAL_CLOSING
 
 
 class TestCancellationConsultsNeitherString:
@@ -442,7 +448,10 @@ class TestCancellationConsultsNeitherString:
         cancel = CancelMessage()
         mailbox = _MailboxDouble([_pending_message("hello"), cancel])
         capability = MailboxCapability(
-            observer=mailbox, card=MailboxTool(absorbed_prefix=prefix, arrival_closing=closing)
+            observer=mailbox,
+            card=MailboxTool(),
+            absorbed_prefix=prefix,
+            arrival_closing=closing,
         )
 
         with pytest.raises(RunInterruptedError):

@@ -33,6 +33,7 @@ import pytest
 from akgentic.core import ActorAddress
 from akgentic.core.messages import CancelMessage, Message, UserMessage
 from akgentic.tool.mailbox import (
+    ABSORBED_PREFIX,
     PREVIEW_LIMIT,
     MailboxMessage,
     MailboxRenderError,
@@ -40,7 +41,6 @@ from akgentic.tool.mailbox import (
     render_arrival_notice,
 )
 from akgentic.tool.mailbox.capability import (
-    ABSORBED_PREFIX,
     MESSAGE_ID_ARG,
     READ_MAILBOX_TOOL,
     UNOFFERABLE_LINE,
@@ -642,20 +642,21 @@ class TestAnAbsorbedMessageIsFramedAsAddedWork:
     async def test_the_prefix_is_the_one_the_capability_was_built_with(self) -> None:
         """Epic 27 — a custom prefix in, the same prefix out.
 
-        The framing text is the capability's, taken from whoever constructed it,
-        which at the wiring site is the ``MailboxTool`` card. What is pinned is
-        the invariant, not the sentences: the constructed value frames the
+        The framing text is the capability's, taken from whoever constructed it
+        — a keyword-only constructor argument, not a card field. What is pinned
+        is the invariant, not the sentences: the constructed value frames the
         delivery, and the message's own rendering is still carried whole.
 
         MUTATION — restore ``ABSORBED_PREFIX`` at the ``ctx.enqueue`` call in
         ``after_tool_execute`` and this goes red on its own; the sibling spec
         above stays green, because it constructs no prefix of its own.
         """
-        sentinel = "SENTINEL PREFIX — configured on the card."
+        sentinel = "SENTINEL PREFIX — passed to the capability."
         absorbed = _agent_message("what is the colour of the sky?", "@Human")
         capability = MailboxCapability(
             observer=_MailboxDouble([absorbed]),
-            card=MailboxTool(absorbed_prefix=sentinel),
+            card=MailboxTool(),
+            absorbed_prefix=sentinel,
         )
         ctx = _CtxDouble()
 

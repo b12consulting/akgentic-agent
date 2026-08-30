@@ -30,8 +30,13 @@ import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.llm import ModelConfig, PromptTemplate
 from akgentic.tool.core import CommandRegistry, ContextState, ToolCard, ToolFactory
-from akgentic.tool.mailbox import MailboxCapability, MailboxTool, ReadMailbox
-from akgentic.tool.mailbox.capability import _CLOSING_WITH_IDS, ABSORBED_PREFIX
+from akgentic.tool.mailbox import (
+    ABSORBED_PREFIX,
+    ARRIVAL_CLOSING,
+    MailboxCapability,
+    MailboxTool,
+    ReadMailbox,
+)
 from akgentic.tool.team import TeamTool
 
 import akgentic.agent.agent as agent_module
@@ -384,69 +389,60 @@ class TestTheNoticeIsGatedOnTheReadTool:
 
 
 # =============================================================================
-# Epic 27 — the two injected prompt strings travel from the card too
+# Epic 27 — the two injected prompt strings are the capability's, not the card's
 # =============================================================================
 
 
-class _CardCarryingPromptText(MailboxTool):
-    """A ``MailboxTool`` that already carries the two prompt fields.
+class TestTheWordingIsTheCapabilitys:
+    """Where the mailbox's two injected strings come from, and where they do not.
 
-    The real card grows them in ``akgentic-tool``, and the two halves are
-    designed to land in either order — so this package's specs must be able to
-    exercise *both* worlds against whichever card version is resolved: a card
-    that has the fields, and a card that does not. Subclassing is what makes the
-    first case reachable before the field lands, without this package assuming
-    anything about when it does.
+    They lived on ``MailboxTool`` for exactly one release. The catalog persists a
+    card with a plain ``model_dump(mode="json")`` and no ``exclude_defaults``, so
+    a literal field default was written into every stored entry — each team
+    frozen with its own private copy of prose that is expected to keep improving.
+    They are keyword-only constructor parameters on ``MailboxCapability`` now,
+    defaulting to the constants ``akgentic-tool`` exports.
+
+    ``BaseAgent`` passes neither. It hands over the card whole and inspects none
+    of it, so every deployment runs the shipped wording — which is the point of
+    the move, not a gap in it.
     """
 
-    absorbed_prefix: str = ""
-    arrival_closing: str = ""
+    def test_the_wired_capability_holds_the_shipped_wording(self) -> None:
+        """The cross-package guard: both packages must agree on the text.
 
+        ``BaseAgent`` supplies no wording, so the capability it builds must hold
+        exactly what ``akgentic-tool`` ships. If this goes red, the two packages
+        have drifted on the prompt itself — fix the drift, not this spec.
 
-class TestThePromptTextReachesTheCapabilityFromTheCard:
-    """The wording is a deployment decision, read off the card defensively.
-
-    ``getattr(card, name, None) or CONSTANT`` — never a direct attribute read:
-    ``akgentic-agent`` resolves ``akgentic-tool`` from PyPI in CI, so a card
-    predating the fields must keep working and produce exactly today's text.
-    """
-
-    _PREFIX = "SENTINEL PREFIX — configured on the card."
-    _CLOSING = "SENTINEL CLOSING — configured on the card."
-
-    def test_a_card_carrying_neither_field_yields_the_module_constants(self) -> None:
-        """The stock card: whatever it carries, the delivered text is this module's.
-
-        **This spec deliberately means two different things depending on which
-        ``akgentic-tool`` is resolved, and both are worth having.** Against a
-        card *predating* the fields — which is what CI resolves from PyPI until
-        the tool-side half is published — the ``getattr`` misses and this pins
-        the **fallback**. Against a card that *carries* them, the ``getattr``
-        hits and the very same two assertions become a guard on the **seam**:
-        the card's default text must still be byte-for-byte the text this module
-        ships. So the two environments cover the two worlds between them, which
-        is why this spec is written against the stock card rather than a double.
-
-        If it goes red in a workspace whose card has the fields, nothing here is
-        broken: the two copies of the wording have drifted apart and one of them
-        is wrong. Fix the drift, not this spec.
-
-        MUTATION — this one stays green when the wiring lines are deleted
-        outright, by design: it pins the *fallback*. The two below are what go
-        red.
+        It survives the fields' deletion unchanged, which is the point: it was
+        always a claim about the delivered text, never about the card.
         """
         _start_agent(_agent_config())
 
         capability = _wired_capability()
         assert capability._absorbed_prefix == ABSORBED_PREFIX
-        assert capability._arrival_closing == _CLOSING_WITH_IDS
+        assert capability._arrival_closing == ARRIVAL_CLOSING
 
-    def test_a_card_carrying_the_fields_decides_the_text(self) -> None:
-        """MUTATION — drop either wiring line and its half of this goes red."""
-        card = _CardCarryingPromptText(absorbed_prefix=self._PREFIX, arrival_closing=self._CLOSING)
+    def test_a_card_cannot_carry_the_wording_any_more(self) -> None:
+        """A card kwarg is silently dropped, and that silence is the hazard.
+
+        ``ToolCard`` sets no ``extra`` policy, so Pydantic's ``extra="ignore"``
+        applies: ``MailboxTool(absorbed_prefix=...)`` raises nothing and returns
+        a card without the field. An entry persisted while the fields existed
+        loads the same way, which is why the change owed no migration.
+
+        The failure therefore surfaces one assertion *later* than its cause and
+        reads like a defect in the capability. This spec pins the mechanism so
+        the next person meets it here rather than in a debugger.
+        """
+        card = MailboxTool(absorbed_prefix="ignored", arrival_closing="ignored")  # type: ignore[call-arg]
+
+        assert not hasattr(card, "absorbed_prefix")
+        assert card == MailboxTool()
 
         _start_agent(_agent_config(tools=[card]))
 
         capability = _wired_capability()
-        assert capability._absorbed_prefix == self._PREFIX
-        assert capability._arrival_closing == self._CLOSING
+        assert capability._absorbed_prefix == ABSORBED_PREFIX
+        assert capability._arrival_closing == ARRIVAL_CLOSING
