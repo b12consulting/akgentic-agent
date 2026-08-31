@@ -23,7 +23,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "pydantic-ai>=2,<3",
     "akgentic-core>=1.5.10",
-    "akgentic-llm>=2.1.0",
+    "akgentic-llm>=2.2.0",
     "akgentic-tool>=1.7.0",
 ]
 
