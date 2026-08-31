@@ -19,6 +19,7 @@ to each other via structured LLM output.
 - [Team Composition](#team-composition)
 - [Configuration](#configuration)
 - [Tool Channels](#tool-channels)
+- [Runtime Model Switching](#runtime-model-switching)
 - [Run Cancellation](#run-cancellation)
 - [Examples](#examples)
 - [Documentation](#documentation)
@@ -502,12 +503,55 @@ Extends `BaseConfig` from `akgentic-core`:
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `prompt` | `PromptTemplate` | `PromptTemplate()` | Agent backstory rendered into `AgentState.backstory` and injected as LLM system prompt |
-| `model_cfg` | `ModelConfig` | `ModelConfig()` | LLM provider, model name, API settings |
+| `model_cfg` | `ModelConfig` | `ModelConfig()` | LLM provider, model name, API settings. Accepts `ModelConfig \| list[ModelConfig]` **at the input boundary only** — see [The model roster](#the-model-roster) |
+| `model_roster` | `list[ModelConfig]` | `[]` | The full declared roster, in declaration order, including the active entry. Empty means a single-model agent, for which switching is unavailable |
 | `runtime_cfg` | `RuntimeConfig` | `RuntimeConfig()` | Retries, tool-call end strategy, parallel tools, HTTP client settings |
 | `run_usage_limits` | `RunUsageLimits` | `RunUsageLimits()` | Budget for **one** `run()` — token and request caps that reset every run |
 | `agent_usage_limits` | `AgentUsageLimits` | `AgentUsageLimits()` | Budget for the agent's **whole lifetime** — runs and tokens, accumulated across every run |
 | `compaction_cfg` | `CompactionConfig` | `CompactionConfig()` | Context-compaction strategy and auto-trigger (opt-in; off unless `model_cfg.context_length` is set) |
 | `tools` | `list[ToolCard]` | `[]` | Tool cards; `TeamTool` and `MailboxTool` are always prepended automatically |
+
+#### The model roster
+
+`model_cfg` and `model_roster` are one declaration with two spellings. Passing a **list** to
+`model_cfg` is a convenience for declaring a roster; passing a single `ModelConfig` — which is
+what every existing config does — declares no roster at all.
+
+```python
+config = AgentConfig(
+    name="@Manager",
+    role="Manager",
+    model_cfg=[                                              # a list, at the input boundary
+        ModelConfig(provider="openai", model="gpt-4.1"),     # element 0 = the active model
+        ModelConfig(provider="anthropic", model="claude-sonnet-4-5"),
+    ],
+)
+assert config.model_cfg.model == "gpt-4.1"      # stored shape is always a single ModelConfig
+assert len(config.model_roster) == 2            # the whole list became the roster
+```
+
+Four rules govern the boundary, and a caller can trip over each of them:
+
+- **Given a list, element 0 becomes the active model and the whole list becomes the roster**
+  (`config.py:128-142`). The active entry is a member of its own roster by construction.
+- **An empty list is rejected.** There is no "roster of nothing" — declare a single
+  `ModelConfig` instead.
+- **A list `model_cfg=` passed together with an explicit `model_roster=` is rejected**, because
+  which one wins would depend on argument order.
+- **Two entries producing the same `provider:model` key are rejected** (`config.py:144-161`). The
+  key is the identity a switch is named by, so a duplicate would not raise later — it would
+  produce a switch that silently matches one of two entries.
+
+**The stored shape is always a single `ModelConfig`.** No read path downstream branches on the
+union: the list exists at validation time and nowhere else, which is what makes accepting it safe.
+
+**An empty roster is the default, and it means switching is unavailable.** Every existing
+single-model agent, catalog entry and example is unchanged by this feature: `model_roster == []`,
+no `list_models` or `switch_model` commands, no `LLM_CONTEXT` block naming a model, and no cost. If
+you are upgrading and you declare one model, nothing changed for you.
+
+Hand-setting `model_roster=` directly is legal, and has consequences worth knowing before you do
+it — see [When the active model is not in the roster](#when-the-active-model-is-not-in-the-roster).
 
 #### Usage limits: two tiers
 
@@ -642,7 +686,18 @@ Runtime state extending `BaseState`:
 | Field | Type | Description |
 |---|---|---|
 | `backstory` | `str` | `config.prompt` rendered at `on_start()`, injected as LLM system context on every call |
-| `tool_state` | `ToolState` | The tool layer's persistent per-agent slot — context-update baselines and the block counter. A **cache, never a record**: the message history is the record, so a lost or stale slot can only cost a full-snapshot re-send, never a lost update. See [Context updates](#context-updates) |
+| `tool_state` | `ToolState` | The tool layer's persistent per-agent slot — context-update baselines, the block counter, and `active_model`. See [Context updates](#context-updates) and [Runtime Model Switching](#runtime-model-switching) |
+
+`tool_state` carries **three** things, and they are harmless to lose for two different reasons:
+
+- **The baselines and the block counter** are a **cache, never a record**. The message history is
+  the record of what the model was told, so a lost or stale slot costs at most one full-snapshot
+  re-send and never a lost update.
+- **`active_model`** (`ToolState.active_model`, a roster key or `None`) is **not** a cache — it is
+  the only place the remembered model choice lives. Losing it is still harmless, but for the other
+  reason: the agent degrades to the *declared* active entry rather than to a re-send. `None` means
+  the agent expresses no preference, which is also what a payload persisted before the field
+  existed restores to — so no migration step is needed.
 
 ## Tool Channels
 
@@ -650,10 +705,15 @@ Runtime state extending `BaseState`:
 
 | Channel | Consumer | Examples |
 |---|---|---|
-| `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `read_mailbox()`, `web_search()`, `workspace_read()` |
+| `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `read_mailbox()`, `web_search()`, `workspace_read()`, `list_models()`, `switch_model()` |
 | `SYSTEM_PROMPT` | LLM system prompt — rendered into the frozen system block | backstory, current date |
-| `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary |
-| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`, `stop` |
+| `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary, the model in force |
+| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`, `stop`, `list_models`, `switch_model` |
+
+`list_models` and `switch_model` serve **both** `TOOL_CALL` and `COMMAND`
+(`akgentic-tool/.../model/tool.py:131-162`), and that is the point: the human and the model reach
+the same capability rather than two parallel implementations of it. They are present only when
+`ModelTool` is in `config.tools` — see [Runtime Model Switching](#runtime-model-switching).
 
 `TeamTool` **and** `MailboxTool` are always prepended to `config.tools` if not already
 present, so every `BaseAgent` can hire and fire members (`TeamTool`) and carries the two
@@ -894,7 +954,15 @@ The registry contents follow from the tool cards attached to the agent:
 | `get_planning_task(task_id)` | `PlanningTool` | Single planning task by ID |
 | `search_planning(...)` | `PlanningTool` | Search the shared task board |
 | `stop()` | `MailboxTool` | Cancel the current run; the mid-run effect is the cancel hook's (see [Run Cancellation](#run-cancellation)) |
+| `list_models()` | `ModelTool` | The roster this agent may switch within, one entry per line, the entry in force marked |
+| `switch_model(model)` | `ModelTool` | Make one roster entry the model in force, from the next turn (see [Runtime Model Switching](#runtime-model-switching)) |
 | `compact()` / `clear()` | `BaseAgent` built-ins | Compact or clear the conversation context |
+
+`ModelTool` is **not** auto-injected, so its two rows are present only for an agent whose
+`config.tools` declares the card. Note also that the card's parameter is named `model` while the
+observer's is `key` — two contracts, two names, deliberately: the command descriptor a frontend
+reads advertises `model` (`akgentic-tool/.../model/tool.py:200-213`), so a human types
+`/switch_model openai:gpt-4.1`.
 
 Do not hand-transcribe this table into your own code: read the set from
 `registry.descriptors()`, or from the `CommandsAnnouncedEvent` the agent emits at start-up. Those
@@ -928,6 +996,195 @@ Expansion happens in `act()` between the render and `run_sync()`, and only when 
 actually changed something: if the command returns the rendered string unchanged, that plain string
 is sent as-is. Errors and document hints are forwarded to the LLM rather than silently dropped.
 Agents whose registry has no `_expand_media_refs` are unaffected — the block is a no-op.
+
+## Runtime Model Switching
+
+An agent can declare a **roster** of models and move between them while it is running — chosen by
+a human typing `/switch_model`, or by the model itself calling the `switch_model` tool. The
+selection persists, so a restarted agent answers on the model it was switched to.
+
+The feature is built across three packages and no one of them can show you the whole of it, so
+this section starts with the path end to end.
+
+### The path, end to end
+
+```
+a human types /switch_model openai:gpt-4.1     ─┐
+   OR the model calls the switch_model tool    ─┴─►  ModelTool's switch_model closure
+                                                       akgentic-tool  model/tool.py:216-248
+  ─►  BaseAgent.switch_model(key)                      THIS PACKAGE   agent.py:537-579
+  ─►  ReactAgent.switch_model(key)                     akgentic-llm   agent.py:356-430
+        · resolves the key against the roster, or refuses  (agent.py:329-354)
+        · builds the model on the agent's EXISTING http client
+        · re-checks the compaction bounds
+        · model_copy(update={"model_cfg": entry}) — no rebuild, no mutation
+  ─►  the NEXT run() carries model=self._model         akgentic-llm   agent.py:635
+        a per-run argument; the pydantic-ai Agent is never rebuilt, so tools,
+        toolsets, system prompts, history, usage counters and the HTTP
+        connection pool all survive the switch untouched
+  ─►  ModelTool writes ToolState.active_model = key    akgentic-tool  model/tool.py:244
+        LAST, and only after the observer returned normally — which is why a
+        refusal must raise rather than return a message
+  ─►  the key rides AgentState's existing checkpoints into the event store
+        no new event, no forced publish
+  ─►  on restore, init_state() brings the slot back, and
+      BaseAgent._restore_active_model() re-applies it at the top of act(),
+      before the turn's context block                  THIS PACKAGE   agent.py:581-628,
+                                                                      called at agent.py:736
+```
+
+Who owns which hop:
+
+| Package | Owns |
+|---|---|
+| `akgentic-tool` | `ModelTool` (the card and its three capabilities), `ModelRow`, `ActiveModelState`, `ModelSwitchToolObserver`, and the `ToolState.active_model` slot |
+| `akgentic-llm` | the roster on `ReactAgentConfig`, `ReactAgent.switch_model()`, `ModelSwitchError`, and the `provider:model` key grammar |
+| `akgentic-agent` | the roster on `AgentConfig`, the observer implementation, the card wiring, and the restore |
+
+The observer implementation lives **here** and only here because this is the one package that may
+import both `akgentic-llm` and `akgentic-tool` — so the `ModelConfig` → `ModelRow` mapping has a
+legal home and neither of those packages gains an import edge to the other
+(`agent.py:500-535`).
+
+### Enabling it: the card is opt-in
+
+Two things are needed, and both are yours to declare: a roster, and the `ModelTool` card.
+
+```python
+from akgentic.agent import AgentConfig
+from akgentic.llm import ModelConfig, PromptTemplate
+from akgentic.tool.model import ModelTool
+
+config = AgentConfig(
+    name="@Manager",
+    role="Manager",
+    prompt=PromptTemplate(template="You are a project manager."),
+    model_cfg=[
+        ModelConfig(provider="openai", model="gpt-4.1", context_length=1_000_000),
+        ModelConfig(provider="anthropic", model="claude-sonnet-4-5", context_length=200_000),
+    ],
+    tools=[ModelTool()],
+)
+```
+
+**`ModelTool` is not auto-injected.** `BaseAgent` auto-adds `TeamTool` and `MailboxTool` and
+nothing else (`agent.py:254-260`); an agent gets `ModelTool` only because its card list says so.
+That is a decision, not an omission: granting every agent the standing power to change its own
+model is a cost and governance question, and it belongs to whoever writes the card list rather
+than arriving unannounced with an upgrade (ADR-018 §5).
+
+**This is a consumer contract, and this README is where it is stated.** Nothing in `akgentic-tool`
+can enforce it — `ModelTool` is an ordinary `ToolCard` and any consumer could prepend it to every
+agent it builds. This package is the consumer that chooses not to.
+
+The two commands reach a UI with no UI-specific code: they are ordinary `CommandRegistry` entries,
+announced in the single `CommandsAnnouncedEvent` the agent emits at start-up
+(`agent.py:290-295`) alongside every other command. No frontend work was needed to surface them.
+
+### What the model is told: the `LLM_CONTEXT` block
+
+`ModelTool` contributes a fifth `LLM_CONTEXT` provider
+(`akgentic-tool/.../model/tool.py:164-169`), so the model in force appears in the per-turn
+**Context update** block like any other volatile state — full on first delivery, a delta
+afterwards (`akgentic-tool/.../model/state.py:64-72`):
+
+```
+**Active model:** openai:gpt-4.1
+**Active model changed:** openai:gpt-4.1 → anthropic:claude-sonnet-4-5
+```
+
+**The block renders the roster's own `active` flag, never `ToolState.active_model`**
+(`akgentic-tool/.../model/tool.py:273-279`). The slot is a persisted *preference*; rendering it
+would show a stale key as though it were the model answering.
+
+### The restore rule, and how it degrades
+
+After `init_state()` and before the first turn, `BaseAgent` re-applies
+`state.tool_state.active_model` (`agent.py:581-628`), as the **first** statement of `act()`
+(`agent.py:736`) — before `_deliver_context_update()`. That order is load-bearing: reversed, the
+first block after a restart would advertise the declared model while the restored one answered.
+
+- **`active_model is None` is a no-op.** The declared active entry wins.
+- **A key that no longer resolves is dropped with one `logging.WARNING`, and the declared active
+  entry wins.** The restore is never fatal. An agent that refused to start because of a remembered
+  choice would strand the whole team (ADR-018 §4).
+
+#### A permanently stale key warns once per turn
+
+The `_restored_model_key` latch is set on the **success path only** (`agent.py:628`, and
+`agent.py:574` for a switch the agent made itself). A key that never resolves is therefore never
+latched, and is retried at the top of every `act()` — one `WARNING` per turn, for the life of the
+agent. Four things to know about it:
+
+- **It is the design, not a defect.** The roster is mutable within a session, so latching a
+  refusal would permanently and silently forfeit a key that may become valid later.
+- **The cheap case** is an unknown key. `ReactAgent._resolve_roster_entry`
+  (`akgentic-llm/.../agent.py:329-354`) refuses it before anything is built — a dictionary miss
+  and a log line.
+- **The expensive case is the one hit in production.** A key that *resolves* but whose provider
+  constructor fails — a missing `OPENAI_API_KEY`, a missing `AZURE_OPENAI_ENDPOINT` — reaches a
+  third-party constructor once per turn, for the life of the agent
+  (`akgentic-llm/.../agent.py:405-408`).
+- **The cure is clearing the persisted selection**, i.e. getting `ToolState.active_model` back to
+  `None` or to a key that resolves. The in-band way is to switch to a valid key — a successful
+  switch overwrites the slot. Otherwise supply the missing credential, or restore the agent from a
+  state whose slot is `None`. Fixing the *roster* alone does not stop the warning if the persisted
+  key is still absent from it.
+
+### `ModelSwitchError` is the one class this layer catches
+
+`BaseAgent.switch_model` catches `ModelSwitchError` and nothing else — never `except Exception`
+(`agent.py:568-571`). One `except` is sufficient because of what that class now carries:
+`akgentic-llm` translates a provider constructor's own failure into it, since pydantic-ai raises
+`UserError` — a `RuntimeError`, not a `ValueError` — for a missing API key
+(`akgentic-llm/.../agent.py:405-408`). That is the production case, and it would escape any
+`except ValueError`.
+
+A refusal **raises**; it is never returned as a message. `ModelTool` records
+`ToolState.active_model` immediately after the observer returns normally
+(`akgentic-tool/.../model/tool.py:244`), so an error string would be read as a success and would
+persist a key the llm layer had just refused. The refusal reaches the model as a `RetriableError`
+it can correct, and reaches a human as a dispatched string.
+
+### Three boundaries decided upstream
+
+These were settled in `akgentic-llm` Epic 22 and in ADR-018; they are stated here rather than
+re-argued, because a reader who does not know them will re-litigate all three.
+
+- **A mid-run switch lands on the NEXT run.** pydantic-ai binds the model once per `run()`
+  (`akgentic-llm/.../agent.py:376-380`), which is why the confirmation string
+  `BaseAgent.switch_model` returns says so (`agent.py:575-579`) — the model reading it is the one
+  that would otherwise be surprised. The one exception the llm layer names: the auto-compaction
+  gate reads `context_length` live and *does* move mid-run.
+- **A switch does no history sanitization.** Provider-specific parts already in the history —
+  thinking parts, reasoning items, provider-native tool payloads — are handed to the next provider
+  as pydantic-ai maps them. Behaviour across a **heterogeneous** switch is therefore best-effort;
+  the mitigation available today is `/compact` before switching (ADR-018 §Traps 1). This is not a
+  provider-neutrality guarantee, and it is worth saying plainly rather than implying one.
+- **A roster is not a fallback chain.** `fallback_models` is automatic, failure-driven and
+  invisible to the model; a roster entry is chosen deliberately, by a human or by the model. The
+  two compose — each roster entry may carry its own chain — and neither replaces the other
+  (ADR-018 §1, §Traps 2). A roster entry that cannot be built fails **at switch time**, not at
+  construction: the deliberate trade for not eagerly building every entry at start-up.
+
+### When the active model is not in the roster
+
+Hand-setting `model_roster=` is legal. `AgentConfig` carries the duplicate-key guard but
+deliberately **not** the membership rule (`config.py:144-161`) — normalization satisfies membership
+by construction on the list path, and the `ReactAgentConfig` that `on_start` builds enforces it one
+layer later. So an `AgentConfig` can carry an active model that its own roster does not contain.
+What follows is surprising and deliberate:
+
+- **`active` is computed by key equality**, so an active model absent from the roster yields rows
+  that are **all `False`** — nothing is synthesized and nothing raises (`agent.py:500-535`).
+- **`ModelTool` then composes no `LLM_CONTEXT` block that turn**
+  (`akgentic-tool/.../model/tool.py:276-279`). Designed degradation, not a bug: it would rather say
+  nothing than name a model it cannot confirm.
+- **An empty roster returns `[]`**, with no row synthesized for the active model. That emptiness is
+  load-bearing — `ModelTool`'s own "no roster" line depends on it
+  (`akgentic-tool/.../model/tool.py:48,85`): *"This agent has no model roster, so there is nothing
+  to switch within."* A synthesized single row would replace that honest answer with a listing of
+  one model the agent cannot switch away from.
 
 ## Run Cancellation
 
@@ -1246,16 +1503,13 @@ package's release lands on the raised floor.
 
 ```
 src/akgentic/agent/
-    __init__.py          # Public API: BaseAgent, AgentConfig, HumanProxy, AgentMessage,
-                         #   LlmRenderable, RunInterruptedError,
-                         #   MailboxRenderError
+    __init__.py          # Public API (__all__): __version__, AgentConfig, HumanProxy,
+                         #   BaseAgent, RunInterruptedError, AgentMessage, LlmRenderable
     agent.py             # BaseAgent — actor + LLM + tool composition, routing logic
-    capabilities/        # Capabilities the agent wires itself: MailboxCapability, is_cancel,
-                         #   render_arrival_notice, and the two mailbox error types
     config.py            # AgentConfig, AgentState
     custom_agent.py      # Worked example: a second agent class with its own schema
     human_proxy.py       # HumanProxy — human-in-the-loop bridge
-    messages.py          # AgentMessage with typed protocol, and the two rendering
+    messages.py          # AgentMessage with its typed protocol and its two renderings;
                          #   LlmRenderable — the Protocol act() accepts
     output_models.py     # StructuredOutput, Request, REPLY_PROTOCOLS
     usage_limits.py      # guard_usage_limits decorator + escalation (no agent.py import)

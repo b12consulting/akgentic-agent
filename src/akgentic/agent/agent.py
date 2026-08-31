@@ -17,7 +17,10 @@ Architecture:
   receiveMsg_AgentMessage asks for StructuredOutput, so the team path stays
   schema-driven
 - get_output_type() applied inside ReactAgent.run() — no leakage into BaseAgent
-- Implements TeamManagementToolObserver protocol (structural typing)
+- Implements TeamManagementToolObserver and ModelSwitchToolObserver protocols
+  (structural typing). The latter is what makes ModelTool's roster listing and
+  runtime switch reach a real roster, and what re-applies a persisted selection
+  at the top of act() so a resumed agent answers on the model it was switched to
 - Two message handlers of its own: receiveMsg_AgentMessage carries all team
   traffic (every message is an AgentMessage), and receiveMsg_CancelMessage
   acknowledges a cancel that lands while the agent is idle. Akgent still
@@ -63,15 +66,18 @@ from akgentic.core.messages import CancelMessage, EventMessage, Message
 from akgentic.llm import (
     AgentUsageSummary,
     LlmUsageEvent,
+    ModelSwitchError,
     ReactAgent,
     ReactAgentConfig,
     UserPrompt,
     aggregate_usage,
+    model_roster_key,
 )
 from akgentic.tool.core import CommandRegistry, ContextUpdater, ToolFactory
-from akgentic.tool.errors import CommandNotRecognized
+from akgentic.tool.errors import CommandNotRecognized, RetriableError
 from akgentic.tool.core.event import CommandsAnnouncedEvent
 from akgentic.tool.mailbox import MailboxCapability, MailboxTool, RunInterruptedError
+from akgentic.tool.model import ModelRow
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace.readers import MediaContent
 
@@ -192,6 +198,23 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     Internal method (used by _route_output()):
     - hire_member(role) → ActorAddress. A failed hire raises ModelRetry; see
       hire_member() for where that retry is, and is not, honoured.
+
+    Model switching (ModelSwitchToolObserver):
+    - list_model_rows() and switch_model() are the two methods ModelTool calls.
+      The ModelConfig → ModelRow mapping lives here and only here: this is the
+      one package that may import both akgentic-llm and akgentic-tool, so
+      neither of them gains an import edge to the other.
+    - _restore_active_model() re-applies the persisted selection at the top of
+      act(), before the turn's context-update block. ModelTool is NOT
+      auto-injected — an agent gets the card only because its card list says so.
+    """
+
+    _restored_model_key: str | None = None
+    """Which persisted preference has already been re-applied — never what model is in force.
+
+    A class attribute with an immutable default, so ``on_start`` gains no line
+    and every construction path (fresh, resumed, subclassed) starts from ``None``.
+    See :meth:`_restore_active_model` for the distinction this stores.
     """
 
     def on_start(self) -> None:
@@ -242,6 +265,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         # with a per-call output_type override.
         react_agent_config = ReactAgentConfig(
             model_cfg=self.config.model_cfg,
+            model_roster=self.config.model_roster,
             runtime_cfg=self.config.runtime_cfg,
             run_usage_limits=self.config.run_usage_limits,
             agent_usage_limits=self.config.agent_usage_limits,
@@ -426,8 +450,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
             # Carry the scenario path in a config copy's model field (the mock
             # reads model_cfg.model first); self.config is left untouched.
+            # The roster goes with it: model_copy skips validation, so keeping a
+            # roster the rewritten active model is no longer part of would leave the
+            # copy internally inconsistent, raising only on some later
+            # re-validation. A mock serves exactly one scenario file anyway, so a
+            # roster it could switch away from is meaningless.
             mock_cfg = config.model_copy(
-                update={"model_cfg": config.model_cfg.model_copy(update={"model": scenario})}
+                update={
+                    "model_cfg": config.model_cfg.model_copy(update={"model": scenario}),
+                    "model_roster": [],
+                }
             )
             return cast(
                 ReactAgent,
@@ -460,6 +492,140 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             context: List of EventMessage objects from the restorer.
         """
         self._react_agent.restore_context(context)
+
+    # ============================================================================
+    # MODEL SWITCHING (ModelSwitchToolObserver)
+    # ============================================================================
+
+    def list_model_rows(self) -> list[ModelRow]:
+        """Project the declared roster onto ``ModelRow``, one row per entry.
+
+        The mapping between ``akgentic-llm``'s ``ModelConfig`` and
+        ``akgentic-tool``'s ``ModelRow`` lives here and nowhere else: this is the
+        one package allowed to see both types, which is why the observer's
+        implementation belongs on this side of the boundary at all.
+
+        Roster and active model are both read **live**, at call time — a switch
+        moves them, and nothing here is cached. ``active`` is decided by **key
+        equality**, never by identity: a hand-set roster may hold an entry that is
+        equal to the active model without being the same object, and that entry
+        must still light up.
+
+        An active model that no roster entry matches is a legal configuration —
+        the membership rule is deliberately absent from ``AgentConfig`` — so it is
+        tolerated rather than repaired: every row comes back ``active=False``,
+        nothing is synthesized and nothing raises. ``ModelTool`` then composes no
+        ``LLM_CONTEXT`` block that turn, which is the designed degradation.
+
+        Returns:
+            One row per roster entry, in declaration order; ``[]`` for an agent
+            that declares no roster, for which switching is unavailable. No row is
+            ever synthesized for an active model the roster does not carry.
+        """
+        active_key = model_roster_key(self._react_agent.active_model())
+        return [
+            ModelRow(
+                key=model_roster_key(entry),
+                provider=entry.provider,
+                model=entry.model,
+                active=model_roster_key(entry) == active_key,
+                context_length=entry.context_length,
+            )
+            for entry in self._react_agent.model_roster()
+        ]
+
+    def switch_model(self, key: str) -> str:
+        """Make the roster entry named by *key* the model in force, from the next turn.
+
+        A refusal **raises**; it is never returned as a message.
+        ``ModelTool._switch_model_factory`` records ``ToolState.active_model``
+        immediately after this call returns normally, so an error string would be
+        read as a success and persist a key the llm layer has just refused.
+
+        Only ``ModelSwitchError`` is caught. ``akgentic-llm`` already translates a
+        provider constructor's own failure — pydantic-ai raises ``UserError``, a
+        ``RuntimeError``, for a missing API key — into that one class precisely so
+        this caller needs one ``except`` and never ``except Exception``. Anything
+        else is a defect and propagates untouched.
+
+        The latch is set here as well as in :meth:`_restore_active_model`: a
+        preference this agent just wrote into the slot itself must not be
+        re-applied at the top of the next turn.
+
+        Args:
+            key: Roster key of the target entry, ``f"{provider}:{model}"``.
+
+        Returns:
+            A confirmation naming the entry now active and the turn from which it
+            answers.
+
+        Raises:
+            RetriableError: When the switch was refused. Carries the refusal's own
+                text — the only diagnosis a tool-driven caller gets — and chains
+                the refusal as ``__cause__``. ``ToolFactory`` converts it into the
+                injected retry exception, so the model sees a correctable retry.
+        """
+        try:
+            entry = self._react_agent.switch_model(key)
+        except ModelSwitchError as exc:
+            raise RetriableError(str(exc)) from exc
+
+        activated = model_roster_key(entry)
+        self._restored_model_key = activated
+        return (
+            f"Switched to {activated}. The model is bound once per run, so this "
+            f"takes effect from the next turn — the current one finishes on the "
+            f"model that started it."
+        )
+
+    def _restore_active_model(self) -> None:
+        """Re-apply the persisted model selection, once, before the turn runs.
+
+        Called as the first statement of :meth:`act` — before
+        ``_deliver_context_update()``, so the turn's ``LLM_CONTEXT`` block cannot
+        advertise a model that is not the one answering, and before ``run_sync``,
+        so the turn actually runs on the restored entry. ``act()`` is the single
+        run entry point of the class, which makes this the one placement that is
+        correct on every construction path regardless of when ``init_state()``
+        lands relative to ``on_start``.
+
+        The slot is read through the full ``self.state.tool_state`` chain at the
+        moment of use: ``init_state()`` replaces the state object wholesale, so a
+        reference captured at ``on_start`` would read a carrier nobody persists
+        any more.
+
+        ``_restored_model_key`` records **which persisted preference has been
+        applied**, never what model is in force — every live answer still comes
+        from ``self._react_agent``. It is what keeps a switch from being redone on
+        every turn: a switch is a model rebuild plus a compaction-strategy
+        rebuild, deliberately not short-circuited on the already-active key.
+
+        **Never fatal.** A key the delegate refuses — stale after a roster edit,
+        or an entry that will not build — leaves the declared active entry in
+        force, costs one warning, and the turn proceeds. Raising over a remembered
+        preference would strand the whole team on a restart.
+        """
+        key = self.state.tool_state.active_model
+        if key is None or key == self._restored_model_key:
+            return
+
+        try:
+            self._react_agent.switch_model(key)
+        except ModelSwitchError as exc:
+            available = ", ".join(
+                model_roster_key(entry) for entry in self._react_agent.model_roster()
+            )
+            logger.warning(
+                "[%s] persisted model %r was not restored (%s); continuing on the declared "
+                "model. Available roster keys: %s",
+                self.config.name,
+                key,
+                exc,
+                available or "none — this agent declares no roster",
+            )
+            return
+
+        self._restored_model_key = key
 
     # ============================================================================
     # USAGE TRACKING
@@ -523,6 +689,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         the message itself (see ``AgentMessage.renderer``), not the
         output-schema docstring.
 
+        Two things happen before the model is reached, in this order and for this
+        reason: ``_restore_active_model()`` re-applies a persisted model selection,
+        then ``_deliver_context_update()`` composes the turn's context block. The
+        reverse order would let the first block after a restart advertise the
+        declared model while the restored one answers.
+
         Args:
             message: The message to reason about. Rendered exactly once, at the
                 top of this method; media expansion then runs on the rendered
@@ -561,6 +733,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 turn that never breached, which is why nothing in this package
                 tells the tiers apart any more.
         """
+        self._restore_active_model()
         self._deliver_context_update()
         rendered_message = message.rendering()
         prompt = self._build_prompt_expanding_media_refs(rendered_message)

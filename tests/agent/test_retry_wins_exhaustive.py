@@ -50,7 +50,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from akgentic.agent.agent import BaseAgent, MailboxCapability
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
 
@@ -78,6 +78,11 @@ def _make_minimal_agent() -> BaseAgent:
     ``has(...) == False`` for everything, so `act()` skips media expansion.
     """
     agent: BaseAgent = object.__new__(BaseAgent)
+
+    # The agent's own state, normally assigned in on_start. act() reads
+    # state.tool_state.active_model to re-apply a persisted model selection;
+    # an empty slot makes that a no-op, which is what these specs want.
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
     registry = MagicMock()
     registry.has.return_value = False

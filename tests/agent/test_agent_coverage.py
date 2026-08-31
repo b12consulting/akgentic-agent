@@ -24,7 +24,7 @@ from akgentic.tool.mailbox import MailboxTool
 from pydantic_ai import ModelRetry
 
 from akgentic.agent.agent import BaseAgent, MailboxCapability
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
 
@@ -74,6 +74,11 @@ def _make_minimal_agent(
 ) -> BaseAgent:
     """Construct a BaseAgent without Pykka actor system."""
     agent: BaseAgent = object.__new__(BaseAgent)
+
+    # The agent's own state, normally assigned in on_start. act() reads
+    # state.tool_state.active_model to re-apply a persisted model selection;
+    # an empty slot makes that a no-op, which is what these specs want.
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
     agent._command_registry = _make_registry(callables)  # type: ignore[attr-defined]
     agent._react_agent = MagicMock()  # type: ignore[attr-defined]

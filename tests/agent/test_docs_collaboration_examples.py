@@ -53,7 +53,7 @@ from pydantic_ai.models import ModelRequestContext
 
 import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent, MailboxCapability
-from akgentic.agent.config import AgentConfig
+from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
 
@@ -111,6 +111,11 @@ def _make_agent(
     ``CommandNotRecognized`` fallback are all exercised for real.
     """
     agent: BaseAgent = object.__new__(BaseAgent)
+
+    # The agent's own state, normally assigned in on_start. act() reads
+    # state.tool_state.active_model to re-apply a persisted model selection;
+    # an empty slot makes that a no-op, which is what these specs want.
+    agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
     # Installed, not stubbed: on_start creates this one, so there is no class-level
     # name for _stub to check against.
     agent._react_agent = MagicMock()  # type: ignore[assignment]

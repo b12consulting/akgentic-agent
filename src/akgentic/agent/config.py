@@ -21,6 +21,8 @@ from akgentic.llm.config import (
     RuntimeConfig,
     RunUsageLimits,
     UsageLimits,
+    normalize_model_roster,
+    validate_unique_roster_keys,
 )
 from akgentic.llm.prompts import PromptTemplate
 from akgentic.tool.core import ToolCard, ToolState
@@ -48,7 +50,16 @@ class AgentConfig(BaseConfig):
 
     Attributes:
         prompt: Agent backstory or system prompt, as a PromptTemplate.
-        model_cfg: LLM model configuration (provider, model name, API settings).
+        model_cfg: LLM model configuration (provider, model name, API settings) —
+            always a single ModelConfig once stored. At the input boundary it also
+            accepts a **list** of ModelConfig (or of dicts, on the catalog path), of
+            which element 0 becomes the active model and the whole list becomes
+            ``model_roster``. The list is a convenience for declaring a roster, never
+            a stored shape: no read path downstream branches on it.
+        model_roster: The full declared roster, in declaration order, including the
+            active entry. Empty means a single-model agent, for which switching is
+            unavailable. Entry keys (``provider:model``) must be unique. Carried
+            verbatim into the ReactAgentConfig that BaseAgent builds.
         runtime_cfg: Runtime execution settings (retries, end strategy, HTTP client).
             Sampling settings such as temperature live on model_cfg, not here.
         run_usage_limits: Per-run token/request budget; the tier pydantic-ai enforces.
@@ -86,6 +97,13 @@ class AgentConfig(BaseConfig):
         default_factory=ModelConfig,
         description="LLM model configuration including provider, model name, and API settings",
     )
+    model_roster: list[ModelConfig] = Field(
+        default_factory=list,
+        description=(
+            "Full declared roster in declaration order, including the active entry. "
+            "Empty = single-model agent, switching unavailable."
+        ),
+    )
     runtime_cfg: RuntimeConfig = Field(
         default_factory=RuntimeConfig,
         description="Runtime execution settings: retries, tool-call end strategy, HTTP client",
@@ -106,6 +124,41 @@ class AgentConfig(BaseConfig):
         default_factory=list,
         description="List of tool cards defining the tools this agent can use, with parameters",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_model_roster(cls, data: Any) -> Any:
+        """Fold a ``model_cfg`` list into the active model plus ``model_roster``.
+
+        The whole body lives in ``akgentic.llm.config.normalize_model_roster`` and is
+        called, never re-spelled: the ``provider:model`` key grammar has exactly one
+        implementation, and a second copy of it would not raise — it would produce a
+        switch that silently matches nothing.
+
+        Deliberately separate from ``_map_pre_split_usage_limits``: each
+        before-validator owns one key and returns its input unchanged when that key is
+        absent, so their evaluation order cannot matter.
+        """
+        return normalize_model_roster(data, "AgentConfig")
+
+    @model_validator(mode="after")
+    def _reject_duplicate_roster_keys(self) -> "AgentConfig":
+        """No two roster entries may name the same ``provider:model``.
+
+        An *after* validator by necessity: before field validation an entry may still be
+        a raw dict with no ``provider``, so ``{"model": "m"}`` and
+        ``{"provider": "openai", "model": "m"}`` look distinct although ModelConfig's
+        ``"openai"`` default is about to make them identical.
+
+        The companion membership rule — a non-empty roster must contain the active model
+        — is deliberately not duplicated here: normalization satisfies it by
+        construction, and the ReactAgentConfig that ``BaseAgent.on_start`` builds still
+        enforces it one layer later.
+        """
+        if not self.model_roster:
+            return self
+        validate_unique_roster_keys(self.model_roster, "AgentConfig")
+        return self
 
     @model_validator(mode="before")
     @classmethod
