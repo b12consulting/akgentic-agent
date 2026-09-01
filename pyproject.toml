@@ -21,7 +21,17 @@ keywords = ["agents", "ai", "team", "collaboration", "pydantic-ai"]
 
 dependencies = [
     "pydantic>=2.0.0",
-    "pydantic-ai>=2,<3",
+    # This is pydantic-ai-SLIM, not the pydantic-ai metapackage, with exactly the
+    # extras this package's own imports need — which is none. Every pydantic_ai
+    # import under src/ and tests/ resolves to the core distribution (pydantic_ai,
+    # .capabilities, .models, .models.function, .messages, .result, ._enqueue), and
+    # pydantic_graph is an unconditional dependency of slim rather than an extra.
+    # The metapackage pins slim[anthropic,cli,evals,google,logfire,mcp,openai,
+    # retries,web]; its `web` extra is what dragged Starlette into the resolution
+    # and collided with akgentic-infra's deliberate starlette<1.1 bound.
+    # Bounds deliberately unchanged: akgentic-llm floors slim at 2.32 because it
+    # needs the httpx2 transport, and this package does not.
+    "pydantic-ai-slim>=2,<3",
     "akgentic-core>=1.5.10",
     "akgentic-llm>=2.2.0",
     "akgentic-tool>=1.7.0",

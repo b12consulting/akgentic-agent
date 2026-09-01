@@ -222,6 +222,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         ReactAgent internally handles:
         - create_model() / create_model_settings() / create_http_client()
+          — that client is an ``httpx2.AsyncClient``, not encode's ``httpx``
         - ContextManager for conversation history
         - Usage limits conversion
 
