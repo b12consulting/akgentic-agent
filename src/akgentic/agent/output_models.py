@@ -74,6 +74,8 @@ class StructuredOutput(BaseModel):
             "Every message you send this turn. This list is your only channel: content "
             "that is not in a message here reaches nobody, including the human. You may "
             "send several messages in one turn — they are dispatched in parallel. Leave "
-            "empty only when you are waiting on someone and have nothing to send."
+            "empty only when you are waiting on someone and have nothing to send. "
+            "CRITICAL: your entire reply for this turn is ONE output object. Several "
+            "messages means several entries in this list, never a second output object."
         ),
     )

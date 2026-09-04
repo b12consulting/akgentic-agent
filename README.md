@@ -238,6 +238,41 @@ An empty list means the agent has nothing more to send — but the LLM still run
 the LLM call is skipped. The message is still processed and added to the agent's context
 for future interactions.
 
+### One Output Object per Turn
+
+`_route_output()` consumes **one** `StructuredOutput` per turn. That is deliberate — routing N
+outputs would mean every consumer downstream handles N — but until 2026-09 it was a contract
+enforced only in Python, stated nowhere the model could read it.
+
+**What went wrong.** `gpt-5.6-terra` on the OpenAI **Responses API** routinely answered with several
+complete `StructuredOutput` objects, one per message it wanted to send, as separate text parts of a
+single model response. The Responses API carries a *list* of output items, so this is expressible
+there in a way a single-text-slot API cannot express. pydantic-ai has no representation for "several
+outputs" and collapses them, two ways, both silent:
+
+| The response also carries… | What happens |
+|---|---|
+| a tool call | the text is **discarded**, and still written to history — so the model reads back a delegation it never sent, concludes it already delegated, and never re-derives it. The recipient is simply never contacted |
+| no tool call | the parts are **string-concatenated** into `{...}{...}`, which is not JSON. The run burns its output retries recovering — 13,758 tokens, 21% of a 64,054-token turn, measured |
+
+**Why the model did it.** Not a provider defect, and not the model ignoring an instruction — the
+instruction did not exist. The `messages` field description told it *"you may send several messages
+in one turn — they are dispatched in parallel"*, and never said that several messages means several
+**entries in this one list**. On a channel that can carry several output items, one item per message
+is a reasonable reading of what it was handed.
+
+**The fix is one sentence in the schema the model fills:**
+
+```python
+"CRITICAL: your entire reply for this turn is ONE output object. Several "
+"messages means several entries in this list, never a second output object."
+```
+
+It lives in the field description rather than a system prompt because it is a property of the output
+format: it travels with the JSON schema on every run, for every role, in every team — a prompt
+sentence has to be repeated in each one and a role written next year will not have it. It also sits
+directly beneath the *"several messages"* invitation it exists to reconcile.
+
 ### Static Schema + Prompt-Carried Reply Protocol
 
 `act()` forwards the `output_type` it was handed straight to the REACT loop — there is no
