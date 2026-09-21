@@ -87,7 +87,6 @@ class TestSimpleTeam:
                 ),
                 model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
             ),
-            routes_to=["Assistant", "Expert"],
         )
 
         assistant_card = AgentCard(
@@ -109,15 +108,10 @@ class TestSimpleTeam:
         assert manager_card.role == "Manager"
         assert manager_card.agent_class == "akgentic.agent.BaseAgent"
         assert manager_card.has_skill("coordination")
-        assert manager_card.can_route_to("Assistant")
-        assert manager_card.can_route_to("Expert")
-        assert not manager_card.can_route_to("Other")
 
         assert assistant_card.role == "Assistant"
         assert assistant_card.has_skill("research")
         assert assistant_card.has_skill("writing")
-        # Empty routes_to means can route to anyone
-        assert assistant_card.can_route_to("Manager")
 
     # =============================================================================
     # MANUAL TEAM SETUP TESTS
@@ -139,7 +133,6 @@ class TestSimpleTeam:
                 prompt=PromptTemplate(template="You are a test manager."),
                 model_cfg=ModelConfig(provider="openai", model="gpt-5-mini", temperature=0.3),
             ),
-            routes_to=["Assistant"],
         )
 
         assistant_card = AgentCard(
