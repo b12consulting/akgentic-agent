@@ -32,9 +32,9 @@ dependencies = [
     # Bounds deliberately unchanged: akgentic-llm floors slim at 2.32 because it
     # needs the httpx2 transport, and this package does not.
     "pydantic-ai-slim>=2,<3",
-    "akgentic-core>=1.5.10",
-    "akgentic-llm>=2.2.0",
-    "akgentic-tool>=1.7.0",
+    "akgentic-core>=1.5.15",
+    "akgentic-llm>=2.3.0",
+    "akgentic-tool>=1.10.0",
 ]
 
 [project.optional-dependencies]
