@@ -1038,10 +1038,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         honours that retry.** ``_route_output`` runs after ``act()`` has already
         returned, so the REACT loop is over and the routing is outside the
         usage-limit guard as well — that guard is on ``act()`` and catches
-        usage-limit errors only, which this is not. The exception therefore leaves
-        the actor message handler, deliberately unswallowed. Retry *is* honoured on
-        the other path: when the model calls the ``hire_members`` tool
-        mid-reasoning, pydantic-ai is still inside the loop and retries there.
+        usage-limit errors only, which this is not. ``resolve_recipient`` therefore
+        catches it, with the ``RuntimeError`` below, and skips that one delivery
+        rather than letting it leave the actor message handler with the rest of the
+        turn. This method itself still raises, for any caller that wants to know.
+        Retry *is* honoured on the other path: when the model calls the
+        ``hire_members`` tool mid-reasoning, pydantic-ai is still inside the loop and
+        retries there.
 
         Args:
             role: Role to hire (must exist in agent catalog)

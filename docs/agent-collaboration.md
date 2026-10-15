@@ -501,9 +501,9 @@ flowchart TD
     K --> Q[return False if nothing was delivered]
 ```
 
-> **Note:** Recipients are validated at routing time (`@name` → `get_team_member`,
-> role → `hire_member`); an unknown `@member` is simply not delivered to. The routing
-> logic is a simple two-branch dispatch.
+> **Note:** Recipients are resolved at routing time (`@name` → `get_team_member`,
+> role → `hire_member`); an unknown `@member`, or a role that cannot be hired, is simply
+> not delivered to. The routing logic is a simple two-branch dispatch.
 >
 > The **return value matters**: `_route_output()` reports whether anything actually went out.
 > The usage-limit guard asks it that, because the guard cannot inspect the output itself —
@@ -589,13 +589,17 @@ agent class routing an LLM-chosen recipient needs exactly it:
 def resolve_recipient(agent: TeamResolver, recipient: str) -> ActorAddress | None:
     if recipient.startswith("@"):
         return agent.get_team_member(recipient)
-    return agent.hire_member(recipient)
+    try:
+        return agent.hire_member(recipient)
+    except (ModelRetry, RuntimeError) as error:
+        logger.warning("No member answers to %r and it cannot be hired (%s); ...", recipient, error)
+        return None
 ```
 
 The sender delivers the **raw** `request.message`; the reply-protocol prefix is added by
 the *receiving* agent's `receiveMsg_AgentMessage()` (see below), keyed to the intent that
 agent received. Recipients are resolved at routing time, so the dispatch is a simple
-two-branch lookup with no error recovery needed.
+two-branch lookup, and a recipient it cannot resolve is skipped rather than raised.
 
 `_route_output()` is the class's single routed send path, and it **returns whether anything
 was actually delivered**. `receiveMsg_AgentMessage()` calls it for a normal turn, and the
@@ -667,9 +671,13 @@ Internally, `TeamTool` asks the `Orchestrator` to create a new actor of the
 requested role and register it in the team roster. The address is returned and
 the message is immediately delivered to the newly hired actor.
 
-If the role does not exist in the agent catalog, the command raises a `RetriableError`, which
-`ToolFactory` has wrapped into `ModelRetry` — so the LLM gets to try a different role rather than
-the run dying.
+If the role does not exist in the agent catalog, or its card is not marked `can_be_hired`, the
+command raises a `RetriableError`, which `ToolFactory` has wrapped into `ModelRetry`. When the
+model calls the `hire_members` **tool** mid-reasoning, that retry is honoured and the LLM gets
+to try a different role. On the **routing** path it cannot be: `_route_output()` runs after
+`act()` has returned, so the run is already over. `resolve_recipient()` therefore catches the
+`ModelRetry` — and the `RuntimeError` of a card that does not expose `hire_member` as a command
+— logs it, and skips that one delivery, so the turn's other messages still go out.
 
 ### 4. The Command Registry
 
@@ -1318,8 +1326,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Core routing engine. Delivers a StructuredOutput: one AgentMessage per
         Request, carrying the RAW request.message and request.message_type. A
         recipient starting with "@" resolves to an existing member and one that
-        does not is hired by role; a recipient that resolves to nothing is
-        skipped. It does not enrich the content — the delivered message adds its
+        does not is hired by role; a recipient that resolves to nothing, or a
+        role that cannot be hired, is skipped and logged. It does not enrich the content — the delivered message adds its
         own reply protocol. Returns whether anything was actually delivered; no
         caller reads that bool today, the guard that used to having been retired.
 
