@@ -415,6 +415,22 @@ Four things follow, and they are the whole point:
   `TriageOutput()`. A usage breach is absorbed in the same place, by the guard (see
   [Run Cancellation](#run-cancellation)).
 
+One thing does not come for free: the framework's recipient check reads `StructuredOutput`,
+so a `TriageOutput` passes it unchecked and a wrong handoff recipient would only be skipped
+by `_route_triage`. The subclass brings an extractor for its own shape:
+
+```python
+def handoff_recipients(output: object) -> list[str] | None:
+    if isinstance(output, TriageOutput):
+        return [handoff.recipient for handoff in output.handoffs]
+    return None
+
+
+class CustomAgent(BaseAgent):
+    def extra_capabilities(self) -> list[AgentCapability[Any]]:
+        return [RecipientCheckCapability(recipients=handoff_recipients)]
+```
+
 **Known gap.** A conclusion that hands off to nobody is silent: an ordinary success that routes
 nothing and notifies no one. `akgentic-llm` cannot see it (`TriageOutput` has no `.messages`,
 and it receives the output as `Any`) and the guard never sees the output at all. Tracked as

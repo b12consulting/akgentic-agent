@@ -17,7 +17,9 @@ in this file would have to be written by copying that ladder into ``CustomAgent`
 first — which is precisely the copying this story removed.
 """
 
+import asyncio
 import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,11 +27,20 @@ from akgentic.core import ActorAddress
 from akgentic.core.agent import WarningError
 from akgentic.llm import AgentUsageLimitError, ReactAgent, RunUsageLimitError
 from pydantic import BaseModel
+from pydantic_ai import ModelRetry
 
 from akgentic.agent.agent import RunInterruptedError
 from akgentic.agent.config import AgentConfig, AgentState
-from akgentic.agent.custom_agent import CustomAgent, Handoff, TriageMessage, TriageOutput
+from akgentic.agent.custom_agent import (
+    CustomAgent,
+    Handoff,
+    TriageAuditCapability,
+    TriageMessage,
+    TriageOutput,
+    handoff_recipients,
+)
 from akgentic.agent.messages import AgentMessage
+from akgentic.agent.recipients import RecipientCheckCapability, TeamDirectory
 
 REQUESTER = "@Ops"
 
@@ -322,3 +333,45 @@ class TestCustomAgentOverridesNothing:
 
         agent._react_agent.conclude_without_tools_sync.assert_not_called()  # type: ignore[attr-defined]
         agent.notify_human.assert_not_called()  # type: ignore[attr-defined]
+
+
+class TestCustomAgentHandoffCheck:
+    """The framework's recipient check reads StructuredOutput; handoffs bring their own."""
+
+    def test_the_extractor_reads_one_recipient_per_handoff(self) -> None:
+        output = TriageOutput(
+            handoffs=[Handoff(recipient="@Ops", task="a"), Handoff(recipient="DBA", task="b")]
+        )
+
+        assert handoff_recipients(output) == ["@Ops", "DBA"]
+        assert handoff_recipients("plain text") is None
+
+    def test_it_mounts_its_audit_and_a_handoff_check(self) -> None:
+        audit, check = _make_custom_agent().extra_capabilities()
+
+        assert isinstance(audit, TriageAuditCapability)
+        assert isinstance(check, RecipientCheckCapability)
+        assert check.recipients is handoff_recipients
+
+    def test_a_handoff_nobody_answers_to_is_sent_back(self) -> None:
+        directory = TeamDirectory(
+            members=["@Triage", "@Ops"], hireable_roles=[], self_name="@Triage"
+        )
+        ctx = SimpleNamespace(
+            deps=SimpleNamespace(team_directory=lambda: directory),
+            retry=0,
+            max_retries=3,
+            partial_output=False,
+            usage=SimpleNamespace(requests=1),
+            usage_limits=None,
+        )
+        _, check = _make_custom_agent().extra_capabilities()
+
+        with pytest.raises(ModelRetry, match="@Ops"):
+            asyncio.run(
+                check.after_output_validate(
+                    ctx,  # type: ignore[arg-type]
+                    output_context=MagicMock(),
+                    output=_triage(recipient="Ops"),
+                )
+            )
