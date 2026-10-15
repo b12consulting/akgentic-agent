@@ -250,6 +250,7 @@ what roles are available, and to hire or fire members.
 | **`GetRoleProfiles`** | `SYSTEM_PROMPT`, `COMMAND` | Injects the full agent catalog (role, description, skills) into every LLM call |
 | **`HireTeamMember`**  | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to hire new members by role                                  |
 | **`FireTeamMember`**  | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to remove members by name                                    |
+| **`HireableRoles`**   | `COMMAND`                  | Lists the roles a hire would accept; registered with `hire_member`, and only then |
 
 **Why it matters for collaboration**: The two `SYSTEM_PROMPT` capabilities
 (`GetTeamRoster` and `GetRoleProfiles`) give the LLM the information it needs to
@@ -679,6 +680,36 @@ to try a different role. On the **routing** path it cannot be: `_route_output()`
 `ModelRetry` — and the `RuntimeError` of a card that does not expose `hire_member` as a command
 — logs it, and skips that one delivery, so the turn's other messages still go out.
 
+#### The recipient check: telling the model while it can still answer
+
+Skipping keeps the turn alive but loses the message, and the model never learns why. So
+every `BaseAgent` also validates recipients **inside** the run, before anything is routed.
+`RecipientCheckCapability` (`akgentic.agent.recipients`) hooks pydantic-ai's
+`after_output_validate`. It asks `team_directory()` — the members, and the roles TeamTool's
+`hireable_roles` command lists — about every recipient of the validated `StructuredOutput`,
+and while one is unreachable it raises `ModelRetry`:
+
+```
+Nothing was sent: no team member answers to ['Expert'], and none can be hired for it.
+Address each message to the exact @name of a member: @Expert, @Human.
+Or write a role without '@' to hire it: Developer.
+```
+
+The model rewrites its answer in the same run. A correct answer costs nothing.
+
+The check **stands down** when a retry could not be honoured, and routing then skips what is
+still unreachable:
+
+| When | Why raising would be worse |
+|---|---|
+| the output retries are spent | the run ends in `UnexpectedModelBehavior` and every message is lost |
+| the run's request limit is reached — always so in akgentic-llm's tool-free conclusion | the run ends in a usage-limit error |
+| the output is partial (streaming) | the answer is not finished yet |
+
+It reads `StructuredOutput` only. An agent routing a shape of its own returns a second
+`RecipientCheckCapability(recipients=...)` from `extra_capabilities()`, with an extractor that
+reads its recipients — see `CustomAgent`.
+
 ### 4. The Command Registry
 
 `on_start()` folds every `COMMAND`-channel capability of the agent's tool cards into a single
@@ -698,7 +729,7 @@ self.notify_event(
 ```
 
 Commands are keyed by the callable's `__name__`. The canonical names are therefore
-`hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`,
+`hire_member`, `hireable_roles`, `fire_member`, `team_members`, `team_roles`, `planning_summary`,
 `get_planning_task`, `search_planning`, `compact`, `clear` — the exact set depends on which tool
 cards the agent carries. Two surfaces reach that one table:
 
@@ -858,7 +889,7 @@ What the subclass gets, and what it must supply:
 | | |
 |---|---|
 | **Reused unchanged** | `act(message, output_type)` — renders the message you hand it and forwards the type you name to the REACT loop, so a custom output model needs no plumbing; absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`); and carries `@guard_usage_limits()`, so the usage-limit policy arrives with the call rather than being declared. `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
-| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first |
+| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability` and the recipient check, so the list is always `[mailbox, recipient_check, *yours]` and the cancel check keeps running first |
 
 A run-tier breach in `CustomAgent` still concludes in **`TriageOutput`** and is still delivered
 by **`_route_triage`**, with `CustomAgent` overriding *and declaring* nothing — because
@@ -1352,6 +1383,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         no-op. Cancellation is enforced mid-run by the mailbox peek inside
         MailboxCapability, not by this handler; by the time a cancel is
         dequeued and lands here there is nothing to cancel.
+
+    team_directory() -> TeamDirectory
+        Who a recipient can name right now: the members (tool actors excluded)
+        and the roles TeamTool's hireable_roles command lists — empty without
+        that command. Read by the recipient check on every routed output.
 
     hire_member(role) -> ActorAddress
         Hire by role through the registry's typed hire_member command.

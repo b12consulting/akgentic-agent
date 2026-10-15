@@ -38,8 +38,8 @@ Supplied here:
   from ``act()`` as an ordinary ``TriageOutput``.
 - ``extra_capabilities`` — one pydantic-ai capability of this agent's own,
   ``TriageAuditCapability``. The framework prepends its own, so the list the
-  ReactAgent receives is ``[mailbox, audit]``: the cancel check still runs
-  first, and this agent never returns the mailbox capability itself.
+  ReactAgent receives is ``[mailbox, recipient_check, audit]``: the cancel check
+  still runs first, and this agent never returns a framework capability itself.
 """
 
 import logging
@@ -153,11 +153,12 @@ class CustomAgent(BaseAgent):
     def extra_capabilities(self) -> list[AgentCapability[Any]]:
         """Contribute this agent's audit capability to the ReactAgent.
 
-        The framework prepends ``MailboxCapability``, so the ReactAgent is
-        handed ``[mailbox, audit]`` — cancellation stays unconditional and its
-        check still runs first. This override deliberately does not call
-        ``super()`` and does not return the mailbox capability: doing either
-        would duplicate a capability the framework already supplies.
+        The framework prepends ``MailboxCapability`` and the recipient check, so
+        the ReactAgent is handed ``[mailbox, recipient_check, audit]`` —
+        cancellation stays unconditional and its check still runs first. This
+        override deliberately does not call ``super()`` and does not return
+        either framework capability: doing so would duplicate one the framework
+        already supplies.
 
         Runs from ``_build_react_agent`` during ``on_start``, before
         ``self._react_agent`` exists, so it reads only ``self.config`` — which

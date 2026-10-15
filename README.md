@@ -286,12 +286,20 @@ output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 delegation path reasons against the **static** `StructuredOutput` type.
 
 `Request.recipient` is a **plain string** with no `enum` constraint. Recipient validity is
-enforced at **routing time** in `_route_output()`, not in the schema:
+checked **inside the run**, not in the schema: `RecipientCheckCapability`
+(`akgentic.agent.recipients`) sends an output back with `ModelRetry` while it names a
+recipient nobody answers to, with the members and the hireable roles in the retry prompt.
+`_route_output()` then resolves what remains:
 
 | Recipient format | Resolution |
 |---|---|
 | `@MemberName` | `get_team_member(name)` → direct send (skipped if not found) |
-| `RoleName` | `hire_member(role)` → create actor → send |
+| `RoleName` | `hire_member(role)` → create actor → send (skipped if the role cannot be hired) |
+
+A recipient is skipped only when the run could not afford a retry — output retries spent, or
+no request left, as in the tool-free conclusion. See
+[the recipient check](docs/agent-collaboration.md#the-recipient-check-telling-the-model-while-it-can-still-answer)
+in the collaboration guide.
 
 The reply-protocol guidance lives where the LLM actually reads it — the **prompt**.
 `AgentMessage.rendering()` puts a one-line protocol (keyed on the message's own
@@ -305,7 +313,7 @@ You received a request from @Human. A reply is expected: respond to @Human with 
 
 > **Note:** This supersedes the schema-constrained-recipient + docstring-injection
 > mechanism from Story 5.1 / ADR-004. The intent-driven 5-type protocol is unchanged —
-> only its enforcement moved from a per-call schema to the prompt + routing-time validation.
+> only its enforcement moved from a per-call schema to the prompt + an in-run recipient check.
 
 ### Routing and Delivery
 
@@ -354,7 +362,7 @@ obligation: invisible from `usage_limits.py`, and silently dropped by the one ha
 forgot it. Now it cannot be skipped, because *making the LLM call* is what triggers it. (The
 one way to lose it is to override `act()` outright instead of calling `super().act()`.)
 
-Two modules exist for what a subclass *does* need, and neither imports `agent.py` — they are
+Three modules exist for what a subclass *does* need, and none imports `agent.py` — they are
 what a *new* agent class needs, so a dependency in that direction would make them unusable
 from the module that defines the base class. What each needs from an agent is stated as a
 `Protocol`:
@@ -363,6 +371,7 @@ from the module that defines the base class. What each needs from an agent is st
 |---|---|
 | `usage_limits.py` | `AgentLike`, `guard_usage_limits`, `escalate_usage_limit` |
 | `utils.py` | `TeamResolver`, `resolve_recipient` — the team addressing convention (`@member` vs role to hire) |
+| `recipients.py` | `TeamDirectory`, `RecipientCheckCapability` — the same convention checked inside the run, with an extractor for your own output shape |
 
 So the subclass is only its own work:
 
