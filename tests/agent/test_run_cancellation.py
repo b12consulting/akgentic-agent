@@ -37,7 +37,6 @@ from akgentic.core import ActorAddress, ActorSystem, BaseConfig, Orchestrator
 from akgentic.core.messages import CancelMessage, HandledMessage
 from akgentic.llm import ModelConfig, PromptTemplate, ReactAgent, ReactAgentConfig
 from akgentic.tool import MailboxTool
-from akgentic.agent.recipients import RecipientCheckCapability
 from akgentic.tool.mailbox import (
     ABSORBED_PREFIX,
     ARRIVAL_CLOSING,
@@ -73,6 +72,7 @@ from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
+from akgentic.agent.recipients import RecipientCheckCapability
 
 AGENT_LOGGER = "akgentic.agent.agent"
 
@@ -794,7 +794,7 @@ class _AgentWithOneExtra(BaseAgent):
 
 class TestCapabilityWiring:
     def test_bare_base_agent_yields_exactly_the_framework_capabilities(self) -> None:
-        """A subclass that overrides nothing gets ``[mailbox, recipient_check]`` and nothing else."""
+        """A subclass overriding nothing gets ``[mailbox, recipient_check]`` and nothing else."""
         with _running_agent():
             capabilities = _InterruptibleReactAgent.captured[-1]["capabilities"]
             assert len(capabilities) == 2

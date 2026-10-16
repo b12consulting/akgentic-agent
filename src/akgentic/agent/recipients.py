@@ -27,7 +27,7 @@ from pydantic_ai.output import OutputContext
 
 from akgentic.agent.output_models import StructuredOutput
 
-RecipientExtractor = Callable[[Any], list[str] | None]
+RecipientExtractor = Callable[[object], list[str] | None]
 """Returns the recipients an output names, or ``None`` when it is not a shape to check."""
 
 
@@ -116,7 +116,7 @@ class DirectorySource(Protocol):
         ...
 
 
-def structured_output_recipients(output: Any) -> list[str] | None:
+def structured_output_recipients(output: object) -> list[str] | None:
     """The recipients of a ``StructuredOutput``; ``None`` for any other shape.
 
     Args:
@@ -147,6 +147,8 @@ class RecipientCheckCapability(AbstractCapability[Any]):
 
     recipients: RecipientExtractor = structured_output_recipients
 
+    # The Any below is pydantic-ai's own hook signature: deps are narrowed at
+    # runtime to a DirectorySource, and the output is any shape an extractor reads.
     async def after_output_validate(
         self,
         ctx: RunContext[Any],

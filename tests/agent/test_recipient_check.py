@@ -1,12 +1,16 @@
 """The recipient check: an unreachable recipient is sent back inside the run.
 
-Unit specs pin the directory, the extractor and every stand-down rule. The two
+Unit specs pin the directory, the extractor and every stand-down rule. The
 end-to-end specs drive a real pydantic-ai run graph with a scripted model, because
 what is under test — a ``ModelRetry`` from ``after_output_validate`` reaching the
-model, and the run surviving when no retry is left — belongs to that graph.
+model, and the run surviving when no retry is left — belongs to that graph. The
+graph keeps two retry budgets, one per output path (an output tool, or native
+text), and akgentic-llm's tool-free conclusion allows a single request, so each of
+the three gets a run of its own.
 """
 
 import asyncio
+import json
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -16,7 +20,13 @@ import pytest
 from akgentic.core import ActorAddress
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig, RuntimeConfig
 from pydantic_ai import ModelRetry
-from pydantic_ai.messages import ModelMessage, ModelResponse, RetryPromptPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelResponse,
+    RetryPromptPart,
+    TextPart,
+    ToolCallPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import UsageLimits
 
@@ -329,4 +339,61 @@ class TestInARealRun:
             react_agent.close()
 
         assert calls == 2  # the first answer, and one retry
+        assert [r.recipient for r in output.messages] == ["Expert"]
+
+    def test_on_the_native_text_path_no_retry_left_ends_the_run_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The text path counts the run-wide output budget, not an output tool's."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        agent = _make_agent(hireable=[])
+        config = ReactAgentConfig(
+            model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+            runtime_cfg=RuntimeConfig(retries=1),
+        )
+        react_agent = ReactAgent(
+            config=config, deps_type=BaseAgent, capabilities=[RecipientCheckCapability()]
+        )
+        agent._react_agent = react_agent  # type: ignore[attr-defined]
+        calls = 0
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal calls
+            calls += 1
+            assert not info.output_tools  # native output: the answer is text
+            args = {"messages": [{"message_type": "request", "message": "hi", "recipient": "X"}]}
+            return ModelResponse(parts=[TextPart(content=json.dumps(args))])
+
+        try:
+            with react_agent.pydantic_agent.override(model=FunctionModel(model)):
+                output = agent.act(AgentMessage(content="go"), StructuredOutput)
+        finally:
+            react_agent.close()
+
+        assert calls == 2  # the first answer, and one retry
+        assert [r.recipient for r in output.messages] == ["X"]
+
+    def test_the_tool_free_conclusion_is_never_sent_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """akgentic-llm's conclusion allows one request; a retry there would fail the turn."""
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        agent = _make_agent(hireable=[])
+        react_agent = _react_agent()
+        calls = 0
+
+        def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal calls
+            calls += 1
+            return _output_call(info, "Expert", f"out-{calls}")
+
+        try:
+            with react_agent.pydantic_agent.override(model=FunctionModel(model)):
+                output = react_agent.conclude_without_tools_sync(
+                    "Conclude now.", deps=agent, output_type=StructuredOutput
+                )
+        finally:
+            react_agent.close()
+
+        assert calls == 1
         assert [r.recipient for r in output.messages] == ["Expert"]
