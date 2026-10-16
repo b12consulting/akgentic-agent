@@ -687,15 +687,27 @@ every `BaseAgent` also validates recipients **inside** the run, before anything 
 `RecipientCheckCapability` (`akgentic.agent.recipients`) hooks pydantic-ai's
 `after_output_validate`. It asks `team_directory()` — the members, and the roles TeamTool's
 `hireable_roles` command lists — about every recipient of the validated `StructuredOutput`,
-and while one is unreachable it raises `ModelRetry`:
+and while one is unreachable it raises `ModelRetry`. The prompt gives one line per recipient
+saying why it failed, then one instruction that depends on whether this agent can hire at all.
+For a coordinator that cannot hire:
 
 ```
-Nothing was sent: no team member answers to ['Expert'], and none can be hired for it.
-Address each message to the exact @name of a member: @Expert, @Human.
-Or write a role without '@' to hire it: Developer.
+Nothing was sent.
+- 'Expert' has no '@', so it was read as a role to hire, and you cannot hire in this team.
+- No team member is called '@Researcher'.
+Address every message to a current member by exact @name: @Expert, @Human.
 ```
 
-The model rewrites its answer in the same run. A correct answer costs nothing.
+and for one that can hire, but not that role:
+
+```
+Nothing was sent.
+- 'Expert' has no '@', so it was read as a role to hire, and it is not a role you can hire.
+Address a member by exact @name: @Expert, @Human — or write one of these roles without '@' to hire it: Developer.
+```
+
+An agent that cannot hire is never invited to try another role. The model rewrites its answer in
+the same run. A correct answer costs nothing.
 
 The check **stands down** when a retry could not be honoured, and routing then skips what is
 still unreachable:
@@ -1385,9 +1397,10 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         dequeued and lands here there is nothing to cancel.
 
     team_directory() -> TeamDirectory
-        Who a recipient can name right now: the members (tool actors excluded)
-        and the roles TeamTool's hireable_roles command lists — empty without
-        that command. Read by the recipient check on every routed output.
+        Who a recipient can name right now: the members (tool actors excluded),
+        whether this agent can hire through routing (TeamTool registered
+        hireable_roles), and the roles that command lists — empty without it.
+        Read by the recipient check on every routed output.
 
     hire_member(role) -> ActorAddress
         Hire by role through the registry's typed hire_member command.

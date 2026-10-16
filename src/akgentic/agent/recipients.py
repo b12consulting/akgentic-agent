@@ -38,12 +38,17 @@ class TeamDirectory(BaseModel):
         members: ``@name`` of every member, tool actors (``#``-prefixed) excluded.
         hireable_roles: Roles ``hire_member`` would accept, as TeamTool's
             ``hireable_roles`` command lists them. Empty when the agent cannot hire.
+        can_hire: Whether this agent can hire through routing at all — whether
+            TeamTool registered its hire commands. Kept apart from
+            ``hireable_roles`` so the model is told "you cannot hire" rather than
+            "this role is not hireable" when the answer is the former.
         self_name: The asking agent's own name, left out when the directory is
             shown to the model.
     """
 
     members: list[str]
     hireable_roles: list[str]
+    can_hire: bool
     self_name: str
 
     def reaches(self, recipient: str) -> bool:
@@ -60,7 +65,13 @@ class TeamDirectory(BaseModel):
         return recipient in self.hireable_roles
 
     def correction(self, unreachable: list[str]) -> str:
-        """The retry prompt telling the model what it may address instead.
+        """The retry prompt: why each recipient failed, then what to address instead.
+
+        One line per recipient, because the three failures call for different
+        corrections: an ``@name`` nobody has, a bare role when this agent cannot
+        hire, and a bare role that is not hireable. The closing instruction
+        depends only on whether the agent can hire, so a model that cannot is
+        never invited to try another role.
 
         Args:
             unreachable: The recipients nobody answers to.
@@ -68,15 +79,32 @@ class TeamDirectory(BaseModel):
         Returns:
             The message handed to the model with ``ModelRetry``.
         """
-        others = [name for name in self.members if name != self.self_name]
-        text = (
-            f"Nothing was sent: no team member answers to {unreachable}, and none can be "
-            f"hired for it. Address each message to the exact @name of a member: "
-            f"{', '.join(others) or '(none)'}."
+        lines = ["Nothing was sent."]
+        lines += [f"- {self._why(recipient)}" for recipient in unreachable]
+        others = ", ".join(name for name in self.members if name != self.self_name)
+        if self.can_hire and self.hireable_roles:
+            lines.append(
+                f"Address a member by exact @name: {others or '(none)'} — or write one of "
+                f"these roles without '@' to hire it: {', '.join(self.hireable_roles)}."
+            )
+        else:
+            lines.append(
+                f"Address every message to a current member by exact @name: {others or '(none)'}."
+            )
+        return "\n".join(lines)
+
+    def _why(self, recipient: str) -> str:
+        if recipient.startswith("@"):
+            return f"No team member is called '{recipient}'."
+        if not self.can_hire:
+            return (
+                f"'{recipient}' has no '@', so it was read as a role to hire, and you cannot "
+                f"hire in this team."
+            )
+        return (
+            f"'{recipient}' has no '@', so it was read as a role to hire, and it is not a "
+            f"role you can hire."
         )
-        if self.hireable_roles:
-            text += f" Or write a role without '@' to hire it: {', '.join(self.hireable_roles)}."
-        return text
 
 
 @runtime_checkable

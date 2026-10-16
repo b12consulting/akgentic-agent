@@ -355,7 +355,7 @@ class TestCustomAgentHandoffCheck:
 
     def test_a_handoff_nobody_answers_to_is_sent_back(self) -> None:
         directory = TeamDirectory(
-            members=["@Triage", "@Ops"], hireable_roles=[], self_name="@Triage"
+            members=["@Triage", "@Ops"], hireable_roles=[], can_hire=False, self_name="@Triage"
         )
         ctx = SimpleNamespace(
             deps=SimpleNamespace(team_directory=lambda: directory),

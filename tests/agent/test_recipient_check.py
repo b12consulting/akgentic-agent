@@ -36,10 +36,11 @@ def _request(recipient: str) -> Request:
     return Request(message_type="request", message="what is x?", recipient=recipient)
 
 
-def _directory(hireable: tuple[str, ...] = ()) -> TeamDirectory:
+def _directory(hireable: tuple[str, ...] = (), *, can_hire: bool | None = None) -> TeamDirectory:
     return TeamDirectory(
         members=["@Manager", "@Expert", "@Human"],
         hireable_roles=list(hireable),
+        can_hire=bool(hireable) if can_hire is None else can_hire,
         self_name="@Manager",
     )
 
@@ -94,13 +95,45 @@ class TestTheDirectory:
     def test_the_correction_names_the_members_but_not_the_asker(self) -> None:
         text = _directory().correction(["Expert"])
 
-        assert "['Expert']" in text
-        assert "@Expert, @Human." in text
+        assert text.startswith("Nothing was sent.")
+        assert text.endswith("@Expert, @Human.")
         assert "@Manager" not in text
 
-    def test_the_correction_offers_the_hireable_roles_when_there_are_any(self) -> None:
-        assert "Developer, Tester" in _directory(("Developer", "Tester")).correction(["X"])
-        assert "hire it" not in _directory().correction(["X"])
+    def test_an_agent_that_cannot_hire_is_told_so_and_offered_no_role(self) -> None:
+        text = _directory(can_hire=False).correction(["Expert"])
+
+        assert "'Expert' has no '@', so it was read as a role to hire" in text
+        assert "you cannot hire in this team" in text
+        assert "hire it" not in text
+
+    def test_a_role_that_is_not_hireable_is_told_apart_and_the_roles_are_offered(self) -> None:
+        text = _directory(("Developer", "Tester")).correction(["Expert"])
+
+        assert "'Expert' has no '@'" in text
+        assert "it is not a role you can hire" in text
+        assert "cannot hire in this team" not in text
+        assert "to hire it: Developer, Tester." in text
+
+    def test_an_unknown_at_name_is_named_as_such(self) -> None:
+        text = _directory(can_hire=False).correction(["@Ghost"])
+
+        assert "No team member is called '@Ghost'." in text
+        assert "has no '@'" not in text
+
+    def test_each_unreachable_recipient_gets_its_own_line_and_one_instruction(self) -> None:
+        lines = _directory(can_hire=False).correction(["@Ghost", "Expert"]).splitlines()
+
+        assert lines[0] == "Nothing was sent."
+        assert lines[1] == "- No team member is called '@Ghost'."
+        assert lines[2].startswith("- 'Expert' has no '@'")
+        assert lines[3].startswith("Address every message to a current member")
+        assert len(lines) == 4
+
+    def test_an_agent_that_can_hire_with_no_hireable_role_is_offered_none(self) -> None:
+        text = _directory(can_hire=True).correction(["Expert"])
+
+        assert "it is not a role you can hire" in text
+        assert "hire it:" not in text
 
 
 class TestTheExtractor:
@@ -122,7 +155,7 @@ class TestTheCheck:
     def test_an_unreachable_recipient_is_sent_back(self) -> None:
         output = StructuredOutput(messages=[_request("@Human"), _request("Expert")])
 
-        with pytest.raises(ModelRetry, match=r"\['Expert'\]"):
+        with pytest.raises(ModelRetry, match="'Expert' has no '@'"):
             _check(_ctx(_Source(_directory())), output)
 
     def test_an_output_naming_nobody_passes(self) -> None:
@@ -209,10 +242,14 @@ class TestTheAgentsDirectory:
 
         assert directory.members == ["@Manager", "@Expert", "@Human"]
         assert directory.hireable_roles == ["Developer"]
+        assert directory.can_hire is True
         assert directory.self_name == "@Manager"
 
-    def test_without_the_hireable_roles_command_nothing_is_hireable(self) -> None:
-        assert _make_agent(hireable=None).team_directory().hireable_roles == []
+    def test_without_the_hireable_roles_command_the_agent_cannot_hire(self) -> None:
+        directory = _make_agent(hireable=None).team_directory()
+
+        assert directory.can_hire is False
+        assert directory.hireable_roles == []
 
 
 def _output_call(info: AgentInfo, recipient: str, call_id: str) -> ModelResponse:
@@ -264,7 +301,8 @@ class TestInARealRun:
             react_agent.close()
 
         assert len(retry_prompts) == 1
-        assert "['Expert']" in retry_prompts[0]
+        assert "'Expert' has no '@'" in retry_prompts[0]
+        assert "it is not a role you can hire" in retry_prompts[0]
         assert "@Expert, @Human" in retry_prompts[0]
         routed_to, _ = agent.send.call_args[0]  # type: ignore[attr-defined]
         assert routed_to.name == "@Expert"
