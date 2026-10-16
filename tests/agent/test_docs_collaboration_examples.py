@@ -56,6 +56,7 @@ from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
+from akgentic.agent.recipients import RecipientCheckCapability
 
 # =============================================================================
 # HELPERS
@@ -856,7 +857,7 @@ class AuditedAgent(BaseAgent):
 
 
 class TestExtraCapabilitiesSnippet:
-    """Both documents claim the list is `[mailbox, *extra_capabilities()]`.
+    """Both documents claim the list is `[mailbox, recipient_check, *extra_capabilities()]`.
 
     The snippet is only honest if a subclass overriding nothing else really gets
     its capability into the ReactAgent, in that order, without touching
@@ -895,14 +896,15 @@ class TestExtraCapabilitiesSnippet:
         # back on the agent's own list.
         assert capabilities == agent._capabilities
         assert capabilities is not agent._capabilities
-        assert len(capabilities) == 2
+        assert len(capabilities) == 3
         assert capabilities[0] is agent._mailbox_capability
         assert isinstance(capabilities[0], MailboxCapability)
-        assert isinstance(capabilities[1], AuditCapability)
+        assert isinstance(capabilities[1], RecipientCheckCapability)
+        assert isinstance(capabilities[2], AuditCapability)
         # Documented: an override may read self.config.
-        assert capabilities[1].agent_name == "@Audited"
+        assert capabilities[2].agent_name == "@Audited"
 
-    def test_a_subclass_overriding_nothing_gets_only_the_framework_capability(
+    def test_a_subclass_overriding_nothing_gets_only_the_framework_capabilities(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Documented: `extra_capabilities()` returns `[]` on BaseAgent."""
@@ -911,8 +913,9 @@ class TestExtraCapabilitiesSnippet:
         assert agent.extra_capabilities() == []
         capabilities = self._build(agent, monkeypatch)
 
-        assert len(capabilities) == 1
+        assert len(capabilities) == 2
         assert capabilities[0] is agent._mailbox_capability
+        assert isinstance(capabilities[1], RecipientCheckCapability)
 
 
 # =============================================================================

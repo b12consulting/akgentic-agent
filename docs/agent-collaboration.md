@@ -501,9 +501,9 @@ flowchart TD
     K --> Q[return False if nothing was delivered]
 ```
 
-> **Note:** Recipients are validated at routing time (`@name` → `get_team_member`,
-> role → `hire_member`); an unknown `@member` is simply not delivered to. The routing
-> logic is a simple two-branch dispatch.
+> **Note:** Recipients are resolved at routing time (`@name` → `get_team_member`,
+> role → `hire_member`); an unknown `@member`, or a role that cannot be hired, is simply
+> not delivered to. The routing logic is a simple two-branch dispatch.
 >
 > The **return value matters**: `_route_output()` reports whether anything actually went out.
 > The usage-limit guard asks it that, because the guard cannot inspect the output itself —
@@ -589,13 +589,17 @@ agent class routing an LLM-chosen recipient needs exactly it:
 def resolve_recipient(agent: TeamResolver, recipient: str) -> ActorAddress | None:
     if recipient.startswith("@"):
         return agent.get_team_member(recipient)
-    return agent.hire_member(recipient)
+    try:
+        return agent.hire_member(recipient)
+    except (ModelRetry, RuntimeError) as error:
+        logger.warning("No member answers to %r and it cannot be hired (%s); ...", recipient, error)
+        return None
 ```
 
 The sender delivers the **raw** `request.message`; the reply-protocol prefix is added by
 the *receiving* agent's `receiveMsg_AgentMessage()` (see below), keyed to the intent that
 agent received. Recipients are resolved at routing time, so the dispatch is a simple
-two-branch lookup with no error recovery needed.
+two-branch lookup, and a recipient it cannot resolve is skipped rather than raised.
 
 `_route_output()` is the class's single routed send path, and it **returns whether anything
 was actually delivered**. `receiveMsg_AgentMessage()` calls it for a normal turn, and the
@@ -667,9 +671,56 @@ Internally, `TeamTool` asks the `Orchestrator` to create a new actor of the
 requested role and register it in the team roster. The address is returned and
 the message is immediately delivered to the newly hired actor.
 
-If the role does not exist in the agent catalog, the command raises a `RetriableError`, which
-`ToolFactory` has wrapped into `ModelRetry` — so the LLM gets to try a different role rather than
-the run dying.
+If the role does not exist in the agent catalog, or its card is not marked `can_be_hired`, the
+command raises a `RetriableError`, which `ToolFactory` has wrapped into `ModelRetry`. When the
+model calls the `hire_members` **tool** mid-reasoning, that retry is honoured and the LLM gets
+to try a different role. On the **routing** path it cannot be: `_route_output()` runs after
+`act()` has returned, so the run is already over. `resolve_recipient()` therefore catches the
+`ModelRetry` — and the `RuntimeError` of a card that does not expose `hire_member` as a command
+— logs it, and skips that one delivery, so the turn's other messages still go out.
+
+#### The recipient check: telling the model while it can still answer
+
+Skipping keeps the turn alive but loses the message, and the model never learns why. So
+every `BaseAgent` also validates recipients **inside** the run, before anything is routed.
+`RecipientCheckCapability` (`akgentic.agent.recipients`) hooks pydantic-ai's
+`after_output_validate`. It asks `team_directory()` — the members, and the roles of the
+orchestrator's agent catalog whose cards are `can_be_hired`, read through one
+`discover_catalog()` proxy call — about every recipient of the validated `StructuredOutput`,
+and while one is unreachable it raises `ModelRetry`. The prompt gives one line per recipient
+saying why it failed, then one instruction that depends on whether this agent can hire at all.
+For a coordinator that cannot hire:
+
+```
+Nothing was sent.
+- 'Expert' has no '@', so it was read as a role to hire, and you cannot hire in this team.
+- No team member is called '@Researcher'.
+Address every message to a current member by exact @name: @Expert, @Human.
+```
+
+and for one that can hire, but not that role:
+
+```
+Nothing was sent.
+- 'Expert' has no '@', so it was read as a role to hire, and it is not a role you can hire.
+Address a member by exact @name: @Expert, @Human — or write one of these roles without '@' to hire it: Developer.
+```
+
+An agent that cannot hire is never invited to try another role. The model rewrites its answer in
+the same run. A correct answer costs nothing.
+
+The check **stands down** when a retry could not be honoured, and routing then skips what is
+still unreachable:
+
+| When | Why raising would be worse |
+|---|---|
+| the output retries are spent | the run ends in `UnexpectedModelBehavior` and every message is lost |
+| the run's request limit is reached — always so in akgentic-llm's tool-free conclusion | the run ends in a usage-limit error |
+| the output is partial (streaming) | the answer is not finished yet |
+
+It reads `StructuredOutput` only. An agent routing a shape of its own returns a second
+`RecipientCheckCapability(recipients=...)` from `extra_capabilities()`, with an extractor that
+reads its recipients — see `CustomAgent`.
 
 ### 4. The Command Registry
 
@@ -850,7 +901,7 @@ What the subclass gets, and what it must supply:
 | | |
 |---|---|
 | **Reused unchanged** | `act(message, output_type)` — renders the message you hand it and forwards the type you name to the REACT loop, so a custom output model needs no plumbing; absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`); and carries `@guard_usage_limits()`, so the usage-limit policy arrives with the call rather than being declared. `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
-| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability`, so the list is always `[mailbox, *yours]` and the cancel check keeps running first |
+| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability` and the recipient check, so the list is always `[mailbox, recipient_check, *yours]` and the cancel check keeps running first |
 
 A run-tier breach in `CustomAgent` still concludes in **`TriageOutput`** and is still delivered
 by **`_route_triage`**, with `CustomAgent` overriding *and declaring* nothing — because
@@ -1318,8 +1369,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Core routing engine. Delivers a StructuredOutput: one AgentMessage per
         Request, carrying the RAW request.message and request.message_type. A
         recipient starting with "@" resolves to an existing member and one that
-        does not is hired by role; a recipient that resolves to nothing is
-        skipped. It does not enrich the content — the delivered message adds its
+        does not is hired by role; a recipient that resolves to nothing, or a
+        role that cannot be hired, is skipped and logged. It does not enrich the content — the delivered message adds its
         own reply protocol. Returns whether anything was actually delivered; no
         caller reads that bool today, the guard that used to having been retired.
 
@@ -1344,6 +1395,13 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         no-op. Cancellation is enforced mid-run by the mailbox peek inside
         MailboxCapability, not by this handler; by the time a cancel is
         dequeued and lands here there is nothing to cancel.
+
+    team_directory() -> TeamDirectory
+        Who a recipient can name right now: the members (tool actors excluded),
+        whether this agent can hire through routing (its registry has
+        hire_member), and the agent catalog's can_be_hired roles from
+        discover_catalog() — empty, and the catalog not read, without it.
+        Read by the recipient check on every routed output.
 
     hire_member(role) -> ActorAddress
         Hire by role through the registry's typed hire_member command.

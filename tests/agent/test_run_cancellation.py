@@ -72,6 +72,7 @@ from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.custom_agent import CustomAgent, TriageMessage, TriageOutput
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import StructuredOutput
+from akgentic.agent.recipients import RecipientCheckCapability
 
 AGENT_LOGGER = "akgentic.agent.agent"
 
@@ -792,12 +793,13 @@ class _AgentWithOneExtra(BaseAgent):
 
 
 class TestCapabilityWiring:
-    def test_bare_base_agent_yields_exactly_the_mailbox_capability(self) -> None:
-        """A subclass that overrides nothing gets ``[mailbox]`` and nothing else."""
+    def test_bare_base_agent_yields_exactly_the_framework_capabilities(self) -> None:
+        """A subclass overriding nothing gets ``[mailbox, recipient_check]`` and nothing else."""
         with _running_agent():
             capabilities = _InterruptibleReactAgent.captured[-1]["capabilities"]
-            assert len(capabilities) == 1
+            assert len(capabilities) == 2
             assert isinstance(capabilities[0], MailboxCapability)
+            assert isinstance(capabilities[1], RecipientCheckCapability)
 
     def test_base_agent_extra_capabilities_defaults_to_empty(self) -> None:
         """The hook is safe on a half-built agent — it reads nothing off self."""
@@ -819,7 +821,9 @@ class TestCapabilityWiring:
 
         capabilities = agent._assemble_capabilities(MailboxTool())
 
-        assert capabilities == [agent._mailbox_capability, extra]
+        assert capabilities[0] is agent._mailbox_capability
+        assert isinstance(capabilities[1], RecipientCheckCapability)
+        assert capabilities[2:] == [extra]
         assert isinstance(agent._mailbox_capability, MailboxCapability)
 
     def test_real_branch_forwards_a_copy_of_the_list_it_is_given(
@@ -1291,7 +1295,9 @@ class TestExtraCapabilityFires:
         agent._react_agent = react_agent  # type: ignore[attr-defined]
 
         # The framework assembled it, mailbox first, with the subclass's own second.
-        assert agent._capabilities == [agent._mailbox_capability, extra]
+        assert agent._capabilities[0] is agent._mailbox_capability
+        assert isinstance(agent._capabilities[1], RecipientCheckCapability)
+        assert agent._capabilities[2:] == [extra]
         assert extra.firings == 0
 
         def stub_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:

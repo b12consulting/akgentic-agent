@@ -61,8 +61,9 @@ class Request(BaseModel):
         description=(
             "The exact '@Name' of a team member, copied from the team roster "
             "(e.g. '@Developer'). A value that is not an '@Name' is treated as a role "
-            "and HIRES A NEW AGENT for that role — use it only when you intend to add a "
-            "member to the team, never to reach a teammate you already have."
+            "and HIRES A NEW AGENT for that role, if the team allows hiring it — use it "
+            "only when you intend to add a member to the team, never to reach a teammate "
+            "you already have."
         ),
     )
 

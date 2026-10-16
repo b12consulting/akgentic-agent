@@ -36,10 +36,15 @@ Supplied here:
   body, and that one call serves the normal turn, the interrupted one, and the
   turn ``akgentic-llm`` concluded after a run-tier breach: all three arrive back
   from ``act()`` as an ordinary ``TriageOutput``.
-- ``extra_capabilities`` — one pydantic-ai capability of this agent's own,
-  ``TriageAuditCapability``. The framework prepends its own, so the list the
-  ReactAgent receives is ``[mailbox, audit]``: the cancel check still runs
-  first, and this agent never returns the mailbox capability itself.
+- ``extra_capabilities`` — two pydantic-ai capabilities of this agent's own:
+  ``TriageAuditCapability``, and a ``RecipientCheckCapability`` reading
+  ``handoff_recipients``. The framework's recipient check reads
+  ``StructuredOutput`` only, so a router of its own shape brings an extractor
+  for it — a wrong handoff recipient is then sent back to the model inside the
+  run, rather than skipped by ``_route_triage``. The framework prepends its own,
+  so the list the ReactAgent receives is
+  ``[mailbox, recipient_check, audit, handoff_check]``: the cancel check still
+  runs first, and this agent never returns a framework capability itself.
 """
 
 import logging
@@ -52,6 +57,7 @@ from pydantic_ai.models import ModelRequestContext
 
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.messages import AgentMessage
+from akgentic.agent.recipients import RecipientCheckCapability
 from akgentic.agent.utils import resolve_recipient
 from akgentic.core import ActorAddress
 from akgentic.core.messages import Message
@@ -81,6 +87,24 @@ class TriageOutput(BaseModel):
     severity: Literal["low", "medium", "high"] = "low"
     summary: str = Field(default="", description="One-line assessment of the incident")
     handoffs: list[Handoff] = Field(default_factory=list)
+
+
+def handoff_recipients(output: object) -> list[str] | None:
+    """The recipients a ``TriageOutput`` hands off to; ``None`` for any other shape.
+
+    The extractor this agent's recipient check reads, the way the framework's
+    reads ``StructuredOutput``.
+
+    Args:
+        output: The validated output of a run.
+
+    Returns:
+        One recipient per handoff, or ``None`` when ``output`` is not a
+        ``TriageOutput``.
+    """
+    if isinstance(output, TriageOutput):
+        return [handoff.recipient for handoff in output.handoffs]
+    return None
 
 
 # ============================================================================
@@ -151,22 +175,30 @@ class CustomAgent(BaseAgent):
     """A BaseAgent that triages incidents against its own schema."""
 
     def extra_capabilities(self) -> list[AgentCapability[Any]]:
-        """Contribute this agent's audit capability to the ReactAgent.
+        """Contribute this agent's audit capability and its handoff check.
 
-        The framework prepends ``MailboxCapability``, so the ReactAgent is
-        handed ``[mailbox, audit]`` — cancellation stays unconditional and its
-        check still runs first. This override deliberately does not call
-        ``super()`` and does not return the mailbox capability: doing either
-        would duplicate a capability the framework already supplies.
+        The framework prepends ``MailboxCapability`` and the recipient check, so
+        the ReactAgent is handed ``[mailbox, recipient_check, audit, handoff_check]`` —
+        cancellation stays unconditional and its check still runs first. This
+        override deliberately does not call ``super()`` and does not return
+        either framework capability: doing so would duplicate one the framework
+        already supplies.
 
         Runs from ``_build_react_agent`` during ``on_start``, before
         ``self._react_agent`` exists, so it reads only ``self.config`` — which
         is assigned before ``on_start`` — and nothing built later.
 
+        The framework's recipient check reads ``StructuredOutput`` and lets a
+        ``TriageOutput`` pass, so the handoffs are checked by a second instance
+        reading :func:`handoff_recipients`.
+
         Returns:
-            One capability, appended after the framework's own.
+            Two capabilities, appended after the framework's own.
         """
-        return [TriageAuditCapability(agent_name=self.config.name)]
+        return [
+            TriageAuditCapability(agent_name=self.config.name),
+            RecipientCheckCapability(recipients=handoff_recipients),
+        ]
 
     def _route_triage(self, output: TriageOutput) -> bool:
         """Act on a TriageOutput: log the assessment, deliver the handoffs.
