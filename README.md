@@ -288,7 +288,9 @@ delegation path reasons against the **static** `StructuredOutput` type.
 `Request.recipient` is a **plain string** with no `enum` constraint. Recipient validity is
 checked **inside the run**, not in the schema: `RecipientCheckCapability`
 (`akgentic.agent.recipients`) sends an output back with `ModelRetry` while it names a
-recipient nobody answers to, with the members and the hireable roles in the retry prompt.
+recipient nobody answers to, with the members and the hireable roles in the retry prompt. The
+hireable roles are the orchestrator's agent catalog cards marked `can_be_hired`, and only an agent
+whose command registry has `hire_member` can hire at all.
 `_route_output()` then resolves what remains:
 
 | Recipient format | Resolution |

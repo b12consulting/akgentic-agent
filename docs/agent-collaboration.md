@@ -685,8 +685,9 @@ to try a different role. On the **routing** path it cannot be: `_route_output()`
 Skipping keeps the turn alive but loses the message, and the model never learns why. So
 every `BaseAgent` also validates recipients **inside** the run, before anything is routed.
 `RecipientCheckCapability` (`akgentic.agent.recipients`) hooks pydantic-ai's
-`after_output_validate`. It asks `team_directory()` — the members, and the roles TeamTool's
-`hireable_roles` command lists — about every recipient of the validated `StructuredOutput`,
+`after_output_validate`. It asks `team_directory()` — the members, and the roles of the
+orchestrator's agent catalog whose cards are `can_be_hired`, read through one
+`discover_catalog()` proxy call — about every recipient of the validated `StructuredOutput`,
 and while one is unreachable it raises `ModelRetry`. The prompt gives one line per recipient
 saying why it failed, then one instruction that depends on whether this agent can hire at all.
 For a coordinator that cannot hire:
@@ -1398,8 +1399,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
     team_directory() -> TeamDirectory
         Who a recipient can name right now: the members (tool actors excluded),
-        whether this agent can hire through routing (TeamTool registered
-        hireable_roles), and the roles that command lists — empty without it.
+        whether this agent can hire through routing (its registry has
+        hire_member), and the agent catalog's can_be_hired roles from
+        discover_catalog() — empty, and the catalog not read, without it.
         Read by the recipient check on every routed output.
 
     hire_member(role) -> ActorAddress

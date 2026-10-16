@@ -12,12 +12,13 @@ the three gets a run of its own.
 import asyncio
 import json
 import uuid
+from collections.abc import Sequence
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from akgentic.core import ActorAddress
+from akgentic.core import ActorAddress, AgentCard
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig, RuntimeConfig
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import (
@@ -218,16 +219,32 @@ def _named(name: str) -> MagicMock:
     return address
 
 
-def _make_agent(hireable: list[str] | None) -> BaseAgent:
-    """A BaseAgent without the actor system, with a team of @Manager, @Expert, @Human."""
+def _card(role: str, *, can_be_hired: bool = True) -> AgentCard:
+    return AgentCard(
+        description=f"The {role}",
+        skills=[],
+        agent_class="akgentic.agent.BaseAgent",
+        config=AgentConfig(name=f"@{role}", role=role),
+        can_be_hired=can_be_hired,
+    )
+
+
+def _make_agent(catalog: Sequence[AgentCard] = (), *, hiring: bool = True) -> BaseAgent:
+    """A BaseAgent without the actor system, with a team of @Manager, @Expert, @Human.
+
+    ``catalog`` is what the orchestrator's agent catalog returns. With ``hiring``
+    the registry has ``hire_member`` and nothing else — the shape of the released
+    akgentic-tool; without it the registry has no command at all.
+    """
     agent: BaseAgent = object.__new__(BaseAgent)
     agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
 
-    commands = {} if hireable is None else {"hireable_roles": lambda: list(hireable)}
+    commands = {"hire_member": MagicMock()} if hiring else {}
     registry = MagicMock()
     registry.has.side_effect = lambda name: name in commands
     registry.callable.side_effect = lambda name: commands[name]
     agent._command_registry = registry  # type: ignore[attr-defined]
+    agent.discover_catalog = MagicMock(return_value=list(catalog))  # type: ignore[method-assign]
     agent.team_id = uuid.uuid4()
 
     agent._context_updater = MagicMock()  # type: ignore[attr-defined]
@@ -248,18 +265,43 @@ def _make_agent(hireable: list[str] | None) -> BaseAgent:
 
 class TestTheAgentsDirectory:
     def test_it_lists_the_members_without_tool_actors(self) -> None:
-        directory = _make_agent(hireable=["Developer"]).team_directory()
+        directory = _make_agent([_card("Developer")]).team_directory()
 
         assert directory.members == ["@Manager", "@Expert", "@Human"]
         assert directory.hireable_roles == ["Developer"]
         assert directory.can_hire is True
         assert directory.self_name == "@Manager"
 
-    def test_without_the_hireable_roles_command_the_agent_cannot_hire(self) -> None:
-        directory = _make_agent(hireable=None).team_directory()
+    def test_the_hireable_roles_are_the_catalog_roles_that_can_be_hired_sorted(self) -> None:
+        catalog = [_card("Tester"), _card("Architect", can_be_hired=False), _card("Developer")]
+
+        directory = _make_agent(catalog).team_directory()
+
+        assert directory.hireable_roles == ["Developer", "Tester"]
+
+    def test_with_hire_member_alone_a_hireable_role_passes_and_another_is_sent_back(
+        self,
+    ) -> None:
+        """The released akgentic-tool registers ``hire_member`` and no role-listing command."""
+        agent = _make_agent([_card("Developer"), _card("Architect", can_be_hired=False)])
+        hireable = StructuredOutput(messages=[_request("Developer")])
+        not_hireable = StructuredOutput(messages=[_request("Architect")])
+
+        assert _check(_ctx(agent), hireable) is hireable
+        with pytest.raises(ModelRetry, match="'Architect' has no '@'.*not a role you can hire"):
+            _check(_ctx(agent), not_hireable)
+
+    def test_without_hire_member_the_agent_cannot_hire_and_the_catalog_is_not_read(
+        self,
+    ) -> None:
+        agent = _make_agent([_card("Developer")], hiring=False)
+
+        directory = agent.team_directory()
 
         assert directory.can_hire is False
         assert directory.hireable_roles == []
+        agent.discover_catalog.assert_not_called()  # type: ignore[attr-defined]
+        assert "you cannot hire in this team" in directory.correction(["Developer"])
 
 
 def _output_call(info: AgentInfo, recipient: str, call_id: str) -> ModelResponse:
@@ -288,7 +330,7 @@ class TestInARealRun:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
-        agent = _make_agent(hireable=[])
+        agent = _make_agent()
         react_agent = _react_agent()
         agent._react_agent = react_agent  # type: ignore[attr-defined]
         retry_prompts: list[str] = []
@@ -322,7 +364,7 @@ class TestInARealRun:
     ) -> None:
         """A model that never corrects itself costs that message, never the turn."""
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
-        agent = _make_agent(hireable=[])
+        agent = _make_agent()
         react_agent = _react_agent(retries=1)
         agent._react_agent = react_agent  # type: ignore[attr-defined]
         calls = 0
@@ -346,7 +388,7 @@ class TestInARealRun:
     ) -> None:
         """The text path counts the run-wide output budget, not an output tool's."""
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-        agent = _make_agent(hireable=[])
+        agent = _make_agent()
         config = ReactAgentConfig(
             model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
             runtime_cfg=RuntimeConfig(retries=1),
@@ -378,7 +420,7 @@ class TestInARealRun:
     ) -> None:
         """akgentic-llm's conclusion allows one request; a retry there would fail the turn."""
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
-        agent = _make_agent(hireable=[])
+        agent = _make_agent()
         react_agent = _react_agent()
         calls = 0
 

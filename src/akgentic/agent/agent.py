@@ -1052,19 +1052,22 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         """Who a recipient can name right now: the members and the hireable roles.
 
         Read by the recipient check on every output that names a recipient. The
-        hireable roles come from TeamTool's ``hireable_roles`` command — the same
-        list a refused hire advertises — so this agent restates none of the hire
-        guard. Without that command the agent cannot hire through routing:
-        ``can_hire`` is ``False`` and the list is empty.
+        agent can hire through routing when its registry has the ``hire_member``
+        command routing calls. The hireable roles are then the roles of the
+        orchestrator's agent catalog whose cards ``can_be_hired``, read through one
+        ``discover_catalog()`` proxy call. Without ``hire_member``, ``can_hire`` is
+        ``False``, the list is empty and the catalog is not read.
 
         Returns:
             The current :class:`~akgentic.agent.recipients.TeamDirectory`.
         """
         members = [member.name for member in self.get_team() if not member.name.startswith("#")]
-        can_hire = self._command_registry.has("hireable_roles")
+        can_hire = self._command_registry.has("hire_member")
         hireable_roles: list[str] = []
         if can_hire:
-            hireable_roles = self._command_registry.callable("hireable_roles")()
+            hireable_roles = sorted(
+                card.role for card in self.discover_catalog() if card.can_be_hired
+            )
         return TeamDirectory(
             members=members,
             hireable_roles=hireable_roles,

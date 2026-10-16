@@ -6,7 +6,8 @@ At that point a recipient nobody answers to can only be skipped. This module che
 the same thing while the run is still open, so the model is told and can correct it.
 
 - :class:`TeamDirectory` — who a recipient can name right now: the members, and the
-  roles a hire would accept. Built by ``BaseAgent.team_directory()``.
+  roles a hire would accept. Built by ``BaseAgent.team_directory()``, which reads
+  those roles from the orchestrator's agent catalog.
 - :class:`RecipientCheckCapability` — a pydantic-ai capability. On every validated
   output it asks the directory about each recipient and raises ``ModelRetry`` while
   one is unreachable. ``BaseAgent`` mounts one for ``StructuredOutput``; an agent
@@ -36,10 +37,11 @@ class TeamDirectory(BaseModel):
 
     Attributes:
         members: ``@name`` of every member, tool actors (``#``-prefixed) excluded.
-        hireable_roles: Roles ``hire_member`` would accept, as TeamTool's
-            ``hireable_roles`` command lists them. Empty when the agent cannot hire.
+        hireable_roles: Roles ``hire_member`` would accept: the roles of the
+            orchestrator's agent catalog whose cards ``can_be_hired``, sorted.
+            Empty when the agent cannot hire.
         can_hire: Whether this agent can hire through routing at all — whether
-            TeamTool registered its hire commands. Kept apart from
+            its command registry has ``hire_member``. Kept apart from
             ``hireable_roles`` so the model is told "you cannot hire" rather than
             "this role is not hireable" when the answer is the former.
         self_name: The asking agent's own name, left out when the directory is
