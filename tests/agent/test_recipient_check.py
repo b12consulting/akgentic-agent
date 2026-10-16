@@ -275,9 +275,12 @@ class TestTheAgentsDirectory:
     def test_the_hireable_roles_are_the_catalog_roles_that_can_be_hired_sorted(self) -> None:
         catalog = [_card("Tester"), _card("Architect", can_be_hired=False), _card("Developer")]
 
-        directory = _make_agent(catalog).team_directory()
+        agent = _make_agent(catalog)
+
+        directory = agent.team_directory()
 
         assert directory.hireable_roles == ["Developer", "Tester"]
+        agent.discover_catalog.assert_called_once_with()  # type: ignore[attr-defined]
 
     def test_with_hire_member_alone_a_hireable_role_passes_and_another_is_sent_back(
         self,

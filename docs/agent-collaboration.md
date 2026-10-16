@@ -250,7 +250,6 @@ what roles are available, and to hire or fire members.
 | **`GetRoleProfiles`** | `SYSTEM_PROMPT`, `COMMAND` | Injects the full agent catalog (role, description, skills) into every LLM call |
 | **`HireTeamMember`**  | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to hire new members by role                                  |
 | **`FireTeamMember`**  | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to remove members by name                                    |
-| **`HireableRoles`**   | `COMMAND`                  | Lists the roles a hire would accept; registered with `hire_member`, and only then |
 
 **Why it matters for collaboration**: The two `SYSTEM_PROMPT` capabilities
 (`GetTeamRoster` and `GetRoleProfiles`) give the LLM the information it needs to
@@ -742,7 +741,7 @@ self.notify_event(
 ```
 
 Commands are keyed by the callable's `__name__`. The canonical names are therefore
-`hire_member`, `hireable_roles`, `fire_member`, `team_members`, `team_roles`, `planning_summary`,
+`hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`,
 `get_planning_task`, `search_planning`, `compact`, `clear` — the exact set depends on which tool
 cards the agent carries. Two surfaces reach that one table:
 
