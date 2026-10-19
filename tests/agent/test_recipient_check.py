@@ -249,6 +249,8 @@ class TestTheSchemasHalf:
             base.model_copy(update={"message": "what is y?"}),
             base.model_copy(update={"message": "What is x?"}),
             base.model_copy(update={"message": "what is x? "}),
+            base.model_copy(update={"recipient": "@expert"}),
+            base.model_copy(update={"recipient": "@Expert "}),
             base.model_copy(update={"recipient": "Expert"}),
         ]
 
