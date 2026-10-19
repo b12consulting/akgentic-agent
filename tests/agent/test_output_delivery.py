@@ -284,7 +284,11 @@ class TestTheMerge:
             '{"messages": []}Done.',
             '{"messages": []}{"messages": [',
             '{"messages": []}{"other": []}',
+            '{"messages": []}{"messages": [], "summary": "kept"}',
             '{"messages": []}[]',
+            '{"messages": []}\u00a0{"messages": []}',
+            '{"messages": []}{"messages": [' + "9" * 5000 + "]}",
+            '{"messages": []}' + "[" * 100_000,
             "",
         ],
         ids=[
@@ -293,7 +297,11 @@ class TestTheMerge:
             "trailing prose",
             "truncated second object",
             "object without messages",
+            "a field beside messages",
             "not an object",
+            "not JSON whitespace between",
+            "an int past the digit limit",
+            "nesting past the recursion limit",
             "empty",
         ],
     )
@@ -458,11 +466,11 @@ def _reply(recipient: str) -> str:
 
 def _native_run(
     monkeypatch: pytest.MonkeyPatch, *, first: list[str]
-) -> tuple[StructuredOutput, list[str]]:
-    """Run once on the native text path: ``first`` as text parts, then ``@Expert`` alone.
+) -> tuple[list[str], list[str]]:
+    """Run and route once on the native text path: ``first`` as text parts, then ``@Expert``.
 
     Returns:
-        The output, and the retry prompts as the model read them.
+        The names the output was routed to, and the retry prompts as the model read them.
     """
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     agent = _make_agent()
@@ -488,10 +496,11 @@ def _native_run(
 
     try:
         with react_agent.pydantic_agent.override(model=FunctionModel(model)):
-            output = agent.act(AgentMessage(content="go"), StructuredOutput)
+            agent._route_output(agent.act(AgentMessage(content="go"), StructuredOutput))
     finally:
         react_agent.close()
-    return output, retry_prompts
+    routed = [call.args[0].name for call in agent.send.call_args_list]  # type: ignore[attr-defined]
+    return routed, retry_prompts
 
 
 class TestInARealRun:
@@ -588,22 +597,22 @@ class TestInARealRun:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """OpenAI may emit a commentary text part before the final answer; both are joined."""
-        output, retry_prompts = _native_run(
+        routed, retry_prompts = _native_run(
             monkeypatch, first=[_reply("@Expert"), _reply("@Human")]
         )
 
         assert retry_prompts == []
-        assert [r.recipient for r in output.messages] == ["@Expert", "@Human"]
+        assert routed == ["@Expert", "@Human"]
 
     def test_an_unmergeable_reply_is_told_nothing_was_sent(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        output, retry_prompts = _native_run(monkeypatch, first=[_reply("@Expert"), "Done."])
+        routed, retry_prompts = _native_run(monkeypatch, first=[_reply("@Expert"), "Done."])
 
         assert len(retry_prompts) == 1
         assert "Nothing was sent: your reply could not be read" in retry_prompts[0]
         assert "Invalid JSON" in retry_prompts[0]
-        assert [r.recipient for r in output.messages] == ["@Expert"]
+        assert routed == ["@Expert"]
 
     def test_the_tool_free_conclusion_is_never_sent_back(
         self, monkeypatch: pytest.MonkeyPatch

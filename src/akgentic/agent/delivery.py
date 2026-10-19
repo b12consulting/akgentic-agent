@@ -216,7 +216,8 @@ class OutputDeliveryCapability(AbstractCapability[Any]):
             ctx: The run context; partial (streamed) output is left alone.
             output_context: Its ``output_type`` decides whether the output is a
                 ``StructuredOutput``.
-            output: The raw text the model wrote.
+            output: The raw text the model wrote — or, on the output-tool path, the
+                tool arguments, which are merged too when they are a string.
 
         Returns:
             One JSON object holding every object's messages, in order; ``output``
@@ -267,6 +268,10 @@ def _is_structured_output(output_context: OutputContext) -> bool:
     return isinstance(output_type, type) and issubclass(output_type, StructuredOutput)
 
 
+_JSON_WHITESPACE = " \t\n\r"
+"""The only whitespace JSON allows between values; bare ``str.strip()`` takes more."""
+
+
 def merge_structured_outputs(raw: str) -> str | None:
     """One ``{"messages": [...]}`` object from several written back to back.
 
@@ -276,21 +281,28 @@ def merge_structured_outputs(raw: str) -> str | None:
     Returns:
         The merged object as JSON, messages in the order written; ``None`` when
         ``raw`` is a single object, is not entirely JSON objects, or holds an
-        object without a ``messages`` list — validation then reports it as usual.
+        object other than ``{"messages": [...]}`` — a field beside ``messages``
+        could not be merged without dropping a value. Validation then reports it
+        as usual.
     """
     decoder = json.JSONDecoder()
     objects: list[object] = []
-    index, end = 0, len(raw.rstrip())
+    index, end = 0, len(raw.rstrip(_JSON_WHITESPACE))
     while index < end:
-        index = len(raw) - len(raw[index:].lstrip())  # raw_decode rejects leading space
+        # raw_decode rejects leading space
+        index = len(raw) - len(raw[index:].lstrip(_JSON_WHITESPACE))
         try:
             value, index = decoder.raw_decode(raw, index)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # also an over-long int, or deep nesting
             return None
         objects.append(value)
     messages: list[object] = []
     for value in objects:
-        if not (isinstance(value, dict) and isinstance(value.get("messages"), list)):
+        if not (
+            isinstance(value, dict)
+            and value.keys() == {"messages"}
+            and isinstance(value["messages"], list)
+        ):
             return None
         messages.extend(value["messages"])
     return json.dumps({"messages": messages}, ensure_ascii=False) if len(objects) > 1 else None

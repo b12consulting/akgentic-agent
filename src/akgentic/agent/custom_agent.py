@@ -37,7 +37,7 @@ Supplied here:
   turn ``akgentic-llm`` concluded after a run-tier breach: all three arrive back
   from ``act()`` as an ordinary ``TriageOutput``.
 - ``extra_capabilities`` — two pydantic-ai capabilities of this agent's own:
-  ``TriageAuditCapability``, and a ``OutputDeliveryCapability`` reading
+  ``TriageAuditCapability``, and an ``OutputDeliveryCapability`` reading
   ``handoff_recipients``. The framework's recipient check reads
   ``StructuredOutput`` only, so a router of its own shape brings an extractor
   for it — a wrong handoff recipient is then sent back to the model inside the

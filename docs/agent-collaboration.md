@@ -731,10 +731,10 @@ array, and models break it in a way that is easy to miss. OpenAI's Responses API
 parts, and two valid objects become one string that does not parse.
 
 - **Merged before validation.** When the text is two or more JSON objects back to back, each
-  with a `"messages"` list, `before_output_validate` merges them into one, messages in the order
-  written. Every message the model meant to send is delivered, and no retry is spent. Anything
-  else — trailing prose, a truncated object, an object without `"messages"` — is left to
-  validation.
+  holding a `"messages"` list and nothing else, `before_output_validate` merges them into one,
+  messages in the order written. Every message the model meant to send is delivered, and no retry
+  is spent. Anything else — trailing prose, a truncated object, an object without `"messages"` or
+  with a field beside it — is left to validation.
 - **"Nothing was sent" when it still fails.** pydantic-ai's own retry names only the parse error.
   A model reads that as a format fix, keeps the messages it believes already went out, and
   resends only the rest — then tells the human it asked someone it never asked.
