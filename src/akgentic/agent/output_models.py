@@ -4,9 +4,13 @@ This module defines Pydantic models that enable agents to return structured resp
 in three distinct patterns:
 """
 
-from typing import Literal
+from collections.abc import Sequence
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+
+from akgentic.llm import MergeableOutput
+from akgentic.llm.output import error_lines
 
 # ---------------------------------------------------------------------------
 # Reply protocols
@@ -68,15 +72,36 @@ class Request(BaseModel):
     )
 
 
-class StructuredOutput(BaseModel):
+class StructuredOutput(MergeableOutput):
+    """Your whole reply for this turn: exactly one JSON object holding a "messages" array."""
+
     messages: list[Request] = Field(
         default_factory=list,
         description=(
-            "Every message you send this turn. This list is your only channel: content "
-            "that is not in a message here reaches nobody, including the human. You may "
-            "send several messages in one turn — they are dispatched in parallel. Leave "
-            "empty only when you are waiting on someone and have nothing to send. "
-            "CRITICAL: your entire reply for this turn is ONE output object. Several "
-            "messages means several entries in this list, never a second output object."
+            "All messages you send this turn, as items of this one array. This list is your only "
+            "channel: content that is not in a message here reaches nobody, including the human. "
+            "To send several messages, add several items to this array — they are dispatched in "
+            "parallel. Leave it empty only when you are waiting on someone and have nothing to "
+            'send. Your reply is exactly ONE JSON object with ONE "messages" array: never write '
+            "a second JSON object after it, and never one JSON object per message."
         ),
     )
+
+    @classmethod
+    def merge(cls, outputs: Sequence[Self]) -> Self:
+        """Every output's messages, in the order written, in one output."""
+        return cls(messages=[message for output in outputs for message in output.messages])
+
+    @classmethod
+    def unreadable_output_error(cls, error: ValidationError) -> str:
+        """Say that nothing was sent, so the model resends every message, not only the rest."""
+        lines = [
+            "Nothing was sent: your reply could not be read, so none of its messages reached "
+            "anyone."
+        ]
+        lines += error_lines(error)
+        lines.append(
+            'Resend every message of this turn as items of ONE "messages" array, in exactly ONE '
+            "JSON object."
+        )
+        return "\n".join(lines)

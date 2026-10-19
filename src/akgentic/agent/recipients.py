@@ -1,20 +1,21 @@
-"""Recipient validation inside the LLM run.
+"""The recipient check: an unreachable recipient is sent back while the run can still fix it.
 
-A recipient the model writes is resolved by ``resolve_recipient`` only after the run
-has ended: an ``@name`` must match a member, and anything else is a role to hire.
-At that point a recipient nobody answers to can only be skipped. This module checks
-the same thing while the run is still open, so the model is told and can correct it.
+A ``StructuredOutput`` is routed only after the run has ended. By then a recipient nobody
+answers to can only be skipped. This module acts while the run is still open.
 
 - :class:`TeamDirectory` — who a recipient can name right now: the members, and the
   roles a hire would accept. Built by ``BaseAgent.team_directory()``, which reads
   those roles from the orchestrator's agent catalog.
-- :class:`RecipientCheckCapability` — a pydantic-ai capability. On every validated
-  output it asks the directory about each recipient and raises ``ModelRetry`` while
-  one is unreachable. ``BaseAgent`` mounts one for ``StructuredOutput``; an agent
-  routing another shape mounts its own with a different extractor.
+- :class:`RecipientCheckCapability` — a pydantic-ai capability that, on every validated
+  output, asks the directory about each recipient and raises ``ModelRetry`` while one is
+  unreachable. ``BaseAgent`` mounts one for ``StructuredOutput``; an agent routing another
+  shape mounts its own with a different recipient extractor.
 
-The check stands down whenever the run could not honour a retry, and routing then
-skips what is still unreachable. It never fails a run that would otherwise succeed.
+A split or unreadable ``StructuredOutput`` is handled upstream, by akgentic-llm's
+``MergeableOutputCapability``, which ``StructuredOutput`` opts into.
+
+The check stands down whenever the run could not honour a retry, and routing then skips
+what is still unreachable. It never fails a run that would otherwise succeed.
 """
 
 from collections.abc import Callable
@@ -135,11 +136,10 @@ def structured_output_recipients(output: object) -> list[str] | None:
 
 @dataclass
 class RecipientCheckCapability(AbstractCapability[Any]):
-    """Send an output back, inside the run, while it names a recipient nobody answers to.
+    """Send an output back while it names a recipient nobody answers to.
 
-    Runs on ``after_output_validate``. The run's ``deps`` must be a
-    :class:`DirectorySource` — ``BaseAgent`` is one; with any other ``deps`` the
-    check does nothing.
+    The run's ``deps`` must be a :class:`DirectorySource` — ``BaseAgent`` is one; with
+    any other ``deps`` this check does nothing.
 
     Attributes:
         recipients: Reads the recipients off an output. Defaults to

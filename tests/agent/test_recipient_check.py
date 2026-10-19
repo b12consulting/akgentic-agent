@@ -1,5 +1,8 @@
 """The recipient check: an unreachable recipient is sent back inside the run.
 
+``StructuredOutput``'s half of akgentic-llm's ``MergeableOutput`` is pinned here too, with
+two real runs showing a split reply merged and an unreadable one told nothing was sent.
+
 Unit specs pin the directory, the extractor and every stand-down rule. The
 end-to-end specs drive a real pydantic-ai run graph with a scripted model, because
 what is under test — a ``ModelRetry`` from ``after_output_validate`` reaching the
@@ -20,6 +23,7 @@ from unittest.mock import MagicMock
 import pytest
 from akgentic.core import ActorAddress, AgentCard
 from akgentic.llm import ModelConfig, ReactAgent, ReactAgentConfig, RuntimeConfig
+from pydantic import ValidationError
 from pydantic_ai import ModelRetry
 from pydantic_ai.messages import (
     ModelMessage,
@@ -205,6 +209,43 @@ class TestTheCheck:
         assert _check(_ctx(_Source(_directory()), **ctx_kwargs), output) is output
 
 
+def _parse_error(raw: str = '{"messages": []}Done.') -> ValidationError:
+    with pytest.raises(ValidationError) as raised:
+        StructuredOutput.model_validate_json(raw)
+    return raised.value
+
+
+class TestTheSchemasHalf:
+    """What ``StructuredOutput`` hands akgentic-llm's ``MergeableOutputCapability``."""
+
+    def test_a_merge_keeps_every_message_in_the_order_written(self) -> None:
+        first = StructuredOutput(messages=[_request("@Expert")])
+        second = StructuredOutput(messages=[_request("@Human"), _request("@Manager")])
+
+        merged = StructuredOutput.merge([first, second])
+
+        assert [request.recipient for request in merged.messages] == [
+            "@Expert",
+            "@Human",
+            "@Manager",
+        ]
+
+    def test_the_retry_says_nothing_was_sent_and_names_the_parse_error(self) -> None:
+        lines = StructuredOutput.unreadable_output_error(_parse_error()).splitlines()
+
+        assert lines[0].startswith("Nothing was sent:")
+        assert lines[1].startswith("- Invalid JSON: trailing characters")
+        assert lines[2].startswith('Resend every message of this turn as items of ONE "messages"')
+
+    def test_a_field_error_is_located(self) -> None:
+        text = StructuredOutput.unreadable_output_error(
+            _parse_error('{"messages": [{"message": "hi"}]}')
+        )
+
+        assert "- messages.0.recipient: Field required" in text
+        assert '{"message": "hi"}' not in text  # the raw output is already in context
+
+
 class TestCanRetry:
     def test_a_fresh_run_can_retry(self) -> None:
         assert can_retry(_ctx(None))
@@ -328,6 +369,50 @@ def _react_agent(retries: int = 3) -> ReactAgent:
     return ReactAgent(config=config, deps_type=BaseAgent, capabilities=[RecipientCheckCapability()])
 
 
+def _reply(recipient: str) -> str:
+    request = {"message_type": "request", "message": "hi", "recipient": recipient}
+    return json.dumps({"messages": [request]})
+
+
+def _native_run(
+    monkeypatch: pytest.MonkeyPatch, *, first: list[str]
+) -> tuple[list[str], list[str]]:
+    """Run and route once on the native text path: ``first`` as text parts, then ``@Expert``.
+
+    Returns:
+        The names the output was routed to, and the retry prompts as the model read them.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    agent = _make_agent()
+    config = ReactAgentConfig(
+        model_cfg=ModelConfig(provider="openai", model="gpt-4o"),
+        runtime_cfg=RuntimeConfig(retries=3),
+    )
+    react_agent = ReactAgent(
+        config=config, deps_type=BaseAgent, capabilities=[RecipientCheckCapability()]
+    )
+    agent._react_agent = react_agent  # type: ignore[attr-defined]
+    retry_prompts: list[str] = []
+
+    def model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        retry_prompts.extend(
+            part.model_response()
+            for message in messages
+            for part in message.parts
+            if isinstance(part, RetryPromptPart)
+        )
+        texts = first if not retry_prompts else [_reply("@Expert")]
+        return ModelResponse(parts=[TextPart(content=text) for text in texts])
+
+    try:
+        with react_agent.pydantic_agent.override(model=FunctionModel(model)):
+            agent._route_output(agent.act(AgentMessage(content="go"), StructuredOutput))
+    finally:
+        react_agent.close()
+    routed = [call.args[0].name for call in agent.send.call_args_list]  # type: ignore[attr-defined]
+    return routed, retry_prompts
+
+
 class TestInARealRun:
     def test_the_model_is_told_and_its_correction_is_routed(
         self, monkeypatch: pytest.MonkeyPatch
@@ -417,6 +502,27 @@ class TestInARealRun:
 
         assert calls == 2  # the first answer, and one retry
         assert [r.recipient for r in output.messages] == ["X"]
+
+    def test_a_reply_split_in_two_json_objects_is_merged_without_a_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OpenAI may emit a commentary text part before the final answer; both are joined."""
+        routed, retry_prompts = _native_run(
+            monkeypatch, first=[_reply("@Expert"), _reply("@Human")]
+        )
+
+        assert retry_prompts == []
+        assert routed == ["@Expert", "@Human"]
+
+    def test_an_unmergeable_reply_is_told_nothing_was_sent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        routed, retry_prompts = _native_run(monkeypatch, first=[_reply("@Expert"), "Done."])
+
+        assert len(retry_prompts) == 1
+        assert "Nothing was sent: your reply could not be read" in retry_prompts[0]
+        assert "Invalid JSON" in retry_prompts[0]
+        assert routed == ["@Expert"]
 
     def test_the_tool_free_conclusion_is_never_sent_back(
         self, monkeypatch: pytest.MonkeyPatch

@@ -290,7 +290,10 @@ checked **inside the run**, not in the schema: `RecipientCheckCapability`
 (`akgentic.agent.recipients`) sends an output back with `ModelRetry` while it names a
 recipient nobody answers to, with the members and the hireable roles in the retry prompt. The
 hireable roles are the orchestrator's agent catalog cards marked `can_be_hired`, and only an agent
-whose command registry has `hire_member` can hire at all.
+whose command registry has `hire_member` can hire at all. `StructuredOutput` is an
+akgentic-llm `MergeableOutput`: an output the model wrote as several objects back to back is merged
+into one (`StructuredOutput.merge`), and when an output still cannot be read, its retry says
+*Nothing was sent* (`StructuredOutput.unreadable_output_error`) so the model resends every message.
 `_route_output()` then resolves what remains:
 
 | Recipient format | Resolution |
@@ -373,7 +376,7 @@ from the module that defines the base class. What each needs from an agent is st
 |---|---|
 | `usage_limits.py` | `AgentLike`, `guard_usage_limits`, `escalate_usage_limit` |
 | `utils.py` | `TeamResolver`, `resolve_recipient` — the team addressing convention (`@member` vs role to hire) |
-| `recipients.py` | `TeamDirectory`, `RecipientCheckCapability` — the same convention checked inside the run, with an extractor for your own output shape |
+| `recipients.py` | `TeamDirectory`, `RecipientCheckCapability` — the recipient convention checked inside the run, with an extractor for your own output shape |
 
 So the subclass is only its own work:
 

@@ -37,10 +37,11 @@ Architecture:
   capability is built unconditionally, so it must work on an agent configured
   without MailboxTool
 - Recipient check: RecipientCheckCapability, from akgentic.agent.recipients,
-  sends a StructuredOutput back with ModelRetry while it names a recipient
-  nobody answers to — an @name that is not a member, or a role the team cannot
-  hire — so the model corrects it before the run ends. It stands down when the
-  run could not honour a retry, and routing then skips what is unreachable
+  sends a StructuredOutput back with ModelRetry while it names a recipient nobody
+  answers to — an @name that is not a member, or a role the team cannot hire —
+  so the model corrects it before the run ends. The recipient check stands down
+  when the run could not honour a retry, and routing then skips what is
+  unreachable
 - Custom capabilities: extra_capabilities() is the subclass override. The
   framework prepends its own capabilities, so self._capabilities is always
   [mailbox, recipient_check, *extra_capabilities()] and neither cancellation
@@ -118,8 +119,8 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       ReactAgent via capabilities= — the cancel check and the mid-run arrival
       notice before every model request. act() resets its run-local tracking.
     - RecipientCheckCapability: built unconditionally in _assemble_capabilities,
-      second, and validates StructuredOutput recipients inside the run against
-      team_directory().
+      second. Validates recipients inside the run against team_directory(). A
+      split or unreadable StructuredOutput is akgentic-llm's MergeableOutput's job.
     - extra_capabilities(): the subclass override for pydantic-ai capabilities
       of your own. The framework prepends its own, so the list handed to the
       ReactAgent is always [mailbox, recipient_check, *extra_capabilities()].
@@ -369,11 +370,11 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
           first pay for a third party's ``before_model_request``.
 
         The recipient check is prepended for the same first reason: a subclass
-        cannot lose it by forgetting ``super()``. ``after_*`` hooks run in reverse
-        registration order, so it sees the output after every capability returned
-        here has had its say. It reads ``StructuredOutput`` only; a subclass that
-        routes a shape of its own returns a second
-        ``RecipientCheckCapability(recipients=...)`` from this hook.
+        cannot lose it by forgetting ``super()``. ``after_*`` hooks run in reverse,
+        so it sees the output after every one of them has had its say. It reads
+        ``StructuredOutput`` only; a subclass that routes a shape of its own
+        returns a second ``RecipientCheckCapability(recipients=...)`` from this
+        hook.
 
         Called from ``on_start``, before ``self._react_agent`` exists.
         ``self.config`` is assigned before ``on_start`` and is safe to read; an
@@ -415,9 +416,9 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
             ``[mailbox, recipient_check, *extra_capabilities()]``. Mailbox first
             because hook order is registration order, so a run about to be
             cancelled does not first pay for a third party's
-            ``before_model_request``. The recipient check next: its only hook is
-            ``after_output_validate``, which runs in reverse order, so it validates
-            the output every subclass capability has already seen.
+            ``before_model_request``. The recipient check next: its
+            ``after_output_validate`` runs in reverse order, so it validates the
+            output every subclass capability has seen.
         """
         self._mailbox_capability = MailboxCapability(observer=self, card=mailbox_card)
         return [self._mailbox_capability, RecipientCheckCapability(), *self.extra_capabilities()]
