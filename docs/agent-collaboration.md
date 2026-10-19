@@ -726,10 +726,11 @@ reads its recipients — see `CustomAgent`.
 
 The step before — turning the model's text into a `StructuredOutput` at all — is guarded by
 akgentic-llm's `MergeableOutputCapability`, which every `ReactAgent` mounts and which
-`StructuredOutput` opts into by subclassing `MergeableOutput`. Its contract is **one** JSON object holding **one** `"messages"`
-array, and models break it in a way that is easy to miss. OpenAI's Responses API may send a
-`commentary` text part ahead of the `final_answer`, each a valid object; pydantic-ai joins the
-parts, and two valid objects become one string that does not parse.
+`StructuredOutput` opts into by subclassing `MergeableOutput`. Its contract is **one** JSON
+object holding **one** `"messages"` array, and models break it in a way that is easy to miss.
+OpenAI's Responses API may send a `commentary` text part ahead of the `final_answer`, each a
+valid object; pydantic-ai joins the parts, and two valid objects become one string that does not
+parse.
 
 - **Merged before validation.** When the text is two or more JSON objects back to back, each a
   valid `StructuredOutput`, they are merged through `StructuredOutput.merge`, messages in the
@@ -748,7 +749,8 @@ Nothing was sent: your reply could not be read, so none of its messages reached 
 Resend every message of this turn as items of ONE "messages" array, in exactly ONE JSON object.
 ```
 
-Other output types keep pydantic-ai's retry unchanged.
+An output type that is not a `MergeableOutput` keeps pydantic-ai's retry unchanged; one that is
+but does not override `unreadable_output_error` gets akgentic-llm's generic wording.
 
 ### 4. The Command Registry
 

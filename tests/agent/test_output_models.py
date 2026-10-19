@@ -7,7 +7,7 @@ Covers REPLY_PROTOCOLS wording/order, Request.message_type, the plain-string
 from unittest.mock import MagicMock
 
 from akgentic.core import ActorAddress
-from pydantic import ValidationError
+from pydantic import ValidationError, create_model
 
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import (
@@ -209,3 +209,13 @@ class TestStructuredOutputModel:
         output = StructuredOutput(messages=[req])
         assert len(output.messages) == 1
         assert output.messages[0].message_type == "instruction"
+
+    def test_the_mergeable_base_adds_nothing_to_the_schema_the_model_reads(self) -> None:
+        """``MergeableOutput`` is behaviour only: the schema is the one a plain model has."""
+        plain = create_model(
+            "StructuredOutput",
+            __doc__=StructuredOutput.__doc__,
+            messages=(list[Request], StructuredOutput.model_fields["messages"]),
+        )
+
+        assert StructuredOutput.model_json_schema() == plain.model_json_schema()
