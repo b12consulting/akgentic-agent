@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-agent"
-version = "1.7.1"
+version = "1.8.0"
 description = "Collaborative agent patterns for the Akgentic framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -33,8 +33,8 @@ dependencies = [
     # needs the httpx2 transport, and this package does not.
     "pydantic-ai-slim>=2,<3",
     "akgentic-core>=1.5.15",
-    "akgentic-llm>=2.3.0",
-    "akgentic-tool>=1.10.0",
+    "akgentic-llm>=2.5.0",
+    "akgentic-tool>=1.11.0",
 ]
 
 [project.optional-dependencies]
