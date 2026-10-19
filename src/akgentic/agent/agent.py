@@ -36,15 +36,19 @@ Architecture:
   survives. The agent owns both the cancel vocabulary and its enforcement: the
   capability is built unconditionally, so it must work on an agent configured
   without MailboxTool
-- Recipient check: RecipientCheckCapability, from akgentic.agent.recipients,
-  sends a StructuredOutput back with ModelRetry while it names a recipient
-  nobody answers to — an @name that is not a member, or a role the team cannot
-  hire — so the model corrects it before the run ends. It stands down when the
-  run could not honour a retry, and routing then skips what is unreachable
+- Output delivery: OutputDeliveryCapability, from akgentic.agent.delivery,
+  makes what the model meant to send what gets sent. It merges a
+  StructuredOutput written as several JSON objects into one, tells the model
+  "Nothing was sent" when its output still cannot be read, and sends a
+  StructuredOutput back with ModelRetry while it names a recipient nobody
+  answers to — an @name that is not a member, or a role the team cannot hire —
+  so the model corrects it before the run ends. The recipient check stands down
+  when the run could not honour a retry, and routing then skips what is
+  unreachable
 - Custom capabilities: extra_capabilities() is the subclass override. The
   framework prepends its own capabilities, so self._capabilities is always
-  [mailbox, recipient_check, *extra_capabilities()] and neither cancellation
-  nor the recipient check can be de-configured
+  [mailbox, output_delivery, *extra_capabilities()] and neither cancellation
+  nor output delivery can be de-configured
 - The usage-limit policy is applied, not written here, and not by any handler:
   @guard_usage_limits() from usage_limits.py sits on act() and compact() — the
   two methods that reach the model — so a subclass gets it by calling act()
@@ -65,7 +69,7 @@ from pydantic_ai import AgentCapability, BinaryContent, ModelRetry, RunContext
 from akgentic.agent.config import AgentConfig, AgentState
 from akgentic.agent.messages import AgentMessage, LlmRenderable
 from akgentic.agent.output_models import StructuredOutput
-from akgentic.agent.recipients import RecipientCheckCapability, TeamDirectory
+from akgentic.agent.delivery import OutputDeliveryCapability, TeamDirectory
 from akgentic.agent.usage_limits import guard_usage_limits
 from akgentic.agent.utils import resolve_recipient
 from akgentic.core import ActorAddress, Akgent, Orchestrator
@@ -117,12 +121,12 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
       card involvement, no MailboxTool presence check) and handed to the
       ReactAgent via capabilities= — the cancel check and the mid-run arrival
       notice before every model request. act() resets its run-local tracking.
-    - RecipientCheckCapability: built unconditionally in _assemble_capabilities,
-      second, and validates StructuredOutput recipients inside the run against
-      team_directory().
+    - OutputDeliveryCapability: built unconditionally in _assemble_capabilities,
+      second. Merges a split StructuredOutput, rewrites a parse-failure retry,
+      and validates recipients inside the run against team_directory().
     - extra_capabilities(): the subclass override for pydantic-ai capabilities
       of your own. The framework prepends its own, so the list handed to the
-      ReactAgent is always [mailbox, recipient_check, *extra_capabilities()].
+      ReactAgent is always [mailbox, output_delivery, *extra_capabilities()].
 
     Observer Protocol:
     - Implements TeamManagementToolObserver (structural typing via @runtime_checkable)
@@ -356,7 +360,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Returns an empty list here. A subclass returning capabilities gets them
         appended to the framework's, in the order returned, at both build sites:
-        ``self._capabilities = [mailbox, recipient_check, *self.extra_capabilities()]``.
+        ``self._capabilities = [mailbox, output_delivery, *self.extra_capabilities()]``.
 
         **Never return the mailbox capability from this hook.** The framework
         prepends it, for two reasons that are the whole point of the split:
@@ -368,12 +372,14 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
           is registration order, so a run that is about to be cancelled does not
           first pay for a third party's ``before_model_request``.
 
-        The recipient check is prepended for the same first reason: a subclass
-        cannot lose it by forgetting ``super()``. ``after_*`` hooks run in reverse
-        registration order, so it sees the output after every capability returned
-        here has had its say. It reads ``StructuredOutput`` only; a subclass that
-        routes a shape of its own returns a second
-        ``RecipientCheckCapability(recipients=...)`` from this hook.
+        Output delivery is prepended for the same first reason: a subclass
+        cannot lose it by forgetting ``super()``. ``before_*`` hooks run in
+        registration order, so every capability returned here sees a split output
+        already merged; ``after_*`` hooks run in reverse, so the recipient check
+        sees the output after every one of them has had its say. It reads
+        ``StructuredOutput`` only; a subclass that routes a shape of its own
+        returns a second ``OutputDeliveryCapability(recipients=...)`` from this
+        hook.
 
         Called from ``on_start``, before ``self._react_agent`` exists.
         ``self.config`` is assigned before ``on_start`` and is safe to read; an
@@ -412,15 +418,16 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 or the auto-inserted default.
 
         Returns:
-            ``[mailbox, recipient_check, *extra_capabilities()]``. Mailbox first
+            ``[mailbox, output_delivery, *extra_capabilities()]``. Mailbox first
             because hook order is registration order, so a run about to be
             cancelled does not first pay for a third party's
-            ``before_model_request``. The recipient check next: its only hook is
-            ``after_output_validate``, which runs in reverse order, so it validates
-            the output every subclass capability has already seen.
+            ``before_model_request``. Output delivery next: its
+            ``before_output_validate`` merge runs ahead of every subclass
+            capability, and its ``after_output_validate`` recipient check, which
+            runs in reverse order, validates the output they have all seen.
         """
         self._mailbox_capability = MailboxCapability(observer=self, card=mailbox_card)
-        return [self._mailbox_capability, RecipientCheckCapability(), *self.extra_capabilities()]
+        return [self._mailbox_capability, OutputDeliveryCapability(), *self.extra_capabilities()]
 
     def _build_react_agent(
         self,
@@ -437,7 +444,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         extra off the normal runtime path.
 
         Both branches receive the same ``capabilities`` list, assembled by
-        ``on_start`` as ``[mailbox, recipient_check, *extra_capabilities()]``. It arrives as an
+        ``on_start`` as ``[mailbox, output_delivery, *extra_capabilities()]``. It arrives as an
         argument rather than being built here so this method only *builds*: the
         mailbox capability needs the tool-card list to read its whitelist from,
         and that list is on_start's, not this method's. The framework's own
@@ -456,7 +463,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         Args:
             config: The ReactAgent configuration to build against.
-            capabilities: ``[mailbox, recipient_check, *extra_capabilities()]``, in hook
+            capabilities: ``[mailbox, output_delivery, *extra_capabilities()]``, in hook
                 order.
             tools: Plain tool callables from the ToolFactory.
             toolsets: Toolsets from the ToolFactory.
@@ -1059,7 +1066,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         ``False``, the list is empty and the catalog is not read.
 
         Returns:
-            The current :class:`~akgentic.agent.recipients.TeamDirectory`.
+            The current :class:`~akgentic.agent.delivery.TeamDirectory`.
         """
         members = [member.name for member in self.get_team() if not member.name.startswith("#")]
         can_hire = self._command_registry.has("hire_member")

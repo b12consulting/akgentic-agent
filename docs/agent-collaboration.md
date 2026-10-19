@@ -683,7 +683,7 @@ to try a different role. On the **routing** path it cannot be: `_route_output()`
 
 Skipping keeps the turn alive but loses the message, and the model never learns why. So
 every `BaseAgent` also validates recipients **inside** the run, before anything is routed.
-`RecipientCheckCapability` (`akgentic.agent.recipients`) hooks pydantic-ai's
+`OutputDeliveryCapability` (`akgentic.agent.delivery`) hooks pydantic-ai's
 `after_output_validate`. It asks `team_directory()` — the members, and the roles of the
 orchestrator's agent catalog whose cards are `can_be_hired`, read through one
 `discover_catalog()` proxy call — about every recipient of the validated `StructuredOutput`,
@@ -719,8 +719,34 @@ still unreachable:
 | the output is partial (streaming) | the answer is not finished yet |
 
 It reads `StructuredOutput` only. An agent routing a shape of its own returns a second
-`RecipientCheckCapability(recipients=...)` from `extra_capabilities()`, with an extractor that
+`OutputDeliveryCapability(recipients=...)` from `extra_capabilities()`, with an extractor that
 reads its recipients — see `CustomAgent`.
+
+#### An output written twice, or one that cannot be read
+
+The same capability guards the step before: turning the model's text into a
+`StructuredOutput` at all. Its contract is **one** JSON object holding **one** `"messages"`
+array, and models break it in a way that is easy to miss. OpenAI's Responses API may send a
+`commentary` text part ahead of the `final_answer`, each a valid object; pydantic-ai joins the
+parts, and two valid objects become one string that does not parse.
+
+- **Merged before validation.** When the text is two or more JSON objects back to back, each
+  with a `"messages"` list, `before_output_validate` merges them into one, messages in the order
+  written. Every message the model meant to send is delivered, and no retry is spent. Anything
+  else — trailing prose, a truncated object, an object without `"messages"` — is left to
+  validation.
+- **"Nothing was sent" when it still fails.** pydantic-ai's own retry names only the parse error.
+  A model reads that as a format fix, keeps the messages it believes already went out, and
+  resends only the rest — then tells the human it asked someone it never asked.
+  `on_output_validate_error` replaces it for a `StructuredOutput`:
+
+```
+Nothing was sent: your reply could not be read, so none of its messages reached anyone.
+- Invalid JSON: trailing characters at line 1 column 216
+Resend every message of this turn as items of ONE "messages" array, in exactly ONE JSON object.
+```
+
+Other output types keep pydantic-ai's retry unchanged.
 
 ### 4. The Command Registry
 
@@ -901,7 +927,7 @@ What the subclass gets, and what it must supply:
 | | |
 |---|---|
 | **Reused unchanged** | `act(message, output_type)` — renders the message you hand it and forwards the type you name to the REACT loop, so a custom output model needs no plumbing; absorbs `RunInterruptedError` itself (notify the human once, return a default `output_type()`); and carries `@guard_usage_limits()`, so the usage-limit policy arrives with the call rather than being declared. `MailboxCapability` — built unconditionally, so every subclass gets all of its duties without asking: the run is interruptible, the recognised cancel is purged from the mailbox at recognition, and mid-run arrivals are announced to the model once; `notify_human`, `send`, `get_team_member`, `hire_member` — no schema in their signatures |
-| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability` and the recipient check, so the list is always `[mailbox, recipient_check, *yours]` and the cancel check keeps running first |
+| **Supplied here** | the output model, the message type and its handler, and the router that delivers the output; optionally `extra_capabilities()`, returning pydantic-ai capabilities of your own — the framework prepends `MailboxCapability` and `OutputDeliveryCapability`, so the list is always `[mailbox, output_delivery, *yours]` and the cancel check keeps running first |
 
 A run-tier breach in `CustomAgent` still concludes in **`TriageOutput`** and is still delivered
 by **`_route_triage`**, with `CustomAgent` overriding *and declaring* nothing — because

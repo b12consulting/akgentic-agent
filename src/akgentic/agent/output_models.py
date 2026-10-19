@@ -69,14 +69,16 @@ class Request(BaseModel):
 
 
 class StructuredOutput(BaseModel):
+    """Your whole reply for this turn: exactly one JSON object holding a "messages" array."""
+
     messages: list[Request] = Field(
         default_factory=list,
         description=(
-            "Every message you send this turn. This list is your only channel: content "
-            "that is not in a message here reaches nobody, including the human. You may "
-            "send several messages in one turn — they are dispatched in parallel. Leave "
-            "empty only when you are waiting on someone and have nothing to send. "
-            "CRITICAL: your entire reply for this turn is ONE output object. Several "
-            "messages means several entries in this list, never a second output object."
+            "All messages you send this turn, as items of this one array. This list is your only "
+            "channel: content that is not in a message here reaches nobody, including the human. "
+            "To send several messages, add several items to this array — they are dispatched in "
+            "parallel. Leave it empty only when you are waiting on someone and have nothing to "
+            'send. Your reply is exactly ONE JSON object with ONE "messages" array: never write '
+            "a second JSON object after it, and never one JSON object per message."
         ),
     )

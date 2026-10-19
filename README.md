@@ -286,11 +286,13 @@ output = self._react_agent.run_sync(prompt, deps=self, output_type=output_type)
 delegation path reasons against the **static** `StructuredOutput` type.
 
 `Request.recipient` is a **plain string** with no `enum` constraint. Recipient validity is
-checked **inside the run**, not in the schema: `RecipientCheckCapability`
-(`akgentic.agent.recipients`) sends an output back with `ModelRetry` while it names a
+checked **inside the run**, not in the schema: `OutputDeliveryCapability`
+(`akgentic.agent.delivery`) sends an output back with `ModelRetry` while it names a
 recipient nobody answers to, with the members and the hireable roles in the retry prompt. The
 hireable roles are the orchestrator's agent catalog cards marked `can_be_hired`, and only an agent
-whose command registry has `hire_member` can hire at all.
+whose command registry has `hire_member` can hire at all. The same capability merges an output
+the model wrote as several `{"messages": [...]}` objects back to back into one, and when an output
+still cannot be read, its retry says *Nothing was sent* so the model resends every message.
 `_route_output()` then resolves what remains:
 
 | Recipient format | Resolution |
@@ -373,7 +375,7 @@ from the module that defines the base class. What each needs from an agent is st
 |---|---|
 | `usage_limits.py` | `AgentLike`, `guard_usage_limits`, `escalate_usage_limit` |
 | `utils.py` | `TeamResolver`, `resolve_recipient` — the team addressing convention (`@member` vs role to hire) |
-| `recipients.py` | `TeamDirectory`, `RecipientCheckCapability` — the same convention checked inside the run, with an extractor for your own output shape |
+| `delivery.py` | `TeamDirectory`, `OutputDeliveryCapability` — what the model meant to send is what gets sent: a split output merged, an unreadable one told *Nothing was sent*, and the recipient convention checked inside the run, with an extractor for your own output shape |
 
 So the subclass is only its own work:
 
@@ -430,7 +432,7 @@ def handoff_recipients(output: object) -> list[str] | None:
 
 class CustomAgent(BaseAgent):
     def extra_capabilities(self) -> list[AgentCapability[Any]]:
-        return [RecipientCheckCapability(recipients=handoff_recipients)]
+        return [OutputDeliveryCapability(recipients=handoff_recipients)]
 ```
 
 **Known gap.** A conclusion that hands off to nobody is silent: an ordinary success that routes

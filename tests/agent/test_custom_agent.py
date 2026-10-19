@@ -39,8 +39,8 @@ from akgentic.agent.custom_agent import (
     TriageOutput,
     handoff_recipients,
 )
+from akgentic.agent.delivery import OutputDeliveryCapability, TeamDirectory
 from akgentic.agent.messages import AgentMessage
-from akgentic.agent.recipients import RecipientCheckCapability, TeamDirectory
 
 REQUESTER = "@Ops"
 
@@ -350,7 +350,7 @@ class TestCustomAgentHandoffCheck:
         audit, check = _make_custom_agent().extra_capabilities()
 
         assert isinstance(audit, TriageAuditCapability)
-        assert isinstance(check, RecipientCheckCapability)
+        assert isinstance(check, OutputDeliveryCapability)
         assert check.recipients is handoff_recipients
 
     def test_a_handoff_nobody_answers_to_is_sent_back(self) -> None:
