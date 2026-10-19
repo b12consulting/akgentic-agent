@@ -54,9 +54,9 @@ from pydantic_ai.models import ModelRequestContext
 import akgentic.agent.agent as agent_module
 from akgentic.agent.agent import BaseAgent, MailboxCapability
 from akgentic.agent.config import AgentConfig, AgentState
-from akgentic.agent.delivery import OutputDeliveryCapability
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import REPLY_PROTOCOLS, Request, StructuredOutput
+from akgentic.agent.recipients import RecipientCheckCapability
 
 # =============================================================================
 # HELPERS
@@ -857,7 +857,7 @@ class AuditedAgent(BaseAgent):
 
 
 class TestExtraCapabilitiesSnippet:
-    """Both documents claim the list is `[mailbox, output_delivery, *extra_capabilities()]`.
+    """Both documents claim the list is `[mailbox, recipient_check, *extra_capabilities()]`.
 
     The snippet is only honest if a subclass overriding nothing else really gets
     its capability into the ReactAgent, in that order, without touching
@@ -899,7 +899,7 @@ class TestExtraCapabilitiesSnippet:
         assert len(capabilities) == 3
         assert capabilities[0] is agent._mailbox_capability
         assert isinstance(capabilities[0], MailboxCapability)
-        assert isinstance(capabilities[1], OutputDeliveryCapability)
+        assert isinstance(capabilities[1], RecipientCheckCapability)
         assert isinstance(capabilities[2], AuditCapability)
         # Documented: an override may read self.config.
         assert capabilities[2].agent_name == "@Audited"
@@ -915,7 +915,7 @@ class TestExtraCapabilitiesSnippet:
 
         assert len(capabilities) == 2
         assert capabilities[0] is agent._mailbox_capability
-        assert isinstance(capabilities[1], OutputDeliveryCapability)
+        assert isinstance(capabilities[1], RecipientCheckCapability)
 
 
 # =============================================================================

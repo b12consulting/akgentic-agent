@@ -1,5 +1,7 @@
-"""Output delivery: a split output is merged, an unreadable one is told nothing was sent,
-and an unreachable recipient is sent back inside the run.
+"""The recipient check: an unreachable recipient is sent back inside the run.
+
+``StructuredOutput``'s half of akgentic-llm's ``MergeableOutput`` is pinned here too, with
+two real runs showing a split reply merged and an unreadable one told nothing was sent.
 
 Unit specs pin the directory, the extractor and every stand-down rule. The
 end-to-end specs drive a real pydantic-ai run graph with a scripted model, because
@@ -35,16 +37,14 @@ from pydantic_ai.usage import UsageLimits
 
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig, AgentState
-from akgentic.agent.delivery import (
-    OutputDeliveryCapability,
-    TeamDirectory,
-    can_retry,
-    merge_structured_outputs,
-    structured_output_recipients,
-    unreadable_correction,
-)
 from akgentic.agent.messages import AgentMessage
 from akgentic.agent.output_models import Request, StructuredOutput
+from akgentic.agent.recipients import (
+    RecipientCheckCapability,
+    TeamDirectory,
+    can_retry,
+    structured_output_recipients,
+)
 
 
 def _request(recipient: str) -> Request:
@@ -79,8 +79,8 @@ def _ctx(
     )
 
 
-def _check(ctx: Any, output: object, capability: OutputDeliveryCapability | None = None) -> Any:
-    check = capability or OutputDeliveryCapability()
+def _check(ctx: Any, output: object, capability: RecipientCheckCapability | None = None) -> Any:
+    check = capability or RecipientCheckCapability()
     return asyncio.run(check.after_output_validate(ctx, output_context=MagicMock(), output=output))
 
 
@@ -187,7 +187,7 @@ class TestTheCheck:
         assert _check(_ctx(object()), output) is output
 
     def test_a_custom_extractor_reads_its_own_shape(self) -> None:
-        check = OutputDeliveryCapability(recipients=lambda out: [out["to"]])
+        check = RecipientCheckCapability(recipients=lambda out: [out["to"]])
 
         with pytest.raises(ModelRetry):
             _check(_ctx(_Source(_directory())), {"to": "Expert"}, check)
@@ -209,131 +209,41 @@ class TestTheCheck:
         assert _check(_ctx(_Source(_directory()), **ctx_kwargs), output) is output
 
 
-def _parse_error(raw: str = '{"messages": []}{"messages": []}') -> ValidationError:
-    try:
+def _parse_error(raw: str = '{"messages": []}Done.') -> ValidationError:
+    with pytest.raises(ValidationError) as raised:
         StructuredOutput.model_validate_json(raw)
-    except ValidationError as error:
-        return error
-    raise AssertionError("expected a parse failure")
+    return raised.value
 
 
-def _on_error(output_type: object, error: ValidationError | ModelRetry) -> None:
-    output_context = MagicMock(output_type=output_type)
-    asyncio.run(
-        OutputDeliveryCapability().on_output_validate_error(
-            _ctx(None), output_context=output_context, output="raw", error=error
-        )
-    )
+class TestTheSchemasHalf:
+    """What ``StructuredOutput`` hands akgentic-llm's ``MergeableOutputCapability``."""
 
+    def test_a_merge_keeps_every_message_in_the_order_written(self) -> None:
+        first = StructuredOutput(messages=[_request("@Expert")])
+        second = StructuredOutput(messages=[_request("@Human"), _request("@Manager")])
 
-class TestAnUnreadableOutput:
+        merged = StructuredOutput.merge([first, second])
+
+        assert [request.recipient for request in merged.messages] == [
+            "@Expert",
+            "@Human",
+            "@Manager",
+        ]
+
     def test_the_retry_says_nothing_was_sent_and_names_the_parse_error(self) -> None:
-        with pytest.raises(ModelRetry) as raised:
-            _on_error(StructuredOutput, _parse_error())
+        lines = StructuredOutput.unreadable_output_error(_parse_error()).splitlines()
 
-        lines = raised.value.message.splitlines()
         assert lines[0].startswith("Nothing was sent:")
         assert lines[1].startswith("- Invalid JSON: trailing characters")
         assert lines[2].startswith('Resend every message of this turn as items of ONE "messages"')
 
     def test_a_field_error_is_located(self) -> None:
-        error = _parse_error('{"messages": [{"message": "hi"}]}')
-
-        text = unreadable_correction(error)
+        text = StructuredOutput.unreadable_output_error(
+            _parse_error('{"messages": [{"message": "hi"}]}')
+        )
 
         assert "- messages.0.recipient: Field required" in text
         assert '{"message": "hi"}' not in text  # the raw output is already in context
-
-    def test_another_output_type_keeps_pydantic_ais_retry(self) -> None:
-        error = _parse_error()
-
-        with pytest.raises(ValidationError) as raised:
-            _on_error(str, error)
-
-        assert raised.value is error
-
-    def test_a_model_retry_passes_through_unchanged(self) -> None:
-        """A second mounted instance must not wrap the first one's rewrite."""
-        retry = ModelRetry("Nothing was sent: already rewritten")
-
-        with pytest.raises(ModelRetry) as raised:
-            _on_error(StructuredOutput, retry)
-
-        assert raised.value is retry
-
-
-class TestTheMerge:
-    def test_objects_back_to_back_merge_in_order(self) -> None:
-        raw = '{"messages": [{"n": 1}]}\n {"messages": [{"n": 2}, {"n": 3}]}'
-
-        merged = merge_structured_outputs(raw)
-
-        assert merged is not None
-        assert json.loads(merged) == {"messages": [{"n": 1}, {"n": 2}, {"n": 3}]}
-
-    def test_the_text_is_kept_as_written(self) -> None:
-        merged = merge_structured_outputs('{"messages": ["I’ve"]}{"messages": []}')
-
-        assert merged == '{"messages": ["I’ve"]}'
-
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            '{"messages": []}',
-            '{"messages": []} ',
-            '{"messages": []}Done.',
-            '{"messages": []}{"messages": [',
-            '{"messages": []}{"other": []}',
-            '{"messages": []}{"messages": [], "summary": "kept"}',
-            '{"messages": []}[]',
-            '{"messages": []}\u00a0{"messages": []}',
-            '{"messages": []}{"messages": [' + "9" * 5000 + "]}",
-            '{"messages": []}' + "[" * 100_000,
-            "",
-        ],
-        ids=[
-            "one object",
-            "one object, trailing space",
-            "trailing prose",
-            "truncated second object",
-            "object without messages",
-            "a field beside messages",
-            "not an object",
-            "not JSON whitespace between",
-            "an int past the digit limit",
-            "nesting past the recursion limit",
-            "empty",
-        ],
-    )
-    def test_anything_but_several_message_objects_is_left_to_validation(self, raw: str) -> None:
-        assert merge_structured_outputs(raw) is None
-
-
-def _before(output_type: object, output: object, *, partial: bool = False) -> Any:
-    output_context = MagicMock(output_type=output_type)
-    return asyncio.run(
-        OutputDeliveryCapability().before_output_validate(
-            _ctx(None, partial=partial), output_context=output_context, output=output
-        )
-    )
-
-
-class TestTheMergeHook:
-    raw = '{"messages": []}{"messages": []}'
-
-    def test_a_split_structured_output_is_merged(self) -> None:
-        assert _before(StructuredOutput, self.raw) == '{"messages": []}'
-
-    def test_another_output_type_is_left_alone(self) -> None:
-        assert _before(str, self.raw) == self.raw
-
-    def test_partial_output_is_left_alone(self) -> None:
-        assert _before(StructuredOutput, self.raw, partial=True) == self.raw
-
-    def test_tool_arguments_are_left_alone(self) -> None:
-        args = {"messages": []}
-
-        assert _before(StructuredOutput, args) is args
 
 
 class TestCanRetry:
@@ -456,7 +366,7 @@ def _react_agent(retries: int = 3) -> ReactAgent:
         model_cfg=ModelConfig(provider="google-gla", model="gemini-2.0-flash"),
         runtime_cfg=RuntimeConfig(retries=retries),
     )
-    return ReactAgent(config=config, deps_type=BaseAgent, capabilities=[OutputDeliveryCapability()])
+    return ReactAgent(config=config, deps_type=BaseAgent, capabilities=[RecipientCheckCapability()])
 
 
 def _reply(recipient: str) -> str:
@@ -479,7 +389,7 @@ def _native_run(
         runtime_cfg=RuntimeConfig(retries=3),
     )
     react_agent = ReactAgent(
-        config=config, deps_type=BaseAgent, capabilities=[OutputDeliveryCapability()]
+        config=config, deps_type=BaseAgent, capabilities=[RecipientCheckCapability()]
     )
     agent._react_agent = react_agent  # type: ignore[attr-defined]
     retry_prompts: list[str] = []
@@ -572,7 +482,7 @@ class TestInARealRun:
             runtime_cfg=RuntimeConfig(retries=1),
         )
         react_agent = ReactAgent(
-            config=config, deps_type=BaseAgent, capabilities=[OutputDeliveryCapability()]
+            config=config, deps_type=BaseAgent, capabilities=[RecipientCheckCapability()]
         )
         agent._react_agent = react_agent  # type: ignore[attr-defined]
         calls = 0

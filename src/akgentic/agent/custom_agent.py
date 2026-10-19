@@ -37,13 +37,13 @@ Supplied here:
   turn ``akgentic-llm`` concluded after a run-tier breach: all three arrive back
   from ``act()`` as an ordinary ``TriageOutput``.
 - ``extra_capabilities`` — two pydantic-ai capabilities of this agent's own:
-  ``TriageAuditCapability``, and an ``OutputDeliveryCapability`` reading
+  ``TriageAuditCapability``, and a ``RecipientCheckCapability`` reading
   ``handoff_recipients``. The framework's recipient check reads
   ``StructuredOutput`` only, so a router of its own shape brings an extractor
   for it — a wrong handoff recipient is then sent back to the model inside the
   run, rather than skipped by ``_route_triage``. The framework prepends its own,
   so the list the ReactAgent receives is
-  ``[mailbox, output_delivery, audit, handoff_check]``: the cancel check still
+  ``[mailbox, recipient_check, audit, handoff_check]``: the cancel check still
   runs first, and this agent never returns a framework capability itself.
 """
 
@@ -56,8 +56,8 @@ from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.models import ModelRequestContext
 
 from akgentic.agent.agent import BaseAgent
-from akgentic.agent.delivery import OutputDeliveryCapability
 from akgentic.agent.messages import AgentMessage
+from akgentic.agent.recipients import RecipientCheckCapability
 from akgentic.agent.utils import resolve_recipient
 from akgentic.core import ActorAddress
 from akgentic.core.messages import Message
@@ -177,8 +177,8 @@ class CustomAgent(BaseAgent):
     def extra_capabilities(self) -> list[AgentCapability[Any]]:
         """Contribute this agent's audit capability and its handoff check.
 
-        The framework prepends ``MailboxCapability`` and output delivery, so
-        the ReactAgent is handed ``[mailbox, output_delivery, audit, handoff_check]`` —
+        The framework prepends ``MailboxCapability`` and the recipient check, so
+        the ReactAgent is handed ``[mailbox, recipient_check, audit, handoff_check]`` —
         cancellation stays unconditional and its check still runs first. This
         override deliberately does not call ``super()`` and does not return
         either framework capability: doing so would duplicate one the framework
@@ -197,7 +197,7 @@ class CustomAgent(BaseAgent):
         """
         return [
             TriageAuditCapability(agent_name=self.config.name),
-            OutputDeliveryCapability(recipients=handoff_recipients),
+            RecipientCheckCapability(recipients=handoff_recipients),
         ]
 
     def _route_triage(self, output: TriageOutput) -> bool:

@@ -1,35 +1,28 @@
-"""Output delivery inside the LLM run: what the model meant to send is what gets sent.
+"""The recipient check: an unreachable recipient is sent back while the run can still fix it.
 
-A ``StructuredOutput`` is routed only after the run has ended. By then nothing can be
-corrected: an output that does not parse loses every message, and a recipient nobody
+A ``StructuredOutput`` is routed only after the run has ended. By then a recipient nobody
 answers to can only be skipped. This module acts while the run is still open.
 
 - :class:`TeamDirectory` — who a recipient can name right now: the members, and the
   roles a hire would accept. Built by ``BaseAgent.team_directory()``, which reads
   those roles from the orchestrator's agent catalog.
-- :class:`OutputDeliveryCapability` — a pydantic-ai capability with three jobs:
+- :class:`RecipientCheckCapability` — a pydantic-ai capability that, on every validated
+  output, asks the directory about each recipient and raises ``ModelRetry`` while one is
+  unreachable. ``BaseAgent`` mounts one for ``StructuredOutput``; an agent routing another
+  shape mounts its own with a different recipient extractor.
 
-  - **merge** — a ``StructuredOutput`` written as several JSON objects back to back
-    is merged into one before validation (:func:`merge_structured_outputs`);
-  - **unreadable output** — when a ``StructuredOutput`` still fails to parse, the
-    retry says nothing was sent (:func:`unreadable_correction`);
-  - **recipient check** — on every validated output it asks the directory about
-    each recipient and raises ``ModelRetry`` while one is unreachable.
+A split or unreadable ``StructuredOutput`` is handled upstream, by akgentic-llm's
+``MergeableOutputCapability``, which ``StructuredOutput`` opts into.
 
-  ``BaseAgent`` mounts one for ``StructuredOutput``; an agent routing another shape
-  mounts its own with a different recipient extractor.
-
-The recipient check stands down whenever the run could not honour a retry, and
-routing then skips what is still unreachable. It never fails a run that would
-otherwise succeed.
+The check stands down whenever the run could not honour a retry, and routing then skips
+what is still unreachable. It never fails a run that would otherwise succeed.
 """
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.output import OutputContext
@@ -142,16 +135,11 @@ def structured_output_recipients(output: object) -> list[str] | None:
 
 
 @dataclass
-class OutputDeliveryCapability(AbstractCapability[Any]):
-    """Make what the model meant to send what gets sent, while the run can still fix it.
+class RecipientCheckCapability(AbstractCapability[Any]):
+    """Send an output back while it names a recipient nobody answers to.
 
-    - ``before_output_validate`` merges a ``StructuredOutput`` split into several
-      JSON objects.
-    - ``on_output_validate_error`` tells the model nothing was sent when a
-      ``StructuredOutput`` cannot be read.
-    - ``after_output_validate`` sends the output back while it names a recipient
-      nobody answers to. The run's ``deps`` must be a :class:`DirectorySource` —
-      ``BaseAgent`` is one; with any other ``deps`` this check does nothing.
+    The run's ``deps`` must be a :class:`DirectorySource` — ``BaseAgent`` is one; with
+    any other ``deps`` this check does nothing.
 
     Attributes:
         recipients: Reads the recipients off an output. Defaults to
@@ -196,138 +184,6 @@ class OutputDeliveryCapability(AbstractCapability[Any]):
         if unreachable:
             raise ModelRetry(directory.correction(unreachable))
         return output
-
-    # Same Any as above: pydantic-ai's hook signature.
-    async def before_output_validate(
-        self,
-        ctx: RunContext[Any],
-        *,
-        output_context: OutputContext,
-        output: Any,
-    ) -> Any:
-        """Merge a ``StructuredOutput`` written as several JSON objects into one.
-
-        OpenAI may emit a commentary text part before the final answer, and
-        pydantic-ai joins the parts: two valid objects become one invalid string.
-        Their messages are what the model meant to send, so they are merged rather
-        than sent back.
-
-        Args:
-            ctx: The run context; partial (streamed) output is left alone.
-            output_context: Its ``output_type`` decides whether the output is a
-                ``StructuredOutput``.
-            output: The raw text the model wrote — or, on the output-tool path, the
-                tool arguments, which are merged too when they are a string.
-
-        Returns:
-            One JSON object holding every object's messages, in order; ``output``
-            unchanged when it is not two or more ``{"messages": [...]}`` objects.
-        """
-        if ctx.partial_output or not isinstance(output, str):
-            return output
-        if not _is_structured_output(output_context):
-            return output
-        merged = merge_structured_outputs(output)
-        return output if merged is None else merged
-
-    # Same Any as above: pydantic-ai's hook signature.
-    async def on_output_validate_error(
-        self,
-        ctx: RunContext[Any],
-        *,
-        output_context: OutputContext,
-        output: Any,
-        error: ValidationError | ModelRetry,
-    ) -> Any:
-        """Say, in the retry, that an unreadable ``StructuredOutput`` sent nothing.
-
-        pydantic-ai's own retry names the parse error only. A model that wrote two
-        JSON objects — or whose provider split one reply into two text parts — then
-        reads it as a format fix, keeps the messages it believes went out, and resends
-        only the rest. Leading with "Nothing was sent" makes it resend every one.
-
-        Args:
-            ctx: Unused.
-            output_context: Its ``output_type`` decides whether the output is a
-                ``StructuredOutput``; any other shape keeps pydantic-ai's retry.
-            output: Unused — the raw output is already in the model's context.
-            error: The core validation failure.
-
-        Raises:
-            ModelRetry: The rewritten retry, for a ``ValidationError`` on a
-                ``StructuredOutput``.
-            ValidationError | ModelRetry: ``error`` unchanged otherwise.
-        """
-        if not (isinstance(error, ValidationError) and _is_structured_output(output_context)):
-            raise error
-        raise ModelRetry(unreadable_correction(error))
-
-
-def _is_structured_output(output_context: OutputContext) -> bool:
-    output_type = output_context.output_type
-    return isinstance(output_type, type) and issubclass(output_type, StructuredOutput)
-
-
-_JSON_WHITESPACE = " \t\n\r"
-"""The only whitespace JSON allows between values; bare ``str.strip()`` takes more."""
-
-
-def merge_structured_outputs(raw: str) -> str | None:
-    """One ``{"messages": [...]}`` object from several written back to back.
-
-    Args:
-        raw: The model's text output.
-
-    Returns:
-        The merged object as JSON, messages in the order written; ``None`` when
-        ``raw`` is a single object, is not entirely JSON objects, or holds an
-        object other than ``{"messages": [...]}`` — a field beside ``messages``
-        could not be merged without dropping a value. Validation then reports it
-        as usual.
-    """
-    decoder = json.JSONDecoder()
-    objects: list[object] = []
-    index, end = 0, len(raw.rstrip(_JSON_WHITESPACE))
-    while index < end:
-        # raw_decode rejects leading space
-        index = len(raw) - len(raw[index:].lstrip(_JSON_WHITESPACE))
-        try:
-            value, index = decoder.raw_decode(raw, index)
-        except (ValueError, RecursionError):  # also an over-long int, or deep nesting
-            return None
-        objects.append(value)
-    messages: list[object] = []
-    for value in objects:
-        if not (
-            isinstance(value, dict)
-            and value.keys() == {"messages"}
-            and isinstance(value["messages"], list)
-        ):
-            return None
-        messages.extend(value["messages"])
-    return json.dumps({"messages": messages}, ensure_ascii=False) if len(objects) > 1 else None
-
-
-def unreadable_correction(error: ValidationError) -> str:
-    """The retry prompt for a ``StructuredOutput`` that failed to parse.
-
-    Args:
-        error: The validation failure.
-
-    Returns:
-        "Nothing was sent", one line per error, then how to resend.
-    """
-    lines = [
-        "Nothing was sent: your reply could not be read, so none of its messages reached anyone."
-    ]
-    for detail in error.errors(include_url=False, include_context=False, include_input=False):
-        where = ".".join(str(part) for part in detail["loc"])
-        lines.append(f"- {where}: {detail['msg']}" if where else f"- {detail['msg']}")
-    lines.append(
-        'Resend every message of this turn as items of ONE "messages" array, in exactly ONE '
-        "JSON object."
-    )
-    return "\n".join(lines)
 
 
 def can_retry(ctx: RunContext[Any]) -> bool:
