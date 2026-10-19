@@ -292,9 +292,9 @@ recipient nobody answers to, with the members and the hireable roles in the retr
 hireable roles are the orchestrator's agent catalog cards marked `can_be_hired`, and only an agent
 whose command registry has `hire_member` can hire at all. `StructuredOutput` is an
 akgentic-llm `MergeableOutput`: an output the model wrote as several objects back to back is merged
-into one (`StructuredOutput.merge`), and when an output still cannot be read, its retry says
-*Nothing was sent* (`StructuredOutput.unreadable_output_error`) so the model resends every message.
-`_route_output()` then resolves what remains:
+into one (`StructuredOutput.merge`, which sends a repeated message once), and when an output still
+cannot be read, its retry says *Nothing was sent* (`StructuredOutput.unreadable_output_error`) so
+the model resends every message. `_route_output()` then resolves what remains:
 
 | Recipient format | Resolution |
 |---|---|

@@ -735,6 +735,8 @@ parse.
 - **Merged before validation.** When the text is two or more JSON objects back to back, each a
   valid `StructuredOutput`, they are merged through `StructuredOutput.merge`, messages in the
   order written. Every message the model meant to send is delivered, and no retry is spent.
+  A message repeated across the objects — same `message_type`, `message` and `recipient` — is
+  sent once, where it first appears.
   Anything else — trailing prose, a truncated object, an object that does not validate — is left
   to validation.
 - **"Nothing was sent" when it still fails.** pydantic-ai's own retry names only the parse error.

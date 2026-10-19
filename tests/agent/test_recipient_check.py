@@ -230,6 +230,34 @@ class TestTheSchemasHalf:
             "@Manager",
         ]
 
+    def test_a_merge_sends_a_repeated_message_once_where_it_first_appeared(self) -> None:
+        first = StructuredOutput(messages=[_request("@Expert"), _request("@Human")])
+        second = StructuredOutput(messages=[_request("@Expert"), _request("@Manager")])
+
+        merged = StructuredOutput.merge([first, second])
+
+        assert [request.recipient for request in merged.messages] == [
+            "@Expert",
+            "@Human",
+            "@Manager",
+        ]
+
+    def test_a_merge_keeps_messages_that_differ_in_any_one_field(self) -> None:
+        base = _request("@Expert")
+        variants = [
+            base.model_copy(update={"message_type": "instruction"}),
+            base.model_copy(update={"message": "what is y?"}),
+            base.model_copy(update={"message": "What is x?"}),
+            base.model_copy(update={"message": "what is x? "}),
+            base.model_copy(update={"recipient": "Expert"}),
+        ]
+
+        merged = StructuredOutput.merge(
+            [StructuredOutput(messages=[base]), StructuredOutput(messages=variants)]
+        )
+
+        assert merged.messages == [base, *variants]
+
     def test_the_retry_says_nothing_was_sent_and_names_the_parse_error(self) -> None:
         lines = StructuredOutput.unreadable_output_error(_parse_error()).splitlines()
 
@@ -513,6 +541,16 @@ class TestInARealRun:
 
         assert retry_prompts == []
         assert routed == ["@Expert", "@Human"]
+
+    def test_a_split_reply_that_repeats_a_message_sends_it_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        routed, retry_prompts = _native_run(
+            monkeypatch, first=[_reply("@Expert"), _reply("@Expert")]
+        )
+
+        assert retry_prompts == []
+        assert routed == ["@Expert"]
 
     def test_an_unmergeable_reply_is_told_nothing_was_sent(
         self, monkeypatch: pytest.MonkeyPatch
