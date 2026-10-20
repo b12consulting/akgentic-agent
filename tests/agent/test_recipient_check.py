@@ -260,6 +260,19 @@ class TestTheSchemasHalf:
 
         assert merged.messages == [base, *variants]
 
+    def test_a_merge_keeps_a_subclass_field_from_the_last_output(self) -> None:
+        class Sourced(StructuredOutput):
+            sources: list[str] = []
+
+        first = Sourced(messages=[_request("@Human")], sources=["draft"])
+        last = Sourced(messages=[_request("@Human")], sources=["final"])
+
+        merged = Sourced.merge([first, last])
+
+        assert isinstance(merged, Sourced)
+        assert merged.sources == ["final"]
+        assert [request.recipient for request in merged.messages] == ["@Human"]
+
     def test_the_retry_says_nothing_was_sent_and_names_the_parse_error(self) -> None:
         lines = StructuredOutput.unreadable_output_error(_parse_error()).splitlines()
 
