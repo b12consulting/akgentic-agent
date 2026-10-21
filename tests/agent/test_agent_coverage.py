@@ -708,7 +708,7 @@ class TestCommandsAnnouncedEventEmission:
         announced: list[CommandsAnnouncedEvent] = []
 
         class _Subscriber(EventSubscriber):
-            def on_stop(self) -> None:
+            def on_stop(self, team_id: uuid.UUID) -> None:
                 pass
 
             def on_message(self, message: Message) -> None:
@@ -734,9 +734,11 @@ class TestCommandsAnnouncedEventEmission:
             manager_addr = orchestrator.createActor(BaseAgent, config=config)
 
             # The announcement follows the real ReactAgent's construction, whose
-            # latency varies (it ran past a fixed 0.5 s under coverage), so wait for
-            # the first one, then settle so a duplicate would still be counted.
-            deadline = time.monotonic() + 5.0
+            # latency varies (it ran past a fixed 0.5 s under coverage, and past 5 s
+            # on a loaded CI runner), so wait for the first one, then settle so a
+            # duplicate would still be counted. The loop exits on arrival, so the
+            # generous deadline costs nothing on a green run.
+            deadline = time.monotonic() + 30.0
             while not announced and time.monotonic() < deadline:
                 time.sleep(0.05)
             time.sleep(0.5)
