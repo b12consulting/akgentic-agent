@@ -470,12 +470,13 @@ class TestCancellationConsultsNeitherString:
 class TestRunEndWithdrawal:
     """``after_node_run`` — the notice is withdrawn once the run has ended.
 
-    Hook arithmetic only: which entries leave the queue, and which stay. That
-    the withdrawal actually **defeats** pydantic-ai's end-of-run redirect is a
-    separate claim, and one these specs cannot make — they drive the hook by
-    hand, with no drain in the picture. It is pinned by the real-chain specs in
-    ``test_arrival_notice_durability.py``, which assert on the value ``act()``
-    returns.
+    Hook arithmetic only: which entries leave the queue, and which stay. They
+    drive the hook by hand, with no drain in the picture, and they are the only
+    specs that reach it: since pydantic-ai 2.58 a real chain delivers the notice
+    with the request it was enqueued for, so none is left queued at the run's
+    end. That a run keeps the answer it produced is pinned by the real-chain
+    specs in ``test_arrival_notice_durability.py``, which assert on the value
+    ``act()`` returns.
     """
 
     async def test_the_notice_is_withdrawn_when_the_run_has_ended(self) -> None:
