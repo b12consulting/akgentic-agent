@@ -31,7 +31,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-from akgentic.llm import ModelSwitchError, model_roster_key
+from akgentic.llm import CompactionConfig, ModelSwitchError, model_roster_key
 from akgentic.llm.config import ModelConfig
 from akgentic.tool.core import ContextUpdater
 from akgentic.tool.model import ModelTool
@@ -140,6 +140,7 @@ def _make_agent(react_agent: _RosterReactAgent) -> BaseAgent:
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"
+    mock_config.compaction_cfg = CompactionConfig()
     agent.config = mock_config  # type: ignore[attr-defined]
 
     agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]

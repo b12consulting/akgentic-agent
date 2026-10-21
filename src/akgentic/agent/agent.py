@@ -73,7 +73,9 @@ from akgentic.core import ActorAddress, Akgent, Orchestrator
 from akgentic.core.messages import CancelMessage, EventMessage, Message
 from akgentic.llm import (
     AgentUsageSummary,
+    CompactionConfig,
     LlmUsageEvent,
+    ModelConfig,
     ModelSwitchError,
     ReactAgent,
     ReactAgentConfig,
@@ -85,7 +87,7 @@ from akgentic.tool.core import CommandRegistry, ContextUpdater, ToolFactory
 from akgentic.tool.errors import CommandNotRecognized, RetriableError
 from akgentic.tool.core.event import CommandsAnnouncedEvent
 from akgentic.tool.mailbox import MailboxCapability, MailboxTool, RunInterruptedError
-from akgentic.tool.model import ModelRow
+from akgentic.tool.model import ModelCompaction, ModelRow
 from akgentic.tool.team import TeamTool
 from akgentic.tool.workspace.readers import MediaContent
 
@@ -93,6 +95,20 @@ logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T")
+
+
+def _model_compaction(entry: ModelConfig, compaction_cfg: CompactionConfig) -> ModelCompaction:
+    """What *entry* means for auto-compaction: the token count that fires it, or off.
+
+    Mirrors akgentic-llm's rule, whose source is ``validate_compaction_bounds`` (the
+    live copy is ``ReactAgent._compaction_threshold``): ``int`` truncation of
+    ``context_length * trigger_ratio`` when the auto-trigger is on and the entry
+    declares a context length, ``None`` otherwise.
+    """
+    context_length = entry.context_length
+    if not (compaction_cfg.auto_trigger and context_length is not None):
+        return ModelCompaction(threshold=None)
+    return ModelCompaction(threshold=int(context_length * compaction_cfg.trigger_ratio))
 
 
 class BaseAgent(Akgent[AgentConfig, AgentState]):
@@ -292,20 +308,6 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         tools = tool_factory.get_tools()
         toolsets = tool_factory.get_toolsets()
 
-        # ── Build the generic command registry and announce it once ────────
-        # /compact and /clear join as command-only built-ins (never TOOL_CALL).
-        # Bound methods are captured here but invoked only at dispatch time, by
-        # which point self._react_agent (built below) exists.
-        self._command_registry: CommandRegistry = tool_factory.get_command_registry(
-            extra_commands=[self.compact, self.clear]
-        )
-        self.notify_event(
-            CommandsAnnouncedEvent(
-                agent=self.myAddress,
-                commands=self._command_registry.descriptors(),
-            )
-        )
-
         # ── Context-update engine (LLM_CONTEXT channel) ────────────────────────
         # One updater for the agent's lifetime, like the command registry. It is
         # built after self.state is assigned: the factory isinstance-checks this
@@ -320,6 +322,20 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
 
         self._react_agent = self._build_react_agent(
             react_agent_config, self._capabilities, tools, toolsets
+        )
+
+        # ── Build the generic command registry and announce it once ────────
+        # After the ReactAgent: a card may read the model runtime while its commands
+        # are built (ModelTool types /switch_model from list_model_rows()). /compact
+        # and /clear join as command-only built-ins (never TOOL_CALL), run at dispatch.
+        self._command_registry: CommandRegistry = tool_factory.get_command_registry(
+            extra_commands=[self.compact, self.clear]
+        )
+        self.notify_event(
+            CommandsAnnouncedEvent(
+                agent=self.myAddress,
+                commands=self._command_registry.descriptors(),
+            )
         )
 
         # ── Dynamic system prompts ────────────────────────────────────────────
@@ -540,12 +556,19 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         nothing is synthesized and nothing raises. ``ModelTool`` then composes no
         ``LLM_CONTEXT`` block that turn, which is the designed degradation.
 
+        Every row reports its ``compaction``, computed from **its own** entry's
+        ``context_length`` (a switch moves it) and from ``self.config.compaction_cfg``.
+        That config is the one ``on_start`` forwards verbatim into the ReactAgent,
+        which exposes no accessor for it; a switch replaces only ``model_cfg``, so it
+        holds for every entry and for the agent's whole life.
+
         Returns:
             One row per roster entry, in declaration order; ``[]`` for an agent
             that declares no roster, for which switching is unavailable. No row is
             ever synthesized for an active model the roster does not carry.
         """
         active_key = model_roster_key(self._react_agent.active_model())
+        compaction_cfg = self.config.compaction_cfg
         return [
             ModelRow(
                 key=model_roster_key(entry),
@@ -553,6 +576,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
                 model=entry.model,
                 active=model_roster_key(entry) == active_key,
                 context_length=entry.context_length,
+                compaction=_model_compaction(entry, compaction_cfg),
             )
             for entry in self._react_agent.model_roster()
         ]

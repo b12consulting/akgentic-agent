@@ -3,7 +3,7 @@
 Two claims, and the second is the one with teeth.
 
 **It works when configured.** An agent whose ``config.tools`` carries a
-``ModelTool`` gets ``list_models`` and ``switch_model`` in its ``CommandRegistry``
+``ModelTool`` gets the ``models`` and ``switch_model`` commands in its ``CommandRegistry``
 and in the descriptors of the single ``CommandsAnnouncedEvent`` ``on_start``
 emits, and its turns carry an ``LLM_CONTEXT`` block naming the model in force. No
 source change was needed for any of that — it is a proof that the existing factory
@@ -23,17 +23,19 @@ reaching into actor internals. The factory also captures the **observer**
 protocol-conformance claim is re-checked with nothing hand-populated.
 """
 
+import logging
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
+import pytest
 from akgentic.core import ActorAddress, ActorSystem, BaseConfig, EventSubscriber, Orchestrator
 from akgentic.core.messages import EventMessage, Message
 from akgentic.llm import ModelConfig, PromptTemplate
 from akgentic.tool.core import CommandRegistry, ToolCard, ToolFactory
-from akgentic.tool.core.event import CommandsAnnouncedEvent
+from akgentic.tool.core.event import CommandDescriptor, CommandsAnnouncedEvent
 from akgentic.tool.mailbox import MailboxTool
 from akgentic.tool.model import ModelSwitchToolObserver, ModelTool
 from akgentic.tool.team import TeamTool
@@ -48,6 +50,7 @@ FAST = ModelConfig(provider="openai", model="gpt-5-mini", context_length=128_000
 CHEAP = ModelConfig(provider="mistral", model="mistral-small", context_length=32_000)
 
 FAST_KEY = "openai:gpt-5-mini"
+CHEAP_KEY = "mistral:mistral-small"
 
 # =============================================================================
 # HELPERS
@@ -237,9 +240,10 @@ class TestTheCardReachesBothSurfaces:
         with _running_agent(_agent_config(tools=[ModelTool()])) as (_, _, announced):
             registry = _RecordingToolFactory.captured_registries[-1]
 
-            assert registry.has("list_models")
+            assert registry.has("models")
             assert registry.has("switch_model")
-            assert {"list_models", "switch_model"} <= _announced_command_names(announced)
+            assert not registry.has("list_models")  # the command is /models; the tool keeps it
+            assert {"models", "switch_model"} <= _announced_command_names(announced)
 
     def test_a_turn_carries_a_context_block_naming_the_model_in_force(self) -> None:
         """The third capability, on the third channel, through the real card."""
@@ -248,6 +252,65 @@ class TestTheCardReachesBothSurfaces:
 
         assert blocks, "the first turn must deliver a context-update block"
         assert FAST_KEY in blocks[0]
+
+
+# =============================================================================
+# Story 8.4 — the registry is built after the ReactAgent, so the roster reaches it
+# =============================================================================
+
+
+def _switch_model_choices(descriptors: list[CommandDescriptor]) -> list[str] | None:
+    descriptor = next(d for d in descriptors if d.name == "switch_model")
+    (arg,) = descriptor.args
+    return arg.choices
+
+
+class TestTheRosterReachesTheCommands:
+    """Story 8.4 AC 2, AC 3, AC 8: commands built after the model runtime exists."""
+
+    def test_switch_model_announces_the_roster_keys_as_choices(self) -> None:
+        """MUTATION — build the registry above the ReactAgent and this goes red."""
+        with _running_agent(_agent_config(tools=[ModelTool()])) as (_, _, announced):
+            registry = _RecordingToolFactory.captured_registries[-1]
+
+            _announced_command_names(announced)  # exactly one announcement
+            assert _switch_model_choices(announced[0].commands) == [FAST_KEY, CHEAP_KEY]
+            assert _switch_model_choices(registry.descriptors()) == [FAST_KEY, CHEAP_KEY]
+
+    def test_a_normal_start_logs_no_roster_fallback_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """MUTATION — build the registry above the ReactAgent and this goes red.
+
+        Non-vacuous: the same start is asserted to have typed the argument, so a
+        capture that saw nothing cannot pass for the wrong reason.
+        """
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.model.tool"):
+            with _running_agent(_agent_config(tools=[ModelTool()])) as (_, _, announced):
+                choices = _switch_model_choices(announced[0].commands)
+
+        fallbacks = [
+            record
+            for record in caplog.records
+            if record.name == "akgentic.tool.model.tool"
+            and record.levelno == logging.WARNING
+            and "roster could not be read" in record.getMessage()
+        ]
+        assert fallbacks == []
+        assert choices == [FAST_KEY, CHEAP_KEY]
+
+    def test_models_shows_a_compaction_threshold_on_every_row(self) -> None:
+        """The column end to end; the exact rendering is the tool's to pin."""
+        with _running_agent(_agent_config(tools=[ModelTool()])):
+            registry = _RecordingToolFactory.captured_registries[-1]
+            text = registry.dispatch("/models")
+
+        assert text is not None
+        assert text.count("compaction threshold") == 2
+        assert "compaction disabled" not in text
+        for key in (FAST_KEY, CHEAP_KEY):
+            line = next(line for line in text.splitlines() if line.startswith(key))
+            assert "compaction threshold" in line
 
 
 # =============================================================================
@@ -260,10 +323,10 @@ class TestWithoutTheCard:
         with _running_agent(_agent_config()) as (_, _, announced):
             registry = _RecordingToolFactory.captured_registries[-1]
 
-            assert not registry.has("list_models")
+            assert not registry.has("models")
             assert not registry.has("switch_model")
             names = _announced_command_names(announced)
-            assert "list_models" not in names
+            assert "models" not in names
             assert "switch_model" not in names
             # Non-vacuous: the announcement itself is live and carries the
             # auto-injected cards' own commands.
