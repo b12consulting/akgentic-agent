@@ -733,6 +733,12 @@ class TestCommandsAnnouncedEventEmission:
             )
             manager_addr = orchestrator.createActor(BaseAgent, config=config)
 
+            # The announcement follows the real ReactAgent's construction, whose
+            # latency varies (it ran past a fixed 0.5 s under coverage), so wait for
+            # the first one, then settle so a duplicate would still be counted.
+            deadline = time.monotonic() + 5.0
+            while not announced and time.monotonic() < deadline:
+                time.sleep(0.05)
             time.sleep(0.5)
 
             for_agent = [e for e in announced if e.agent.name == manager_addr.name]
