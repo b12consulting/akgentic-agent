@@ -612,7 +612,7 @@ union: the list exists at validation time and nowhere else, which is what makes 
 
 **An empty roster is the default, and it means switching is unavailable.** Every existing
 single-model agent, catalog entry and example is unchanged by this feature: `model_roster == []`,
-no `list_models` or `switch_model` commands, no `LLM_CONTEXT` block naming a model, and no cost. If
+no `/models` or `/switch_model` commands, no `LLM_CONTEXT` block naming a model, and no cost. If
 you are upgrading and you declare one model, nothing changed for you.
 
 Hand-setting `model_roster=` directly is legal, and has consequences worth knowing before you do
@@ -773,12 +773,13 @@ Runtime state extending `BaseState`:
 | `TOOL_CALL` | LLM via pydantic-ai tools | `hire_members()`, `fire_members()`, `read_mailbox()`, `web_search()`, `workspace_read()`, `list_models()`, `switch_model()` |
 | `SYSTEM_PROMPT` | LLM system prompt — rendered into the frozen system block | backstory, current date |
 | `LLM_CONTEXT` | LLM via a per-turn appended **Context update** block | team roster, role profiles, planning summary, knowledge-graph summary, the model in force |
-| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`, `stop`, `list_models`, `switch_model` |
+| `COMMAND` | `CommandRegistry` — in-agent Python and `/`-prefixed messages | `hire_member`, `fire_member`, `team_members`, `team_roles`, `planning_summary`, `stop`, `models`, `switch_model` |
 
-`list_models` and `switch_model` serve **both** `TOOL_CALL` and `COMMAND`
-(`akgentic-tool/.../model/tool.py:131-162`), and that is the point: the human and the model reach
-the same capability rather than two parallel implementations of it. They are present only when
-`ModelTool` is in `config.tools` — see [Runtime Model Switching](#runtime-model-switching).
+The roster listing and the switch serve **both** `TOOL_CALL` and `COMMAND`, and that is the
+point: the human and the model reach the same capability rather than two parallel implementations
+of it. The listing is the `list_models` tool for the model and the `/models` command for a human;
+the switch is `switch_model` on both. They are present only when `ModelTool` is in
+`config.tools` — see [Runtime Model Switching](#runtime-model-switching).
 
 `TeamTool` **and** `MailboxTool` are always prepended to `config.tools` if not already
 present, so every `BaseAgent` can hire and fire members (`TeamTool`) and carries the two
@@ -1019,15 +1020,17 @@ The registry contents follow from the tool cards attached to the agent:
 | `get_planning_task(task_id)` | `PlanningTool` | Single planning task by ID |
 | `search_planning(...)` | `PlanningTool` | Search the shared task board |
 | `stop()` | `MailboxTool` | Cancel the current run; the mid-run effect is the cancel hook's (see [Run Cancellation](#run-cancellation)) |
-| `list_models()` | `ModelTool` | The roster this agent may switch within, one entry per line, the entry in force marked |
+| `models()` | `ModelTool` | The roster this agent may switch within, one entry per line, the entry in force marked; each row says at what token count auto-compaction fires for it, or that it is off |
 | `switch_model(model)` | `ModelTool` | Make one roster entry the model in force, from the next turn (see [Runtime Model Switching](#runtime-model-switching)) |
 | `compact()` / `clear()` | `BaseAgent` built-ins | Compact or clear the conversation context |
 
 `ModelTool` is **not** auto-injected, so its two rows are present only for an agent whose
 `config.tools` declares the card. Note also that the card's parameter is named `model` while the
 observer's is `key` — two contracts, two names, deliberately: the command descriptor a frontend
-reads advertises `model` (`akgentic-tool/.../model/tool.py:200-213`), so a human types
-`/switch_model openai:gpt-4.1`.
+reads advertises `model`, so a human types `/switch_model openai:gpt-4.1`. That argument announces
+the roster keys as `choices`, in roster order: `on_start` builds the registry after the
+`ReactAgent`, so the card reads the roster through `list_model_rows()` when its commands are
+built.
 
 Do not hand-transcribe this table into your own code: read the set from
 `registry.descriptors()`, or from the `CommandsAnnouncedEvent` the agent emits at start-up. Those

@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-agent"
-version = "1.8.0"
+version = "1.8.1"
 description = "Collaborative agent patterns for the Akgentic framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,12 +29,14 @@ dependencies = [
     # The metapackage pins slim[anthropic,cli,evals,google,logfire,mcp,openai,
     # retries,web]; its `web` extra is what dragged Starlette into the resolution
     # and collided with akgentic-infra's deliberate starlette<1.1 bound.
-    # Bounds deliberately unchanged: akgentic-llm floors slim at 2.32 because it
-    # needs the httpx2 transport, and this package does not.
-    "pydantic-ai-slim>=2,<3",
+    # Floored at 2.58: from that release, `'asap'` content a `before_model_request`
+    # hook enqueues goes out with that same request instead of the next one, so
+    # the mailbox's arrival notice is never left queued when a run ends. The run
+    # path and its specs are written against that delivery.
+    "pydantic-ai-slim>=2.58,<3",
     "akgentic-core>=1.5.15",
     "akgentic-llm>=2.5.0",
-    "akgentic-tool>=1.11.0",
+    "akgentic-tool>=1.12.0",
 ]
 
 [project.optional-dependencies]

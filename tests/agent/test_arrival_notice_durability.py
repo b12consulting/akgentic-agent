@@ -3,33 +3,35 @@
 Drives a **real** pydantic-ai run graph — the ``test_retry_wins_exhaustive``
 pattern — with the ``MailboxCapability`` wired in as a capability, so the
 delivery path under test is the shipped one: the hook enqueues the notice via
-``ctx.enqueue(notice, priority="asap")`` and pydantic-ai's auto-injected,
-outermost ``PendingMessageDrainCapability`` drains it into the next model
-request, into the durable history, and — through ``ContextManager.add_message``
-— into the ``LlmMessageEvent`` stream. A double that faked the drain would
-assert what the author *believes* pydantic-ai does rather than what it does.
+``ctx.enqueue(notice, priority="asap")`` and pydantic-ai delivers it into the
+model request, into the durable history, and — through
+``ContextManager.add_message`` — into the ``LlmMessageEvent`` stream. A double
+that faked the delivery would assert what the author *believes* pydantic-ai
+does rather than what it does.
 
-Three shapes are pinned, and the first two are opposites:
+Since pydantic-ai 2.58 (this package's floor), ``'asap'`` content a
+``before_model_request`` hook enqueues goes out with **that same request**, not
+the next one. Three shapes are pinned:
 
-- the ordinary next-step-boundary delivery (mail pending from the start, a
-  plain tool call creates the boundary the drain delivers into) — the notice
-  text lands in the durable history (``react_agent.context.messages``) exactly
-  once, and exactly one ``LlmMessageEvent`` carrying it reaches the observer;
-- the **run-end withdrawal** (the notice is enqueued at the run's last step
-  boundary, so the run would otherwise terminate with it still queued) — the
-  notice is withdrawn, the run ends on its own ``End(FinalResult)``, and the
-  answer the model already produced is what ``act()`` returns;
-- the same run-end shape with a **second producer** also holding an ``'asap'``
-  entry — the notice is withdrawn and the foreign entry is not, so the drain
-  redirects for it exactly as it always did. The withdrawal is this
-  capability's own, keyed on the ids it recorded; it is not a queue flush.
+- mail pending from the start — the model sees the notice on its first
+  request, the notice lands in durable history (``react_agent.context.messages``)
+  exactly once, exactly one ``LlmMessageEvent`` carries it, and a later request
+  in the same run does not announce it again;
+- a run that finalises on that first request — the notice already went out
+  with it, so nothing is queued when the run reaches its ``End(FinalResult)``:
+  no redirect turn, and the answer the model produced is what ``act()``
+  returns;
+- the same shape with a **second producer** also enqueueing at ``'asap'`` — its
+  entry goes out with the same request too, so again no redirect.
 
-The second shape used to be the opposite claim: that the drain's
-``after_node_run`` redirects through one extra model request so the notice is
-"delivered rather than lost". It does — and the price is the run's own
-``End(FinalResult)``, which that redirect **discards**. The answer the agent had
-already written was then never returned by ``run_sync`` and reached nobody,
-which is what issue #123 reported from a live process. The queued message was
+Before 2.58 the notice arrived one request late, and a notice raised on the
+final request was still queued at the run's end. pydantic-ai's drain then
+discarded the ``End(FinalResult)`` and redirected through one more model
+request, so the answer the agent had already written was never returned —
+issue #123. ``MailboxCapability.after_node_run`` withdraws such a notice; the
+same-request delivery now means a real chain no longer leaves one behind, and
+the withdrawal itself is pinned at hook level in
+``test_run_cancellation.py::TestRunEndWithdrawal``. The queued message was
 never at risk: it is still in the actor mailbox and gets its own turn, exactly
 as ADR-010 §5 specifies.
 """
@@ -153,11 +155,8 @@ class _ForeignEnqueue(AbstractCapability[Any]):
     """Any other producer of queued content — a stand-in for one, at least.
 
     It enqueues once, at ``'asap'``, from ``before_model_request``: the same
-    one-step-late position the arrival notice occupies, since the outermost
-    drain has already run for that request by the time any other capability's
-    hook fires. Its entry is therefore still queued when the run reaches its
-    ``End``, which is the whole point — nothing withdraws it, so the drain's
-    redirect fires for it exactly as it always did.
+    position the arrival notice occupies, so its entry goes out with the same
+    request the notice does.
     """
 
     CONTENT = "a note from somewhere else entirely"
@@ -238,12 +237,12 @@ class TestArrivalNoticeDurability:
     def test_notice_lands_in_durable_history_and_event_stream_exactly_once(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Next-step-boundary delivery: enqueued at firing 1, drained into request 2.
+        """Same-request delivery: enqueued before request 1, sent with request 1.
 
         Mail is pending from the run's start, so the hook's first firing
-        enqueues the notice. The stub model's first response calls a plain tool
-        — creating the step boundary whose model request the drain delivers
-        into — and the second finalises via the output tool.
+        enqueues the notice and the model sees it on its first call. The stub
+        model's first response calls a plain tool, so a second request follows —
+        and it must not announce the same mail again.
         """
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
 
@@ -259,10 +258,13 @@ class TestArrivalNoticeDurability:
             return "all good"
 
         model_call_count = 0
+        # Per model call: how many copies of the notice the model was sent.
+        seen: list[int] = []
 
         def stub_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             nonlocal model_call_count
             model_call_count += 1
+            seen.append(_notice_count_in_history(messages, notice))
             output_tool_name = info.output_tools[0].name
             if model_call_count == 1:
                 return ModelResponse(
@@ -284,44 +286,30 @@ class TestArrivalNoticeDurability:
         finally:
             react_agent.close()
 
-        # The boundary existed: turn 1 called the tool, turn 2 finalised.
+        # Turn 1 called the tool, turn 2 finalised.
         assert model_call_count == 2
+        # Sent with the first request; the second carries that same copy, no new one.
+        assert seen == [1, 1]
         # Durable history holds the notice exactly once.
         assert _notice_count_in_history(react_agent.context.messages, notice) == 1
         # Exactly one LlmMessageEvent carried it to the observer.
         assert len(_notice_events(recorder.events, notice)) == 1
 
-    def test_a_notice_left_at_the_run_end_is_withdrawn_and_the_answer_survives(
+    def test_a_notice_raised_on_the_final_request_goes_out_with_it_and_the_answer_survives(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The run keeps the output it produced; the notice is withdrawn (#123).
+        """The run keeps the output it produced (#123).
 
-        With no tool call, the hook's only firing is before request 1 — the
-        drain has already run for that request, so the notice is still queued
-        when the model finalises. Without the withdrawal, the drain's
-        ``after_node_run`` **discards** that ``End(FinalResult)`` and redirects
-        into a second model request; the run then finalises again and
-        ``run_sync`` returns the *second* output. The first answer — the one the
-        user was waiting for — is in durable history and nowhere else.
+        With no tool call, the hook's only firing is before request 1, and the
+        model finalises on that request. The notice goes out with it, so nothing
+        is queued when the run reaches its ``End(FinalResult)`` and there is no
+        redirect into a second model request — the one that used to make
+        ``run_sync`` return the *second* output and leave the first answer, the
+        one the user was waiting for, in durable history and nowhere else.
 
         So the assertion that matters is on the returned value, not on a queue
         length: the stub model answers differently each turn, and ``act()`` must
         return the **first** answer.
-
-        MUTATION — delete ``MailboxCapability.after_node_run`` (the pre-#123
-        state) and this spec goes red on ``model_call_count == 1`` first, then on
-        the returned message. It is **the** regression guard for the bug, and the
-        only one that fails on the returned output rather than on a queue.
-
-        Measured against the full suite: that mutation reddens 5 of 447, and all
-        five are withdrawal specs —
-        ``test_a_foreign_producers_entry_still_redirects_at_the_run_end`` here,
-        plus ``test_the_notice_is_withdrawn_when_the_run_has_ended``,
-        ``test_another_producers_entry_is_left_in_the_queue`` and
-        ``test_an_absorbed_messages_rendering_is_never_withdrawn`` in
-        ``test_run_cancellation.py::TestRunEndWithdrawal``. What stays green is
-        the point: ``test_notice_lands_in_durable_history_and_event_stream_exactly_once``
-        above, and every cancel and offer spec — the mid-run doorbell is untouched.
         """
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
 
@@ -368,32 +356,25 @@ class TestArrivalNoticeDurability:
         # ...and the answer it produced is the one the caller got.
         assert [m.message for m in output.messages] == ["answer from turn 1"]
 
-        # The notice was withdrawn, so it reached neither history nor the stream.
-        assert _notice_count_in_history(react_agent.context.messages, notice) == 0
-        assert _notice_events(recorder.events, notice) == []
+        # The notice went out with that one request: once in history, once in the stream.
+        assert _notice_count_in_history(react_agent.context.messages, notice) == 1
+        assert len(_notice_events(recorder.events, notice)) == 1
 
         # The message itself was never at risk: still queued, never consumed,
         # so it gets its own turn (ADR-010 §5).
         assert mailbox.pending == [arrived]
         assert mailbox.consumed == []
 
-    def test_a_foreign_producers_entry_still_redirects_at_the_run_end(
+    def test_a_foreign_producers_entry_goes_out_with_the_same_request(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The withdrawal is ours alone — everyone else keeps the redirect (AC-5).
+        """A second producer's entry is delivered alongside the notice (AC-5).
 
         Same shape as the spec above, plus a second capability enqueueing its own
-        ``'asap'`` content. Both entries are queued when the model finalises. The
-        notice is withdrawn; the foreign entry is not, so pydantic-ai's drain
-        discards the ``End`` and redirects through one more model request exactly
-        as it does today, and ``act()`` returns the *second* answer.
-
-        That is the correct outcome, not a residual bug: the drain's redirect is
-        right for content with no other delivery path, and this capability knows
-        of only one such exception — the arrival notice, whose message is still
-        sitting in the actor mailbox. Narrowing the withdrawal to the ids this
-        capability recorded (rather than clearing the queue) is what keeps that
-        true, and this is the spec that says so.
+        ``'asap'`` content from the same hook. Both entries go out with request 1,
+        so neither is queued when the model finalises: no redirect, and ``act()``
+        returns the first answer. Each lands in history exactly once — the mailbox
+        capability neither drops nor duplicates another producer's content.
         """
         monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
 
@@ -436,14 +417,14 @@ class TestArrivalNoticeDurability:
         finally:
             react_agent.close()
 
-        # The drain redirected for the foreign entry: a second turn happened.
-        assert model_call_count == 2
-        assert [m.message for m in output.messages] == ["answer from turn 2"]
+        # Nothing was left queued at the end: no redirect, the first answer stands.
+        assert model_call_count == 1
+        assert [m.message for m in output.messages] == ["answer from turn 1"]
 
-        # The foreign content was delivered — once, into that redirect turn.
+        # Both entries went out with that request, each exactly once.
         assert _notice_count_in_history(react_agent.context.messages, _ForeignEnqueue.CONTENT) == 1
-        # Our own notice was still withdrawn, and the mail still untouched.
-        assert _notice_count_in_history(react_agent.context.messages, notice) == 0
+        assert _notice_count_in_history(react_agent.context.messages, notice) == 1
+        # The mail itself is still untouched.
         assert mailbox.pending == [arrived]
 
 

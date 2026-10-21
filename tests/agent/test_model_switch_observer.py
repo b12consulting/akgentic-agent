@@ -27,10 +27,10 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from akgentic.llm import ModelSwitchError, model_roster_key
+from akgentic.llm import CompactionConfig, ModelSwitchError, model_roster_key
 from akgentic.llm.config import ModelConfig
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.model import ModelRow, ModelSwitchToolObserver, ModelTool
+from akgentic.tool.model import ModelCompaction, ModelRow, ModelSwitchToolObserver, ModelTool
 
 from akgentic.agent.agent import BaseAgent
 from akgentic.agent.config import AgentConfig, AgentState
@@ -78,7 +78,7 @@ class _RosterReactAgent:
         raise ModelSwitchError(f"cannot switch to '{key}': available keys: {available}")
 
 
-def _make_agent(react_agent: Any) -> BaseAgent:
+def _make_agent(react_agent: Any, compaction_cfg: CompactionConfig | None = None) -> BaseAgent:
     """A bare ``BaseAgent`` over *react_agent*, with a real ``AgentState``.
 
     The actor ref, the orchestrator address and the team id are the three things
@@ -97,6 +97,7 @@ def _make_agent(react_agent: Any) -> BaseAgent:
 
     mock_config = MagicMock(spec=AgentConfig)
     mock_config.name = "@TestAgent"
+    mock_config.compaction_cfg = compaction_cfg or CompactionConfig()
     agent.config = mock_config  # type: ignore[attr-defined]
 
     agent.state = AgentState(backstory="You are a test agent.")  # type: ignore[attr-defined]
@@ -272,6 +273,71 @@ class TestActiveModelOutsideTheRoster:
         agent = _make_agent(_RosterReactAgent(FAST, []))
 
         assert _rows_of(agent) == []
+
+
+# =============================================================================
+# Story 8.4 AC 7 — every row reports its compaction, by the llm threshold rule
+# =============================================================================
+
+
+class TestCompactionPerRow:
+    """Story 8.4 AC 7: the threshold, the two ways of being off, and truncation.
+
+    Literals are pinned, never recomputed: a spec that re-derives
+    ``int(context_length * trigger_ratio)`` mirrors the code and cannot catch a
+    dropped gate or a ``round``.
+    """
+
+    def test_each_row_carries_its_own_entry_s_threshold(self) -> None:
+        agent = _make_agent(_RosterReactAgent(FAST, ROSTER), CompactionConfig(trigger_ratio=0.5))
+
+        assert [row.compaction for row in _rows_of(agent)] == [
+            ModelCompaction(threshold=64_000),
+            ModelCompaction(threshold=100_000),
+            ModelCompaction(threshold=16_000),
+        ]
+
+    def test_the_threshold_truncates_rather_than_rounds(self) -> None:
+        """MUTATION — ``round`` instead of ``int`` reports 901 and this goes red.
+
+        ``1_001 * 0.9`` is ``900.9000000000001`` in float.
+        """
+        odd = ModelConfig(provider="openai", model="gpt-odd", context_length=1_001)
+        agent = _make_agent(_RosterReactAgent(odd, [odd]), CompactionConfig(trigger_ratio=0.9))
+
+        assert [row.compaction for row in _rows_of(agent)] == [ModelCompaction(threshold=900)]
+
+    def test_auto_trigger_off_reports_no_threshold_on_every_row(self) -> None:
+        """MUTATION — drop the ``auto_trigger`` gate and this goes red."""
+        agent = _make_agent(_RosterReactAgent(FAST, ROSTER), CompactionConfig(auto_trigger=False))
+
+        assert [row.compaction for row in _rows_of(agent)] == [ModelCompaction(threshold=None)] * 3
+
+    def test_an_entry_without_context_length_reports_no_threshold(self) -> None:
+        """Per entry, not per agent: the sibling with a window still reports one.
+
+        MUTATION — drop the ``context_length is None`` guard and
+        ``list_model_rows()`` raises ``TypeError``.
+        """
+        undeclared = ModelConfig(provider="azure", model="gpt-4o-mini")
+        agent = _make_agent(_RosterReactAgent(FAST, [undeclared, CHEAP]))
+
+        rows = _rows_of(agent)
+
+        assert agent.config.compaction_cfg.auto_trigger
+        assert rows[0].compaction == ModelCompaction(threshold=None)
+        assert rows[1].compaction == ModelCompaction(threshold=27_200)
+
+    def test_no_row_leaves_compaction_unreported(self) -> None:
+        """``None`` means "not reported" on the tool side; this agent always reports."""
+        undeclared = ModelConfig(provider="azure", model="gpt-4o-mini")
+        roster = [*ROSTER, undeclared]
+
+        for compaction_cfg in (CompactionConfig(), CompactionConfig(auto_trigger=False)):
+            rows = _rows_of(_make_agent(_RosterReactAgent(FAST, roster), compaction_cfg))
+
+            assert len(rows) == 4
+            assert all(row.compaction is not None for row in rows)
 
 
 # =============================================================================
