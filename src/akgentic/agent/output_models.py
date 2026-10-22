@@ -92,14 +92,15 @@ class StructuredOutput(MergeableOutput):
         """Every output's messages, in the order written, in one output; a repeat is sent once.
 
         A split output restates its turn, so a ``(message_type, message, recipient)`` already
-        seen earlier in the merge is dropped, and its first occurrence keeps its place.
+        seen earlier in the merge is dropped, and its first occurrence keeps its place. Every
+        other field a subclass adds comes from the last output, the one the model finished on.
         """
         unique: dict[tuple[str, str, str], Request] = {}
         for output in outputs:
             for message in output.messages:
                 key = (message.message_type, message.message, message.recipient)
                 unique.setdefault(key, message)
-        return cls(messages=list(unique.values()))
+        return outputs[-1].model_copy(update={"messages": list(unique.values())})
 
     @classmethod
     def unreadable_output_error(cls, error: ValidationError) -> str:
