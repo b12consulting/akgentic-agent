@@ -140,10 +140,23 @@ manager_card = AgentCard(
         prompt=PromptTemplate(template="You are a project manager. Delegate to specialists."),
         model_cfg=ModelConfig(provider="openai", model="gpt-4.1"),
     ),
-    routes_to=["Developer", "QA"],   # roles this agent can hire on demand
+)
+# A specialist the Manager may hire on demand: can_be_hired defaults to False,
+# so a role is hireable only when its card says so.
+developer_card = AgentCard(
+    description="Writes and tests code",
+    skills=["python", "testing"],
+    agent_class="akgentic.agent.BaseAgent",
+    can_be_hired=True,
+    config=AgentConfig(
+        name="@Developer",
+        role="Developer",
+        prompt=PromptTemplate(template="You are a senior developer."),
+        model_cfg=ModelConfig(provider="openai", model="gpt-4.1"),
+    ),
 )
 # Register role blueprints — accepts a list of AgentCard
-orchestrator_proxy.register_agent_profiles([manager_card])
+orchestrator_proxy.register_agent_profiles([manager_card, developer_card])
 
 # Human entry point
 human_addr = orchestrator_proxy.createActor(
@@ -175,7 +188,7 @@ When an agent sends a message, it declares its intent via a `message_type`:
 | Intent | Meaning | Expected reply |
 |---|---|---|
 | `request` | "Do this and **bring me the result**" | `response` |
-| `instruction` | "Do this (possibly for a third party)" | `acknowledgment` |
+| `instruction` | "Do this (possibly for a third party)" | `acknowledgment`, only if asked |
 | `response` | "Here is what you asked for" | Optional |
 | `notification` | "FYI — no action needed" | None |
 | `acknowledgment` | "Got it" | None |
@@ -199,7 +212,7 @@ Intent flows through the system in two complementary ways:
 All inter-agent communication uses a single `AgentMessage` type:
 
 ```python
-class AgentMessage(Message):
+class AgentMessage(MailboxMessage):   # akgentic.tool.mailbox; MailboxMessage extends Message
     type: Literal["request", "response", "notification", "instruction", "acknowledgment"] = "request"
     content: str
 ```
@@ -225,7 +238,7 @@ class Request(BaseModel):
     message: str
     recipient: str   # "@MemberName" (existing actor) or "RoleName" (triggers hiring)
 
-class StructuredOutput(BaseModel):
+class StructuredOutput(MergeableOutput):   # akgentic.llm
     messages: list[Request] = []
 ```
 
@@ -261,12 +274,16 @@ in one turn — they are dispatched in parallel"*, and never said that several m
 **entries in this one list**. On a channel that can carry several output items, one item per message
 is a reasonable reading of what it was handed.
 
-**The fix is one sentence in the schema the model fills:**
+**The fix is in the schema the model fills.** The `messages` field description now reads, in part:
 
 ```python
-"CRITICAL: your entire reply for this turn is ONE output object. Several "
-"messages means several entries in this list, never a second output object."
+"To send several messages, add several items to this array — they are dispatched in "
+'parallel. [...] Your reply is exactly ONE JSON object with ONE "messages" array: never write '
+"a second JSON object after it, and never one JSON object per message."
 ```
+
+and a reply that still arrives as several objects is merged by akgentic-llm's
+`MergeableOutputCapability` rather than rejected (see below).
 
 It lives in the field description rather than a system prompt because it is a property of the output
 format: it travels with the JSON schema on every run, for every role, in every team — a prompt
@@ -302,7 +319,13 @@ the model resends every message. `_route_output()` then resolves what remains:
 | `RoleName` | `hire_member(role)` → create actor → send (skipped if the role cannot be hired) |
 
 A recipient is skipped only when the run could not afford a retry — output retries spent, or
-no request left, as in the tool-free conclusion. See
+no request left, as in the tool-free conclusion.
+
+These checks answer *"would this be delivered?"*, not *"may this agent contact that one?"*: any
+member can address any other member, and there is no per-role allow-list (`AgentCard` has no
+`routes_to`). The agent learns who exists from `TeamTool`'s roster and role list, delivered in the
+per-turn Context update, each role marked `[hireable]` or `[not hireable]`. See
+[Who an agent can contact](docs/agent-collaboration.md#who-an-agent-can-contact) and
 [the recipient check](docs/agent-collaboration.md#the-recipient-check-telling-the-model-while-it-can-still-answer)
 in the collaboration guide.
 
@@ -509,9 +532,14 @@ AgentCard(
     skills=["python", "testing"],
     agent_class="akgentic.agent.BaseAgent",   # FQCN string or class reference
     config=AgentConfig(name="@Developer", role="Developer"),
-    routes_to=["Reviewer", "Tester"],         # roles this agent can hire
+    can_be_hired=True,                        # other agents may hire this role (default False)
 )
 ```
+
+**`can_be_hired` is the hiring gate.** It defaults to `False`: a card left at the default is listed
+to the model as `[not hireable]`, the recipient check refuses a message addressed to that role, and
+`hire_member` raises `RoleNotHireableError`. `AgentCard` has no `routes_to` field — there is no
+per-agent list of reachable roles, and a stale `routes_to=` keyword is silently ignored.
 
 **`role` is not a constructor keyword.** `AgentCard.role` is a read-only property that reads
 `config.role`, so that config field is the single source of truth. Passing `role=` to the
@@ -529,12 +557,16 @@ When `_route_output()` sees `recipient="Developer"` (no `@` prefix), `resolve_re
 calls `hire_member("Developer")`, which resolves the registry's typed `hire_member` command
 (`TeamTool`) and invokes it. That command:
 
-1. Looks up the `AgentCard` for `"Developer"` in the Orchestrator
-2. Calls `createActor(agent_class, config=card.get_config_copy())`
-3. Returns the new actor address for immediate message delivery
+1. Looks up the `AgentCard` for `"Developer"` in the Orchestrator — a `RetriableError` naming the
+   hireable roles if there is none
+2. Refuses with `RoleNotHireableError` unless the card sets `can_be_hired=True`
+3. Calls `createActor(agent_class, config=card.get_config_copy())`
+4. Returns the new actor address for immediate message delivery
 
-If no `hire_member` command is registered — `TeamTool` was removed from `config.tools` — the
-method raises `RuntimeError` rather than failing silently.
+If no `hire_member` command is registered — `TeamTool(hire_team_members=False)` — `hire_member()`
+raises `RuntimeError`. On the routing path `resolve_recipient()` catches that and a refused hire
+alike, logs them, and skips that one message; the recipient check has normally sent the model back
+before routing is reached.
 
 The LLM in the sending agent triggers this transparently by naming a role instead of a
 team member.
