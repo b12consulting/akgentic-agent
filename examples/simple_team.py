@@ -10,9 +10,9 @@ Demonstrates the core capabilities of akgentic-agent:
 
 Team structure:
     @Human (HumanProxy)
-        └──→ @Manager (BaseAgent, routes_to=[Assistant, Expert])
-                  ├── @Assistant (BaseAgent)
-                  └── @Expert (BaseAgent)
+        └──→ @Manager (BaseAgent)
+                  ├── @Assistant (BaseAgent, pre-hired; role can_be_hired)
+                  └── @Expert (BaseAgent, pre-hired; role can_be_hired)
 
 Run: uv run python packages/akgentic-agent/examples/simple_team.py
 """
@@ -79,10 +79,12 @@ tools = [search_tool, planning_tool, workspace_tool]
 # AGENT CARDS — declarative role definitions registered with the Orchestrator.
 # Cards act as blueprints: the Orchestrator stores them so agents can hire roles
 # dynamically at runtime without hard-coding agent addresses.
+#
+# A role is hireable only when its card sets can_be_hired=True (the default is
+# False). The role comes from config.role — AgentCard has no role field.
 # =============================================================================
 
 manager_card = AgentCard(
-    role="Manager",
     description="Coordinates the team and delegates tasks to Assistant and Expert",
     skills=["coordination", "delegation", "planning"],
     agent_class="akgentic.agent.BaseAgent",
@@ -100,14 +102,13 @@ manager_card = AgentCard(
         runtime_cfg=RuntimeConfig(),
         tools=tools,
     ),
-    routes_to=["Assistant", "Expert"],  # roles this agent can hire on demand
 )
 
 assistant_card = AgentCard(
-    role="Assistant",
     description="Provides support, research, and clear written answers",
     skills=["research", "writing", "communication"],
     agent_class="akgentic.agent.BaseAgent",
+    can_be_hired=True,  # the Manager may hire this role by naming it
     config=AgentConfig(
         name="@Assistant",
         role="Assistant",
@@ -120,10 +121,10 @@ assistant_card = AgentCard(
 )
 
 expert_card = AgentCard(
-    role="Expert",
     description="Provides deep specialized knowledge and technical analysis",
     skills=["analysis", "problem-solving", "domain expertise"],
     agent_class="akgentic.agent.BaseAgent",
+    can_be_hired=True,  # the Manager may hire this role by naming it
     config=AgentConfig(
         name="@Expert",
         role="Expert",
