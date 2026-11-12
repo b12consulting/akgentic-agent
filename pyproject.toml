@@ -35,7 +35,7 @@ dependencies = [
     # path and its specs are written against that delivery.
     "pydantic-ai-slim>=2.58,<3",
     "akgentic-core>=1.5.15",
-    "akgentic-llm>=2.5.0",
+    "akgentic-llm>=2.5.2",
     "akgentic-tool>=1.12.0",
 ]
 
