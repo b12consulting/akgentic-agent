@@ -34,9 +34,11 @@ minimal, and the agent produces explicit, directed messages.
 
 - ✅ A single `AgentMessage` type — no request/answer message pair to model
 - ✅ The LLM reasons about routing, over a conversation history it can actually see
-- ✅ Hire-by-role: the LLM addresses a _role_ and the framework hires on demand
+- ✅ Hire-by-role: the LLM addresses a _role_ and the framework hires on demand, for the roles
+  whose card is marked `can_be_hired`
 - ✅ No hidden call stack — the agent sees the dialogue, not framework state
-- ✅ An unresolvable `@member` is skipped at routing time instead of failing the run
+- ✅ An unreachable recipient is sent back to the model while the run can still fix it, and
+  skipped at routing time when it cannot — never a failed run
 
 **What it costs:** nothing *forces* the LLM to reply to the right party. See
 [Routing Patterns](#routing-patterns-continuation-vs-llm-driven) for when that matters.
@@ -48,8 +50,8 @@ minimal, and the agent produces explicit, directed messages.
 ```
 User: "Estimate the effort for dark-mode support."
   ↓
-Manager: LLM decides → sends AgentMessage to "Frontend Developer" (role)
-  → Framework hires a FrontendDeveloper actor automatically
+Manager: LLM decides → sends AgentMessage to "FrontendDeveloper" (role)
+  → Framework hires a FrontendDeveloper actor automatically (its card is can_be_hired)
   ↓
 FrontendDeveloper: LLM decides → sends AgentMessage back to "@Manager"
   ↓
@@ -100,15 +102,42 @@ Pydantic `ValidationError`.
 
 The `recipient` field drives all routing logic in `_route_output()`:
 
-| Recipient format | Meaning                      | Framework action    |
-| ---------------- | ---------------------------- | ------------------- |
-| `@MemberName`    | Existing team member by name | Direct send         |
-| `RoleName`       | Role not yet hired           | Auto-hire then send |
+| Recipient format | Meaning                      | Framework action                                   |
+| ---------------- | ---------------------------- | -------------------------------------------------- |
+| `@MemberName`    | Existing team member by name | Direct send                                        |
+| `RoleName`       | Role to hire                 | Auto-hire then send — only if the role is hireable |
 
-Recipients are validated at **routing time**, not in the schema: `Request.recipient` is a
-plain string, and `_route_output()` resolves it through `resolve_recipient()` (`@name` →
-`get_team_member`, role → `hire_member`), skipping delivery when a `@member` is not found.
-There is no per-call `Request` subclass and no `enum` constraint on `recipient` (Story 5.5).
+`Request.recipient` is a plain string: there is no per-call `Request` subclass and no `enum`
+constraint on `recipient` (Story 5.5), so the schema never varies from turn to turn. Validity is
+checked in two places instead:
+
+1. **Inside the run** — `RecipientCheckCapability` checks every recipient of the validated
+   output against `team_directory()` and sends the output back with `ModelRetry` while one is
+   unreachable. See [The recipient check](#the-recipient-check-telling-the-model-while-it-can-still-answer).
+2. **At routing time** — `_route_output()` resolves each recipient through
+   `resolve_recipient()` (`@name` → `get_team_member`, role → `hire_member`) and skips, with a
+   log line, whatever the run could not correct.
+
+### Who an agent can contact
+
+| Question | Answer | Where |
+|---|---|---|
+| How does the agent know who is on the team? | `TeamTool`'s roster, in the per-turn **Context update** | `GetTeamRoster` |
+| How does it know which roles it could hire? | `TeamTool`'s role list, each role marked `[hireable]` or `[not hireable]` | `GetRoleProfiles` |
+| Which `@name`s are reachable? | Every current member except tool actors (`#`-prefixed) | `team_directory().members` |
+| Which roles can be hired? | Roles whose `AgentCard.can_be_hired` is `True` (default **`False`**) — and only if the agent has the `hire_member` command | `team_directory().hireable_roles`, `can_hire` |
+| Can it be restricted to talking to some members only? | **No.** Any member may address any other member. There is no allow-list and no `routes_to`; a topology lives in the prompts | — |
+| Is `message_type` enforced? | **No.** It tells the receiver whether a reply is expected; nothing checks that a `response` answers a `request`, or that a `request` is answered | `REPLY_PROTOCOLS` |
+
+To disable hiring for one agent, give it `TeamTool(hire_team_members=False)`. That removes both the
+`hire_members` tool **and** the `hire_member` command, so routing cannot hire either, and the
+recipient check tells the model "you cannot hire in this team" rather than offering it roles.
+
+To steer a contact topology, override `team_directory()` in a subclass and narrow `members` (and
+`hireable_roles`): the recipient check then refuses everyone else, and its correction lists only
+the members you allowed. That is guidance, not enforcement — when the check stands down (retries
+or request budget spent), `_route_output()` still delivers to any member `get_team_member()`
+finds. A hard rule needs the same filter in the router.
 
 ### Context is the "Call Stack"
 
@@ -165,21 +194,24 @@ index pointer, no framework-managed stack.
    │  messages: list[Request({message_type, message, recipient})]│
    └──────────┬──────────────────────────────────────────────────┘
               │
+              │  (inside the run: RecipientCheckCapability
+              │   sends unreachable recipients back with ModelRetry)
    ┌──────────▼──────────┐
    │  _route_output()    │  ← Core routing engine; returns "delivered?"
    └──────────┬──────────┘
               │
      For each Request:
-     ┌─────────────────────────────────────────────────────┐
-     │ recipient starts with "@"? → direct send to member   │
-     │ recipient is a role name?  → auto-hire + send        │
-     └─────────────────────────────────────────────────────┘
+     ┌──────────────────────────────────────────────────────────┐
+     │ recipient starts with "@"? → direct send to member        │
+     │ recipient is a role name?  → hire (if hireable) + send    │
+     │ unresolved / not hireable? → log and skip this Request    │
+     └──────────────────────────────────────────────────────────┘
 ```
 
 ### Data Model
 
 ```python
-class AgentMessage(Message):
+class AgentMessage(MailboxMessage):  # akgentic.tool.mailbox; MailboxMessage extends Message
     """Single message type for all inter-agent communication."""
     type: Literal[
         "request", "response", "notification", "instruction", "acknowledgment"
@@ -194,14 +226,19 @@ class Request(BaseModel):
     message: str    # Raw message text
     recipient: str  # "@MemberName" or "RoleName"
 
-class StructuredOutput(BaseModel):
+class StructuredOutput(MergeableOutput):  # akgentic.llm
     """Complete LLM response: zero or more directed messages."""
     messages: list[Request] = []
 ```
 
-`AgentMessage` adds exactly two fields of its own — `type` and `content`. Everything else
-(`id`, `parent_id`, `team_id`, `timestamp`, `sender`, `recipient`, `display_type`) is inherited
-from `akgentic-core`'s `Message`.
+`AgentMessage` adds exactly two fields of its own — `type` and `content` — and overrides the two
+rendering methods `MailboxMessage` requires: `rendering()` (the prompt) and `rendering_preview()`
+(one summary line for the mailbox). Everything else (`id`, `parent_id`, `team_id`, `timestamp`,
+`sender`, `recipient`, `display_type`) is inherited from `akgentic-core`'s `Message`.
+
+`StructuredOutput` subclasses `MergeableOutput` so that an output the model wrote as several JSON
+objects is merged rather than rejected — see
+[An output written twice](#an-output-written-twice-or-one-that-cannot-be-read).
 
 The two `type` fields are the same protocol seen from both ends: `_route_output()` copies
 `request.message_type` straight onto the `AgentMessage.type` it sends, so the receiver reads the
@@ -209,23 +246,25 @@ sender's intent as first-class data. It also fills the inherited `recipient` wit
 `ActorAddress` — the string→address resolution happens in `_route_output()`, and the delivered
 message records its outcome.
 
-### ToolFactory & 3-Channel Architecture
+### ToolFactory & 4-Channel Architecture
 
 Every `BaseAgent` composes a `ToolFactory` that aggregates `ToolCard` instances into
-three channels. Each `ToolCard` capability declares which channels it is exposed
+four channels. Each `ToolCard` capability declares which channels it is exposed
 through via `expose: set[Channels]`:
 
-| Channel         | Method on `ToolCard`   | Purpose                                                                                |
-| --------------- | ---------------------- | -------------------------------------------------------------------------------------- |
-| `TOOL_CALL`     | `get_tools()`          | LLM-callable functions (`hire_members`, `fire_members`, `update_planning`)             |
-| `SYSTEM_PROMPT` | `get_system_prompts()` | Dynamic prompts injected into LLM context (`team_roster`, `role_profiles`, `planning`) |
-| `COMMAND`       | `get_commands()`       | Folded by `ToolFactory.get_command_registry()` into one name-keyed `CommandRegistry`, reached from in-agent code and `/`-prefixed messages (`hire_member`, `planning_summary`) |
+| Channel         | Method on `ToolCard`     | Purpose |
+| --------------- | ------------------------ | ------- |
+| `TOOL_CALL`     | `get_tools()`            | LLM-callable functions (`hire_members`, `fire_members`, `update_planning`) |
+| `SYSTEM_PROMPT` | `get_system_prompts()`   | Static prompts rendered once into the frozen system block. Nothing on the default card set uses it |
+| `LLM_CONTEXT`   | `get_context_states()`   | Volatile team state — roster, role list, planning board — composed by the `ContextUpdater` into at most one **Context update** block per turn: a full snapshot first, then only what changed |
+| `COMMAND`       | `get_commands()`         | Folded by `ToolFactory.get_command_registry()` into one name-keyed `CommandRegistry`, reached from in-agent code and `/`-prefixed messages (`hire_member`, `planning_summary`) |
 
-Note which `get_commands()` is which. The one a `ToolCard` implements is the live extension point —
-that is how a tool declares its COMMAND-channel callables. The **aggregator** of the same name on
-`ToolFactory` is the older param-class-keyed dict; it is **deprecated** and warns.
-`BaseAgent.on_start()` calls `ToolFactory.get_command_registry()` instead, which keys every command
-by the callable's `__name__` and derives an argument schema from its signature. See
+The team-state capabilities normalise `SYSTEM_PROMPT` to `LLM_CONTEXT`: a card that still asks for
+`SYSTEM_PROMPT` on the roster, the role list or the planning board gets `LLM_CONTEXT`.
+
+`ToolCard.get_commands()` is how a tool declares its COMMAND-channel callables.
+`BaseAgent.on_start()` collects them through `ToolFactory.get_command_registry()`, which keys every
+command by the callable's `__name__` and derives an argument schema from its signature. See
 [The Command Registry](#4-the-command-registry) for the two surfaces that reach it.
 
 Two `ToolCard` implementations are central to collaboration — **TeamTool** and
@@ -236,7 +275,7 @@ Two `ToolCard` implementations are central to collaboration — **TeamTool** and
 ## Collaboration Tools: TeamTool and PlanningTool
 
 Two tools are the pillars of multi-agent collaboration. Both are **`ToolCard`
-subclasses** resolved by `ToolFactory` into the three channels above.
+subclasses** resolved by `ToolFactory` into the four channels above.
 
 ### TeamTool — Team Awareness and Composition
 
@@ -246,14 +285,15 @@ what roles are available, and to hire or fire members.
 
 | Capability            | Default channels           | Description                                                                    |
 | --------------------- | -------------------------- | ------------------------------------------------------------------------------ |
-| **`GetTeamRoster`**   | `SYSTEM_PROMPT`, `COMMAND` | Injects a live list of team members and their roles into every LLM call        |
-| **`GetRoleProfiles`** | `SYSTEM_PROMPT`, `COMMAND` | Injects the full agent catalog (role, description, skills) into every LLM call |
-| **`HireTeamMember`**  | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to hire new members by role                                  |
-| **`FireTeamMember`**  | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to remove members by name                                    |
+| **`GetTeamRoster`**   | `LLM_CONTEXT`, `COMMAND`   | The live list of team members and their roles (command: `/team_members`)       |
+| **`GetRoleProfiles`** | `LLM_CONTEXT`, `COMMAND`   | Every role of the agent catalog — description, skills, hireable or not (command: `/team_roles`) |
+| **`HireTeamMember`**  | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to hire new members by role (command: `/hire_member`)        |
+| **`FireTeamMember`**  | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to remove members by name (command: `/fire_member`)          |
+| **`GetTeamActivity`** | opt-in (`False` by default) | `team_activity` report: who is mid-handler, and on what                       |
 
-**Why it matters for collaboration**: The two `SYSTEM_PROMPT` capabilities
-(`GetTeamRoster` and `GetRoleProfiles`) give the LLM the information it needs to
-make routing decisions. At every `act()` call, the LLM sees:
+**Why it matters for collaboration**: the two `LLM_CONTEXT` capabilities (`GetTeamRoster` and
+`GetRoleProfiles`) give the LLM the information it needs to make routing decisions. On the
+agent's first turn the Context update carries both in full:
 
 ```
 **Here is the team member list by name (and role):**
@@ -261,19 +301,26 @@ make routing decisions. At every `act()` call, the LLM sees:
 @Developer456 (role: Developer)
 @QA789 (role: QA)
 
-**Here is the available team role list (for hiring):**
-Manager: Helpful manager coordinating team work (Skills: coordination, delegation)
-Developer: Full-stack developer (Skills: coding, architecture)
-QA: Quality assurance engineer (Skills: testing, automation)
+**Here is the team role list:**
+Manager: Helpful manager coordinating team work (Skills: coordination, delegation) [not hireable]
+Developer: Full-stack developer (Skills: coding, architecture) [hireable]
+QA: Quality assurance engineer (Skills: testing, automation) [hireable]
 ```
 
-Actors whose name starts with `#` (tool actors) are excluded from the roster, and the agent
-reading it is marked `- [you]`.
+On later turns only the changes are sent — `@SecurityEngineer457 (role: SecurityEngineer) joined
+the team.`, `Role re-described — …` — and nothing at all when nothing changed. The baselines live
+on `AgentState.tool_state`, so a restored agent resumes delta delivery instead of re-snapshotting.
 
-That is the whole mechanism. The roster and the role catalog reach the LLM through the
-`SYSTEM_PROMPT` channel, regenerated on every call. **Nothing is injected into the output
-schema** — `act()` reasons against the static `StructuredOutput` type — so the developer never
-hard-codes team structure into a prompt, and the schema never varies from call to call.
+Actors whose name starts with `#` (tool actors) are excluded from the roster, and the agent
+reading it is marked `- [you]`. The `[hireable]` marker mirrors `AgentCard.can_be_hired`, which
+defaults to `False`: a role nobody marked hireable is listed but cannot be hired. When no role is
+hireable the list closes with `No role in this list can be hired.`
+
+That is the whole mechanism. **Nothing is injected into the output schema** — `act()` reasons
+against the static `StructuredOutput` type — so the developer never hard-codes team structure
+into a prompt, and the schema never varies from call to call. Turning either capability off
+(`TeamTool(get_team_roster=False)`) leaves the agent blind to it; the recipient check then becomes
+the only place it learns who exists.
 
 ### PlanningTool — Coordinating Complex Multi-Agent Work
 
@@ -283,12 +330,13 @@ planning tool provides a shared, persistent task board backed by a `PlanActor`.
 
 | Capability            | Default channels           | Description                                          |
 | --------------------- | -------------------------- | ---------------------------------------------------- |
-| **`GetPlanning`**     | `SYSTEM_PROMPT`, `COMMAND` | Injects the full task list into every LLM call       |
+| **`GetPlanning`**     | `LLM_CONTEXT`, `COMMAND`   | The task board, in the per-turn Context update (command: `/planning_summary`) |
 | **`GetPlanningTask`** | `TOOL_CALL`, `COMMAND`     | LLM-callable tool to retrieve a single task by ID    |
 | **`UpdatePlanning`**  | `TOOL_CALL`                | LLM-callable tool to create, update, or delete tasks |
 | **`SearchPlanning`**  | `TOOL_CALL`, `COMMAND`     | Search tasks by status, owner, creator, or description |
 
-At every `act()` call, the LLM sees the current plan state. `GetPlanning.filter_by_agent` defaults
+The LLM sees the plan in its Context update: in full on the first turn, then only the tasks that
+changed. `GetPlanning.filter_by_agent` defaults
 to **`True`**, so out of the box each agent sees only the tasks it owns or created, under a
 `**Your tasks** (owner or creator: @Manager):` header — and
 `No tasks assigned to or created by @Manager yet.` when it has none. Pass
@@ -392,7 +440,7 @@ sequenceDiagram
 ```
 
 The planning tool acts as shared memory. Each agent sees the same task list (via
-`SYSTEM_PROMPT`), updates it (via `TOOL_CALL`), and other agents observe those
+`LLM_CONTEXT`), updates it (via `TOOL_CALL`), and other agents observe those
 changes on their next invocation.
 
 ---
@@ -408,7 +456,7 @@ sequenceDiagram
 
     User->>Manager: AgentMessage("Plan the sprint", type="request")
     activate Manager
-    Note over Manager: receiveMsg_AgentMessage prepends the reply<br/>protocol for "request" to the raw content
+    Note over Manager: act() renders the message: the reply<br/>protocol for "request", then the raw content
     Manager->>Manager: act() → StructuredOutput
     Note over Manager: [{message_type: "response", message: "Here is the plan",<br/>recipient: "@User"}]
     Manager->>User: AgentMessage("Here is the plan", type="response")
@@ -442,7 +490,7 @@ sequenceDiagram
     deactivate Developer
 
     activate Manager
-    Note over Manager: prefixes locally:<br/>"You received a response from @Developer456. …"
+    Note over Manager: prefixes locally:<br/>"You received a response from @Developer. …"
     Manager->>Manager: act() → StructuredOutput
     Note over Manager: [{recipient: "@User", message_type: "response",<br/>message: "Estimate: 3 days"}]
     Manager->>User: AgentMessage("Estimate: 3 days", type="response")
@@ -471,7 +519,7 @@ sequenceDiagram
     Orchestrator-->>Manager: @SecurityEngineer456 address
     Manager->>NewActor: AgentMessage("Audit auth flow", type="request")
     activate NewActor
-    Note over NewActor: prefixes locally, then system prompts:<br/>roster (sees full team) + roles + planning
+    Note over NewActor: prefixes locally, then Context update:<br/>roster (sees full team) + roles + planning
     NewActor->>NewActor: act() → StructuredOutput
     NewActor->>Manager: AgentMessage("Audit complete: …", type="response")
     deactivate NewActor
@@ -486,8 +534,11 @@ limit needs no second path — `akgentic-llm` returns it through `act()` as an o
 
 ```mermaid
 flowchart TD
-    S[receiveMsg_AgentMessage] --> A[act prefixed_content StructuredOutput]
-    A --> R[_route_output output]
+    S[receiveMsg_AgentMessage] --> A[act message StructuredOutput]
+    A --> V{RecipientCheckCapability: every recipient reachable?}
+    V -->|no, and a retry is possible| X[ModelRetry with the members and hireable roles]
+    X --> A
+    V -->|yes, or no retry left| R[_route_output output]
     C[run-tier breach → one tool-free conclusion] --> R
     R --> B[For each Request in output.messages]
     B --> E{starts with '@'?}
@@ -495,20 +546,22 @@ flowchart TD
     F --> G{resolved?}
     G -->|yes| H[send AgentMessage to member]
     G -->|no| K[skip this Request]
-    E -->|no| L[hire_member role → auto-hire]
-    L --> H
+    E -->|no| L[hire_member role]
+    L --> M{hireable?}
+    M -->|yes| H
+    M -->|no: ModelRetry / RuntimeError| K
     H --> P[return True — something was delivered]
     K --> Q[return False if nothing was delivered]
 ```
 
-> **Note:** Recipients are resolved at routing time (`@name` → `get_team_member`,
-> role → `hire_member`); an unknown `@member`, or a role that cannot be hired, is simply
-> not delivered to. The routing logic is a simple two-branch dispatch.
+> **Note:** By the time `_route_output()` runs, the recipient check has already sent every
+> unreachable recipient back to the model once a retry was possible. What reaches routing
+> unresolved is what the run could not correct: an unknown `@member`, or a role that cannot be
+> hired, is logged and not delivered to. The routing logic is a simple two-branch dispatch.
 >
-> The **return value matters**: `_route_output()` reports whether anything actually went out.
-> The usage-limit guard asks it that, because the guard cannot inspect the output itself —
-> the schema belongs to the caller. An output that resolved no recipient sent nothing, and a
-> conclusion that sent nothing is a failure, not a quiet success.
+> `_route_output()` returns whether anything actually went out. **No caller reads that bool
+> today** — the usage-limit guard that used to was retired, which is the
+> [known gap](#5-usage-limit-protection) below.
 
 ### 5. Mailbox Visibility
 
@@ -522,7 +575,7 @@ twice.
   `TeamTool`) — it names **one** message, by the id the arrival notice gave it. The tool reads
   nothing and returns nothing but an acknowledgement; `MailboxCapability.after_tool_execute` is
   what makes that acknowledgement true, consuming exactly the named message and injecting its
-  own `render_for_llm()` as a turn of its own. So naming an id **absorbs that one message**: it
+  own `rendering()` as a turn of its own. So naming an id **absorbs that one message**: it
   is not delivered again, and the model must deal with it in this run. Mail left unnamed stays
   queued and arrives as its own turn once the run ends. An absent or unknown id is a silent
   no-op. A pending `/stop` or `CancelMessage` is never offered an id and never absorbed by a
@@ -546,8 +599,8 @@ the mailbox and then raises `RunInterruptedError` at the next step boundary, cau
 — which notifies the human and returns a default output the router delivers as nothing, so no
 handler carries a catch.
 The run dies, the agent survives. The hook and the vocabulary it applies (`is_cancel`,
-`render_arrival_notice`) are both the agent's, defined in `akgentic.agent.capabilities` — not
-the card's. `BaseAgent` builds the capability unconditionally so an agent configured *without*
+`render_arrival_notice`) live in `akgentic.tool.mailbox.capability`, beside the capability,
+not on the card. `BaseAgent` builds the capability unconditionally so an agent configured *without*
 `MailboxTool` is still interruptible, and such an agent has no card to borrow a predicate
 from. The card keeps its own surface: the id-taking `read_mailbox` tool and the `/stop`
 registration whose string form `is_cancel` recognises without importing anything from
@@ -598,15 +651,16 @@ def resolve_recipient(agent: TeamResolver, recipient: str) -> ActorAddress | Non
 
 The sender delivers the **raw** `request.message`; the reply-protocol prefix is added by
 the *receiving* agent's `receiveMsg_AgentMessage()` (see below), keyed to the intent that
-agent received. Recipients are resolved at routing time, so the dispatch is a simple
-two-branch lookup, and a recipient it cannot resolve is skipped rather than raised.
+agent received. The recipient check has already had its chance inside the run, so the dispatch
+is a simple two-branch lookup, and a recipient it still cannot resolve is skipped rather than
+raised.
 
 `_route_output()` is the class's single routed send path, and it **returns whether anything
 was actually delivered**. `receiveMsg_AgentMessage()` calls it for a normal turn, and the
 tool-free conclusion of a turn cut short by a run-tier usage limit
 (see [Usage Limit Protection](#5-usage-limit-protection)) goes through the very same helper —
-so a concluded answer is delivered exactly like any other message, and an answer that reached
-nobody is reported as the failure it is.
+so a concluded answer is delivered exactly like any other message. Nothing reads the bool today,
+so an answer that reached nobody is not reported — see the known gap there.
 
 ### 2. Static Structured Output + Prompt-Carried Reply Protocol
 
@@ -633,7 +687,7 @@ output = self.act(message, StructuredOutput)
 self._route_output(output)
 
 
-# In AgentMessage.render_for_llm(), which act() calls once:
+# In AgentMessage.rendering(), which act() calls once:
 sender_name = self.sender.name if self.sender else "unknown"
 article = "an" if self.type[0] in "aeiou" else "a"
 return (
@@ -643,10 +697,9 @@ return (
 )
 ```
 
-`"unknown"` in the renderer is prose for the prompt only. The guard keeps its own requester as
-`None` when the message carried no sender, because a placeholder *there* would be echoed back
-as a `Request.recipient` — and a recipient without a leading `@` is a role to **hire**, so the
-teardown of a breached turn would spin up a member called "unknown".
+`"unknown"` in the renderer is prose for the prompt only, never an address: a placeholder echoed
+back as a `Request.recipient` would have no leading `@`, and a recipient without one is a role to
+**hire**. The recipient check refuses it (no such hireable role), and routing skips it.
 
 This supersedes the schema-constrained-recipient + docstring-injection mechanism from
 Story 5.1 / ADR-004; the intent-driven 5-type protocol itself is unchanged.
@@ -881,8 +934,9 @@ exists. That bound is only as real as the budget behind it: the default `AgentUs
 all-`None` and never blocks, so an agent left on the defaults breaches, concludes and breaches
 again indefinitely — see ❌ DON'T #3.
 
-Invalid `@member` recipients are handled gracefully at routing time: `get_team_member()` returns
-`None` and delivery is skipped rather than raising. That applies to a conclusion as much as to a
+An unreachable recipient in a conclusion is not sent back: the conclusion runs on a one-request
+budget, so the recipient check stands down, `get_team_member()` returns `None` and delivery is
+skipped rather than raising. That applies to a conclusion as much as to a
 normal turn, which is why this document says the LLM **attempts** a conclusion — never that the
 requester is guaranteed a reply.
 
@@ -989,10 +1043,12 @@ manager_card = AgentCard(
         model_cfg=ModelConfig(provider="openai", model="gpt-4o", temperature=0.3),
         tools=tools,
     ),
-    routes_to=["Assistant", "Expert"],  # roles this agent can hire
+    # can_be_hired stays False: the Manager is created below, not hired.
 )
 
-# ... define assistant_card, expert_card similarly ...
+# ... define assistant_card, expert_card similarly, each with can_be_hired=True —
+# a card that leaves it at its False default is listed as [not hireable], and a
+# message addressed to that role is sent back to the model, then dropped.
 
 actor_system = ActorSystem()
 orchestrator_addr = actor_system.createActor(
@@ -1019,9 +1075,9 @@ The following shows what happens inside a single `receiveMsg_AgentMessage()` tur
 not code you write — the LLM produces this output:
 
 ```python
-# The LLM sees (via TeamTool system prompts):
+# The LLM sees (via TeamTool's Context update):
 #   Team members: @Manager [you], @Developer456, @QA789
-#   Available roles: Manager, Developer, QA, SecurityEngineer
+#   Roles: Manager [not hireable], Developer, QA, SecurityEngineer [hireable]
 #
 # The LLM returns:
 StructuredOutput(messages=[
@@ -1036,7 +1092,7 @@ StructuredOutput(messages=[
 # _route_output() resolves each:
 # "@Human"             → starts with "@" → get_team_member → direct send
 # "@Developer456"      → starts with "@" → get_team_member → direct send
-# "SecurityEngineer"   → no "@" → hire_member → send to new actor
+# "SecurityEngineer"   → no "@" → hireable → hire_member → send to new actor
 ```
 
 ### Example 3: Waiting for a Collaborator
@@ -1179,13 +1235,13 @@ StructuredOutput(messages=[
 
 5. **Always include a `HumanProxy` in the team**
 
-   `notify_human()` sends the usage-limit escalation — reached through
-   `escalate_usage_limit()`, currently its only caller — to the team's first user-proxy
-   member, found structurally through `ActorAddress.is_user_proxy`, so any role string works.
-   Without one, the notice is logged and dropped.
+   `notify_human()` sends two notices — the usage-limit escalation, through
+   `escalate_usage_limit()`, and `"Run interrupted."` when `act()` absorbs a cancel — to the
+   team's first user-proxy member, found structurally through `ActorAddress.is_user_proxy`, so
+   any role string works. Without one, the notice is logged and dropped.
 
-   It fires on the **agent** tier (the lifetime budget is spent), and on a run-tier breach
-   only when the tool-free conclusion delivered nothing. A run-tier breach that concluded
+   The escalation fires on the **agent** tier (the lifetime budget is spent), and on a run-tier
+   breach only when akgentic-llm declined or failed the tool-free conclusion. A run-tier breach that concluded
    successfully notifies nobody — see [Usage Limit Protection](#5-usage-limit-protection).
 
 ### ❌ DON'T
@@ -1194,13 +1250,18 @@ StructuredOutput(messages=[
 
    ```
    # Wrong: "@" prefix is for existing members, not roles.
-   # If no Designer has been hired, get_team_member returns None and the
-   # message is silently dropped — no error, no delivery.
+   # If no Designer has been hired, the recipient check sends the output back
+   # ("No team member is called '@Designer'"), costing a retry; once retries
+   # are spent, routing drops the message with only a log line.
    recipient: "@Designer"
 
-   # Right: a bare role name triggers auto-hire
+   # Right: a bare role name hires one — if the Designer card is can_be_hired
+   # and this agent has the hire_member command
    recipient: "Designer"
    ```
+
+   The reverse mistake costs more: a bare role name addressed to a teammate you already have
+   passes the check whenever the role is hireable, and **hires a second one**.
 
 2. **Don't rely on ordering within `StructuredOutput.messages`**
 
@@ -1235,7 +1296,8 @@ StructuredOutput(messages=[
    defaults (e.g., disabling hire):
 
    ```python
-   # Only if you want to disable hiring:
+   # Only if you want to disable hiring — both the hire_members tool and
+   # hire-by-role routing, since the hire_member command goes with it:
    tools = [TeamTool(hire_team_members=False), planning_tool]
    ```
 
@@ -1256,7 +1318,7 @@ back down it. `akgentic-agent` is the other answer.
 | **Context tracking**     | Framework state: the recorded request path               | `ReactAgent`'s `ContextManager` conversation history      |
 | **Fan-out (parallel)**   | One request per collaborator, sequenced by hand          | Single `StructuredOutput` with multiple `Request` entries |
 | **LLM visibility**       | The LLM is unaware of the routing graph                  | The LLM owns the routing graph                            |
-| **Developer complexity** | Must reason about the stack to follow message flow       | Prompt-level: describe who is in the team                 |
+| **Developer complexity** | Must reason about the stack to follow message flow       | Prompt-level: describe roles and behaviour, not members   |
 
 ### The trade-off this makes
 
@@ -1278,7 +1340,7 @@ right party, and the reply protocol in the prompt tells it to, but nothing force
 ### AgentMessage
 
 ```python
-class AgentMessage(Message):
+class AgentMessage(MailboxMessage):
     """Base message type for team communication.
 
     Attributes:
@@ -1291,7 +1353,8 @@ class AgentMessage(Message):
     content: str
 ```
 
-`AgentMessage` declares exactly those two fields. It inherits `id`, `parent_id`, `team_id`,
+`AgentMessage` declares exactly those two fields, plus the `rendering()` / `rendering_preview()`
+overrides `MailboxMessage` requires. It inherits `id`, `parent_id`, `team_id`,
 `timestamp`, `sender`, `recipient` and `display_type` from `akgentic-core`'s `Message`.
 
 The `recipient` string on a `Request` is what `_route_output()` resolves; the resolved
@@ -1309,7 +1372,8 @@ class Request(BaseModel):
         message_type: Intent of the message (request, response, notification, etc.).
         message: The message content to send.
         recipient: Target expressed as "@MemberName" or "RoleName". A plain string,
-            unconstrained in the schema — validity is resolved at routing time.
+            unconstrained in the schema — validity is checked by the recipient check
+            inside the run, and resolved again at routing time.
     """
     message_type: Literal["request", "response", "notification", "instruction", "acknowledgment"]
     message: str
@@ -1319,7 +1383,7 @@ class Request(BaseModel):
 ### StructuredOutput
 
 ```python
-class StructuredOutput(BaseModel):
+class StructuredOutput(MergeableOutput):
     """Complete LLM response for one agent invocation.
 
     An empty list signals the agent is waiting for collaborators.
@@ -1340,7 +1404,11 @@ class AgentConfig(BaseConfig):
     Attributes:
         prompt: Agent backstory/system prompt, as a PromptTemplate (not a bare string).
         model_cfg: LLM provider and model settings — including sampling settings such
-            as temperature, which live here and NOT on runtime_cfg.
+            as temperature, which live here and NOT on runtime_cfg. Also accepts a list
+            at the input boundary: element 0 becomes the active model and the whole list
+            becomes model_roster.
+        model_roster: The declared roster the agent can switch between at runtime (via
+            ModelTool). Empty = single-model agent.
         runtime_cfg: Execution parameters — retries, tool-call end strategy,
             parallel tool calls, HTTP client settings.
         run_usage_limits: Budget for ONE run; enforced by pydantic-ai, resets per run.
@@ -1351,6 +1419,7 @@ class AgentConfig(BaseConfig):
     """
     prompt: PromptTemplate = PromptTemplate()
     model_cfg: ModelConfig = ModelConfig()
+    model_roster: list[ModelConfig] = []
     runtime_cfg: RuntimeConfig = RuntimeConfig()
     run_usage_limits: RunUsageLimits = RunUsageLimits()
     agent_usage_limits: AgentUsageLimits = AgentUsageLimits()
@@ -1363,7 +1432,8 @@ class AgentConfig(BaseConfig):
 `run()` call (pydantic-ai, mid-run, counts reset each run); the agent tier bounds the
 agent's whole lifetime (`ReactAgent`, pre-flight before each run). The agent tier survives a
 resume without being persisted: `ReactAgent` recomputes its counters from the usage events
-replayed through `init_llm_context()`, so `AgentState` stays exactly `{backstory: str}`.
+replayed through `init_llm_context()`, so `AgentState` carries no usage counter — only
+`backstory` and the tool layer's `tool_state` cache.
 
 The pre-split `usage_limits` spelling remains accepted as a deprecated constructor keyword
 and read accessor for `run_usage_limits` — it warns, and both are removed in
@@ -1386,7 +1456,7 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
     act(message, output_type) -> T
         Execute one LLM REACT loop against the caller's output_type, delegating
         to ReactAgent.run_sync(output_type=output_type). Takes the message, not a
-        prompt: it renders it once through message.render_for_llm(), so framing
+        prompt: it renders it once through message.rendering(), so framing
         lives in the message class and no caller composes a prompt of its own.
         There is no string overload — passing a str is a type error.
         receiveMsg_AgentMessage passes StructuredOutput, which is why the
@@ -1402,14 +1472,15 @@ class BaseAgent(Akgent[AgentConfig, AgentState]):
         Request, carrying the RAW request.message and request.message_type. A
         recipient starting with "@" resolves to an existing member and one that
         does not is hired by role; a recipient that resolves to nothing, or a
-        role that cannot be hired, is skipped and logged. It does not enrich the content — the delivered message adds its
-        own reply protocol. Returns whether anything was actually delivered; no
-        caller reads that bool today, the guard that used to having been retired.
+        role that cannot be hired, is skipped and logged. It does not enrich the
+        content — the delivered message adds its own reply protocol. Returns
+        whether anything was actually delivered; no caller reads that bool today,
+        since the usage-limit guard that used to was retired.
 
     receiveMsg_AgentMessage(message, sender) -> None
         Pykka message handler, undecorated. Entry point for all incoming
         messages. Intercepts "/"-prefixed content as a command; otherwise runs
-        one act() turn on the message — whose own render_for_llm() carries the
+        one act() turn on the message — whose own rendering() carries the
         REPLY_PROTOCOLS line for message.type — and routes the result. It
         carries no try/except of its own: a queued /stop or CancelMessage is
         absorbed inside act(), which notifies the human and returns an empty
@@ -1519,7 +1590,7 @@ make real LLM calls. Run them with `uv run pytest tests/ -m integration`.
 When extending the collaboration system:
 
 1. **Maintain `AgentMessage` as the sole inter-agent message type** — do not introduce new types without strong justification
-2. **Keep routing validation in `_route_output()`** — recipient validity is enforced at routing time, not in the output schema; the `Request.recipient` field stays a plain string
+2. **Keep recipient validation out of the output schema** — `Request.recipient` stays a plain string; validity is checked by `RecipientCheckCapability` inside the run, and `_route_output()` only skips what the run could not correct. Do not move validation back into routing alone: the model would never learn why a message vanished
 3. **Leave the usage-limit policy where it is — on `act()`** — a new `receiveMsg_*` declares nothing and decorates nothing; it inherits the guard by calling `act()`. Overriding `act()` without calling `super().act()` is the one way to lose it
 4. **Document prompt patterns** — add examples to this document when new routing patterns are validated
 5. **Performance test fan-out** — benchmark with large `StructuredOutput` lists to detect delivery bottlenecks
